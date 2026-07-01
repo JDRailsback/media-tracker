@@ -1,0 +1,16 @@
+# Swift Package Manager build artifacts
+.build/
+Package.resolved
+
+# Vapor / environment secrets — NEVER commit real keys
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+
+# Xcode (if the backend is opened in Xcode)
+*.xcodeproj
+*.xcworkspace
+.swiftpm/
