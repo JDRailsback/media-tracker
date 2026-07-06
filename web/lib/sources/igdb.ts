@@ -10,8 +10,8 @@ const MIN_RATING_COUNT = 5;
 // A non-exact match (e.g. a niche edition like "Minecraft Education" when you
 // search "minecraft") needs to be much more significant to show up at all.
 // Searching its exact name still finds it (exact match = lenient bar above).
+// Applies ONLY to already-released games — see passesQualityBar.
 const NON_EXACT_MIN_RATING_COUNT = 50;
-const NON_EXACT_MIN_HYPES = 20;
 
 interface IGDBGame {
   id: number;
@@ -29,7 +29,11 @@ function passesQualityBar(g: IGDBGame, isExact: boolean): boolean {
   const isFuture = g.first_release_date
     ? g.first_release_date * 1000 > Date.now()
     : true;
-  if (isFuture) return isExact || (g.hypes ?? 0) >= NON_EXACT_MIN_HYPES;
+  // Unreleased/announced games ALWAYS get a pass, exact match or not — same
+  // reasoning as the TMDB adapter: surfacing new announcements before they
+  // have engagement data is the whole point, so the elevated non-exact bar
+  // only applies to already-released games (where tie-in/edition spam lives).
+  if (isFuture) return true;
   const minCount = isExact ? MIN_RATING_COUNT : NON_EXACT_MIN_RATING_COUNT;
   return (g.total_rating_count ?? 0) >= minCount;
 }

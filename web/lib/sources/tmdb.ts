@@ -18,6 +18,7 @@ const MIN_POPULARITY = 3;
 // — this is what keeps something like a minor "X x Y" crossover special or
 // an obscure look-alike title from cluttering a search for the thing you
 // actually meant. An exact title match always gets the lenient bar above.
+// Applies ONLY to already-released titles — see passesQualityBar.
 const NON_EXACT_MIN_VOTE_COUNT = 300;
 const NON_EXACT_MIN_POPULARITY = 40;
 
@@ -30,9 +31,15 @@ function passesQualityBar(opts: {
 }): boolean {
   if (!opts.posterPath) return false;
   const isFuture = opts.dateStr ? new Date(opts.dateStr) > new Date() : true;
+  // Unreleased/announced titles ALWAYS get the lenient bar, exact match or
+  // not. Surfacing new announcements before they have any votes/popularity
+  // is the whole point of this app — the elevated non-exact bar exists to
+  // filter tie-in/crossover spam among EXISTING content, and applying it to
+  // unreleased titles too would hide legitimate upcoming sequels/announcements
+  // just because they're new and haven't accumulated engagement yet.
+  if (isFuture) return opts.popularity >= MIN_POPULARITY;
   const minVotes = opts.isExact ? MIN_VOTE_COUNT : NON_EXACT_MIN_VOTE_COUNT;
   const minPopularity = opts.isExact ? MIN_POPULARITY : NON_EXACT_MIN_POPULARITY;
-  if (isFuture) return opts.popularity >= minPopularity;
   return opts.voteCount >= minVotes || opts.popularity >= minPopularity * 4;
 }
 

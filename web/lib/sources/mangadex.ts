@@ -1,5 +1,5 @@
 import type { MediaItem } from "@/lib/types";
-import { isExactMatch } from "./textMatch";
+import { isExactMatch, matchTier } from "./textMatch";
 
 // MangaDex adapter (TS port). v1 = official English chapter dates only.
 
@@ -18,6 +18,15 @@ const MIN_FOLLOWS = 50;
 // query should surface. No popularity number perfectly captures "is this
 // the important thing," so this is a deliberately high, adjustable bar.
 const NON_EXACT_MIN_FOLLOWS = 25000;
+
+// MangaDex's API returns ALL content ratings — including erotica/pornographic
+// — unless you explicitly restrict it. Verified live: searching "toy story"
+// (which has no real match) returned several suggestive/erotica results that
+// merely fuzzy-matched somewhere in MangaDex's own index. "safe" +
+// "suggestive" covers ordinary mainstream manga (including normal
+// shounen/shoujo fan-service); erotica/pornographic are always excluded,
+// regardless of match quality or follows.
+const CONTENT_RATING = "contentRating[]=safe&contentRating[]=suggestive";
 
 interface MDRelationship {
   id: string;
@@ -75,13 +84,19 @@ async function fetchFollows(ids: string[]): Promise<Record<string, number>> {
 }
 
 export async function searchMangaDex(q: string): Promise<MediaItem[]> {
-  const url = `https://api.mangadex.org/manga?title=${encodeURIComponent(q)}&limit=15&includes[]=cover_art`;
+  const url = `https://api.mangadex.org/manga?title=${encodeURIComponent(q)}&limit=15&includes[]=cover_art&${CONTENT_RATING}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`MangaDex search failed: ${res.status}`);
   const data = await res.json();
   const results = data.data as MDManga[];
 
-  const withCovers = results.filter((m) => coverURL(m));
+  // MangaDex's own search sometimes matches on tags/alt-titles that don't
+  // appear anywhere in the displayed title — e.g. searching "toy story"
+  // (which has no real manga match) returned several completely unrelated
+  // titles. Require the displayed title to at least CONTAIN the query before
+  // any popularity consideration; a title that isn't even a loose text match
+  // shouldn't show up regardless of how followed it is.
+  const withCovers = results.filter((m) => coverURL(m) && matchTier(titleOf(m), q) < 3);
   const follows = await fetchFollows(withCovers.map((m) => m.id));
 
   return withCovers
@@ -105,7 +120,7 @@ export async function detailsMangaDex(id: string): Promise<MediaItem> {
 // Popular manga (for the Discover page's "Popular manga" shelf). MangaDex can
 // sort server-side by follow count, so no extra statistics call is needed here.
 export async function discoverMangaDex(limit = 20): Promise<MediaItem[]> {
-  const url = `https://api.mangadex.org/manga?order[followedCount]=desc&limit=${limit}&includes[]=cover_art&hasAvailableChapters=true`;
+  const url = `https://api.mangadex.org/manga?order[followedCount]=desc&limit=${limit}&includes[]=cover_art&hasAvailableChapters=true&${CONTENT_RATING}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`MangaDex discover failed: ${res.status}`);
   const data = await res.json();

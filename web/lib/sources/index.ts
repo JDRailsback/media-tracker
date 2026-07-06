@@ -28,12 +28,24 @@ function interleave(lists: MediaItem[][]): MediaItem[] {
   return out;
 }
 
+// Some sources fuzzy-match on things that never appear in the displayed
+// title (tags, alt-titles) — e.g. searching "toy story" returned MangaDex
+// results with no visible relation to the query at all. Reject anything
+// that isn't at least an exact/starts-with/contains match on the title
+// actually shown to the user, BEFORE ranking — a popularity score doesn't
+// make an unrelated result acceptable to show.
+function relevantOnly(items: MediaItem[], query: string): MediaItem[] {
+  return items.filter((i) => matchTier(i.title, query) < 3);
+}
+
 // Array.prototype.sort is stable in all modern JS engines, so items within
 // the same tier keep their interleaved (cross-category) relative order.
 // (Each adapter also applies a stricter popularity bar to non-exact matches
 // before this ever runs — see lib/sources/textMatch.ts and each adapter.)
 function byRelevance(items: MediaItem[], query: string): MediaItem[] {
-  return [...items].sort((a, b) => matchTier(a.title, query) - matchTier(b.title, query));
+  return relevantOnly(items, query).sort(
+    (a, b) => matchTier(a.title, query) - matchTier(b.title, query)
+  );
 }
 
 // Search dispatch. No type -> search all sources concurrently, quality-filter
