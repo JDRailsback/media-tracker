@@ -1,4 +1,5 @@
 import type { MediaItem } from "@/lib/types";
+import { isExactMatch } from "./textMatch";
 
 // MangaDex adapter (TS port). v1 = official English chapter dates only.
 
@@ -7,6 +8,16 @@ import type { MediaItem } from "@/lib/types";
 // search, not one per result) and require a minimum. Confirmed live:
 // GET /statistics/manga?manga[]=id1&manga[]=id2 -> { statistics: { [id]: { follows } } }
 const MIN_FOLLOWS = 50;
+
+// A non-exact match (e.g. a tie-in comic when you search a game/show's name)
+// needs to be much more followed to show up at all. Searching its exact name
+// still finds it (exact match = lenient bar above).
+// Tuned against a real observed case: "Minecraft: Anime Edition" (a tie-in
+// comic, not what most people mean by "minecraft") has 15,620 MangaDex
+// follows — genuinely popular within manga readers, but not what a generic
+// query should surface. No popularity number perfectly captures "is this
+// the important thing," so this is a deliberately high, adjustable bar.
+const NON_EXACT_MIN_FOLLOWS = 25000;
 
 interface MDRelationship {
   id: string;
@@ -32,8 +43,12 @@ function coverURL(m: MDManga): string | undefined {
   return file ? `/api/cover/mangadex/${m.id}/${file}.512.jpg` : undefined;
 }
 
+function titleOf(m: MDManga): string {
+  return m.attributes.title.en ?? Object.values(m.attributes.title)[0] ?? "Untitled";
+}
+
 function mapManga(m: MDManga, releaseDate?: string, subtitle?: string): MediaItem {
-  const title = m.attributes.title.en ?? Object.values(m.attributes.title)[0] ?? "Untitled";
+  const title = titleOf(m);
   return {
     id: `manga:${m.id}`,
     type: "manga",
@@ -70,7 +85,10 @@ export async function searchMangaDex(q: string): Promise<MediaItem[]> {
   const follows = await fetchFollows(withCovers.map((m) => m.id));
 
   return withCovers
-    .filter((m) => (follows[m.id] ?? 0) >= MIN_FOLLOWS)
+    .filter((m) => {
+      const threshold = isExactMatch(titleOf(m), q) ? MIN_FOLLOWS : NON_EXACT_MIN_FOLLOWS;
+      return (follows[m.id] ?? 0) >= threshold;
+    })
     .sort((a, b) => (follows[b.id] ?? 0) - (follows[a.id] ?? 0))
     .map((m) => mapManga(m));
 }

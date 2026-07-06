@@ -1,10 +1,17 @@
 import type { MediaItem } from "@/lib/types";
+import { isExactMatch } from "./textMatch";
 
 // IGDB adapter (TS port). OAuth token + POST query body.
 
 // Quality bar: released games need real rating volume; unreleased games get a
 // pass (they legitimately have none yet) as long as they have cover art.
 const MIN_RATING_COUNT = 5;
+
+// A non-exact match (e.g. a niche edition like "Minecraft Education" when you
+// search "minecraft") needs to be much more significant to show up at all.
+// Searching its exact name still finds it (exact match = lenient bar above).
+const NON_EXACT_MIN_RATING_COUNT = 50;
+const NON_EXACT_MIN_HYPES = 20;
 
 interface IGDBGame {
   id: number;
@@ -14,15 +21,38 @@ interface IGDBGame {
   first_release_date?: number; // Unix seconds
   total_rating_count?: number;
   hypes?: number;
+  game_type?: number | null;
 }
 
-function passesQualityBar(g: IGDBGame): boolean {
+function passesQualityBar(g: IGDBGame, isExact: boolean): boolean {
   if (!g.cover?.url) return false;
   const isFuture = g.first_release_date
     ? g.first_release_date * 1000 > Date.now()
     : true;
-  if (isFuture) return true;
-  return (g.total_rating_count ?? 0) >= MIN_RATING_COUNT;
+  if (isFuture) return isExact || (g.hypes ?? 0) >= NON_EXACT_MIN_HYPES;
+  const minCount = isExact ? MIN_RATING_COUNT : NON_EXACT_MIN_RATING_COUNT;
+  return (g.total_rating_count ?? 0) >= minCount;
+}
+
+// IGDB tags every sub-entry (seasons, episodes, DLC, packs, updates...) as
+// its own "game" with a `game_type`. Verified LIVE against real responses
+// (see docs/DISCOVER_AND_SEARCH.md) — searching "fortnite"/"minecraft" and
+// inspecting the raw game_type per result:
+//   7 = season      ("Fortnite: Season 6/7/8...")
+//   13 = pack        ("Fortnite Festival: <song>", "Minecraft: ... Skin Pack")
+//   6 = episode      ("Minecraft: Story Mode - Episode 5")
+//   14 = update      ("Minecraft: Nether Update", "Caves & Cliffs")
+//   5 = dlc_addon    ("A Minecraft Movie DLC")
+//   3 = bundle       ("Minecraft Dungeons: Ultimate DLC Bundle")
+//   2 = expansion    ("Fortnite: Save the World", "LEGO Fortnite")
+// A DENYLIST, not an allowlist: the real flagship "Minecraft" entry itself
+// is tagged 11 ("port"), not 0 ("main_game") — an allowlist of just {0}
+// silently excluded the actual base game. Deny only the confirmed-junk
+// types; let everything else (0, 11, and anything unobserved) through.
+const JUNK_GAME_TYPES = new Set([2, 3, 5, 6, 7, 13, 14]);
+
+function isMainGame(g: IGDBGame): boolean {
+  return g.game_type == null || !JUNK_GAME_TYPES.has(g.game_type);
 }
 
 async function getToken(): Promise<string> {
@@ -70,11 +100,30 @@ function mapGame(g: IGDBGame): MediaItem {
   };
 }
 
-const SEARCH_FIELDS = "name,summary,cover.url,first_release_date,total_rating_count,hypes";
+const SEARCH_FIELDS = "name,summary,cover.url,first_release_date,total_rating_count,hypes,game_type";
+
+// IGDB sometimes has more than one entry for the same title (e.g. a
+// main_game AND a separate port/edition entry both literally named
+// "Fortnite"). Keep only the highest-signal one per exact title.
+function dedupeByTitle(games: IGDBGame[]): IGDBGame[] {
+  const best = new Map<string, IGDBGame>();
+  for (const g of games) {
+    const key = g.name.trim().toLowerCase();
+    const existing = best.get(key);
+    if (!existing || (g.total_rating_count ?? 0) > (existing.total_rating_count ?? 0)) {
+      best.set(key, g);
+    }
+  }
+  return [...best.values()];
+}
 
 export async function searchIGDB(q: string): Promise<MediaItem[]> {
-  const games = await query(`search "${q}"; fields ${SEARCH_FIELDS}; limit 30;`);
-  return games.filter(passesQualityBar).map(mapGame);
+  // Fetch a larger raw candidate pool since filtering (quality + main-game)
+  // happens after the fetch, not in the query itself.
+  const games = await query(`search "${q}"; fields ${SEARCH_FIELDS}; limit 50;`);
+  return dedupeByTitle(
+    games.filter(isMainGame).filter((g) => passesQualityBar(g, isExactMatch(g.name, q)))
+  ).map(mapGame);
 }
 
 export async function detailsIGDB(id: string): Promise<MediaItem> {
@@ -88,16 +137,16 @@ export async function detailsIGDB(id: string): Promise<MediaItem> {
 // Popular, already-released games (for the Discover page's "Popular games" shelf).
 export async function discoverIGDBPopular(limit = 20): Promise<MediaItem[]> {
   const games = await query(
-    `fields ${SEARCH_FIELDS}; where total_rating_count > 50 & cover != null; sort total_rating_count desc; limit ${limit};`
+    `fields ${SEARCH_FIELDS}; where total_rating_count > 50 & cover != null; sort total_rating_count desc; limit ${limit * 2};`
   );
-  return games.map(mapGame);
+  return games.filter(isMainGame).slice(0, limit).map(mapGame);
 }
 
 // Anticipated, not-yet-released games (for "Popular upcoming").
 export async function discoverIGDBUpcoming(limit = 12): Promise<MediaItem[]> {
   const nowSeconds = Math.floor(Date.now() / 1000);
   const games = await query(
-    `fields ${SEARCH_FIELDS}; where first_release_date > ${nowSeconds} & cover != null & hypes != null; sort hypes desc; limit ${limit};`
+    `fields ${SEARCH_FIELDS}; where first_release_date > ${nowSeconds} & cover != null & hypes != null; sort hypes desc; limit ${limit * 2};`
   );
-  return games.map(mapGame);
+  return games.filter(isMainGame).slice(0, limit).map(mapGame);
 }

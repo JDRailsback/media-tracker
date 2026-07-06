@@ -11,6 +11,7 @@ import {
 } from "./tmdb";
 import { searchIGDB, detailsIGDB, discoverIGDBPopular, discoverIGDBUpcoming } from "./igdb";
 import { searchMangaDex, detailsMangaDex, discoverMangaDex } from "./mangadex";
+import { matchTier } from "./textMatch";
 
 // Round-robin interleave instead of concatenating. Without this, a combined
 // search for "minecraft" would show 20 irrelevant movies (fetched first, in
@@ -27,18 +28,26 @@ function interleave(lists: MediaItem[][]): MediaItem[] {
   return out;
 }
 
+// Array.prototype.sort is stable in all modern JS engines, so items within
+// the same tier keep their interleaved (cross-category) relative order.
+// (Each adapter also applies a stricter popularity bar to non-exact matches
+// before this ever runs — see lib/sources/textMatch.ts and each adapter.)
+function byRelevance(items: MediaItem[], query: string): MediaItem[] {
+  return [...items].sort((a, b) => matchTier(a.title, query) - matchTier(b.title, query));
+}
+
 // Search dispatch. No type -> search all sources concurrently, quality-filter
 // (done inside each adapter), and interleave — never grouped by category.
 export async function search(query: string, type?: string | null): Promise<MediaItem[]> {
   switch (type) {
     case "movie":
-      return searchTMDBMovie(query);
+      return byRelevance(await searchTMDBMovie(query), query);
     case "tvShow":
-      return searchTMDBTV(query);
+      return byRelevance(await searchTMDBTV(query), query);
     case "game":
-      return searchIGDB(query);
+      return byRelevance(await searchIGDB(query), query);
     case "manga":
-      return searchMangaDex(query);
+      return byRelevance(await searchMangaDex(query), query);
     default: {
       const settled = await Promise.allSettled([
         searchTMDBMovie(query),
@@ -47,7 +56,7 @@ export async function search(query: string, type?: string | null): Promise<Media
         searchMangaDex(query),
       ]);
       const lists = settled.map((r) => (r.status === "fulfilled" ? r.value : []));
-      return interleave(lists);
+      return byRelevance(interleave(lists), query);
     }
   }
 }

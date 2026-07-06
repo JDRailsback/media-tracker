@@ -1,4 +1,5 @@
 import type { ExternalLink, LinkKind, MediaItem } from "@/lib/types";
+import { isExactMatch } from "./textMatch";
 
 // TMDB adapter (TS port). Maps TMDB's JSON into our MediaItem.
 // Runs server-side only (in an API route), so TMDB_API_KEY stays secret.
@@ -12,16 +13,27 @@ const IMAGE_BASE = "https://image.tmdb.org/t/p/w500";
 const MIN_VOTE_COUNT = 20;
 const MIN_POPULARITY = 3;
 
+// A loosely-related result (a tie-in special, an unrelated title that only
+// fuzzy/keyword-matched) needs to be MUCH more significant to show up at all
+// — this is what keeps something like a minor "X x Y" crossover special or
+// an obscure look-alike title from cluttering a search for the thing you
+// actually meant. An exact title match always gets the lenient bar above.
+const NON_EXACT_MIN_VOTE_COUNT = 300;
+const NON_EXACT_MIN_POPULARITY = 40;
+
 function passesQualityBar(opts: {
   posterPath?: string | null;
   voteCount: number;
   popularity: number;
   dateStr?: string;
+  isExact: boolean;
 }): boolean {
   if (!opts.posterPath) return false;
   const isFuture = opts.dateStr ? new Date(opts.dateStr) > new Date() : true;
-  if (isFuture) return opts.popularity >= MIN_POPULARITY;
-  return opts.voteCount >= MIN_VOTE_COUNT || opts.popularity >= MIN_POPULARITY * 4;
+  const minVotes = opts.isExact ? MIN_VOTE_COUNT : NON_EXACT_MIN_VOTE_COUNT;
+  const minPopularity = opts.isExact ? MIN_POPULARITY : NON_EXACT_MIN_POPULARITY;
+  if (isFuture) return opts.popularity >= minPopularity;
+  return opts.voteCount >= minVotes || opts.popularity >= minPopularity * 4;
 }
 
 function key(): string {
@@ -54,6 +66,7 @@ export async function searchTMDBMovie(query: string): Promise<MediaItem[]> {
         voteCount: m.vote_count ?? 0,
         popularity: m.popularity ?? 0,
         dateStr: m.release_date,
+        isExact: isExactMatch(m.title, query),
       })
     )
     .map(mapMovie);
@@ -133,6 +146,7 @@ export async function searchTMDBTV(query: string): Promise<MediaItem[]> {
         voteCount: s.vote_count ?? 0,
         popularity: s.popularity ?? 0,
         dateStr: s.first_air_date,
+        isExact: isExactMatch(s.name, query),
       })
     )
     .map(mapShow);
