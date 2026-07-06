@@ -2,15 +2,42 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --color-canvas: 244 247 251;
+  --color-panel: 255 255 255;
+  --color-surface: 255 255 255;
+  --color-ink: 17 24 39;
+  --color-subtle: 100 111 130;
+  --color-hairline: 224 229 237;
+  --color-accent: 68 87 232;
+  --color-accent-2: 34 197 220;
+  --color-on-accent: 255 255 255;
+}
+
+.dark {
+  --color-canvas: 10 13 19;
+  --color-panel: 14 18 26;
+  --color-surface: 19 24 34;
+  --color-ink: 232 236 243;
+  --color-subtle: 138 148 168;
+  --color-hairline: 32 39 53;
+  --color-accent: 91 114 255;
+  --color-accent-2: 45 212 232;
+  --color-on-accent: 255 255 255;
+}
+
 html,
 body {
-  background: #f2f2f7;
-  color: #1c1c1e;
+  background: rgb(var(--color-canvas));
+  color: rgb(var(--color-ink));
   -webkit-font-smoothing: antialiased;
   overscroll-behavior-y: contain;
 }
 
-/* Respect the iPhone notch/home-indicator safe areas. */
+body {
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
 .safe-top {
   padding-top: env(safe-area-inset-top);
 }

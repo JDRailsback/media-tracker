@@ -37,21 +37,21 @@ export default function DetailModal({
   return (
     <div
       onClick={onClose}
-      className="fixed inset-0 z-30 flex items-center justify-center bg-black/50 p-4"
+      className="fixed inset-0 z-30 flex animate-fade-in items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="relative flex max-h-[85vh] w-full max-w-2xl overflow-hidden rounded-2xl bg-white shadow-2xl"
+        className="relative flex max-h-[85vh] w-full max-w-2xl animate-scale-in overflow-hidden rounded-2xl bg-surface shadow-2xl ring-1 ring-hairline"
       >
         <button
           onClick={onClose}
           aria-label="Close"
-          className="absolute right-4 top-4 z-10 rounded-full bg-white/90 p-1.5 text-ink/70 shadow-sm hover:bg-white"
+          className="absolute right-4 top-4 z-10 rounded-full bg-canvas/90 p-1.5 text-ink/70 backdrop-blur transition-colors hover:text-ink"
         >
           <X size={16} strokeWidth={2.5} />
         </button>
 
-        <div className="hidden w-56 shrink-0 bg-surface sm:block">
+        <div className="hidden w-56 shrink-0 bg-canvas sm:block">
           {full.posterURL ? (
             // eslint-disable-next-line @next/next/no-img-element
             <img src={full.posterURL} alt="" className="h-full w-full object-cover" />
@@ -60,23 +60,23 @@ export default function DetailModal({
 
         <div className="flex-1 overflow-y-auto p-6">
           <TypeTag type={full.type} />
-          <h1 className="mt-2 text-2xl font-semibold text-ink">{full.title}</h1>
-          <div className="mt-1 flex items-center gap-2 text-[13px] text-subtle">
+          <h1 className="mt-2.5 text-2xl font-bold text-ink">{full.title}</h1>
+          <div className="mt-1.5 flex items-center gap-2 text-[13px] text-subtle">
             {full.subtitle && <span>{full.subtitle}</span>}
             {release && (
               <>
                 {full.subtitle && <span>·</span>}
-                <span className="font-medium text-accent">{release.label}</span>
+                <span className="font-semibold text-accent">{release.label}</span>
               </>
             )}
           </div>
 
           <button
             onClick={() => (isFollowed ? onUnfollow() : onFollow(full))}
-            className={`mt-4 flex items-center gap-1.5 rounded-full px-4 py-2 text-[14px] font-medium transition-colors ${
+            className={`mt-4 flex items-center gap-1.5 rounded-full px-4 py-2 text-[14px] font-semibold transition-all duration-200 active:scale-95 ${
               isFollowed
-                ? "bg-surface text-ink hover:bg-hairline"
-                : "bg-accent text-white hover:bg-accent/90"
+                ? "bg-canvas text-ink hover:bg-hairline/60"
+                : "bg-gradient-to-r from-accent to-accent-2 text-on-accent shadow-md shadow-accent/25 hover:brightness-110"
             }`}
           >
             {isFollowed ? <Check size={15} /> : <Plus size={15} />}
@@ -89,17 +89,17 @@ export default function DetailModal({
 
           {full.externalLinks && full.externalLinks.length > 0 && (
             <div className="mt-5">
-              <h2 className="mb-2 text-[12.5px] font-medium uppercase tracking-wide text-subtle">
+              <h2 className="mb-2 text-[12.5px] font-semibold uppercase tracking-wide text-subtle">
                 Available on
               </h2>
               <div className="flex flex-wrap gap-2">
                 {full.externalLinks.map((l) => (
                   <a
-                    key={l.provider + l.url}
+                    key={`${l.provider}-${l.kind}-${l.url}`}
                     href={l.url}
                     target="_blank"
                     rel="noreferrer"
-                    className="flex items-center gap-1.5 rounded-full bg-surface px-3 py-1.5 text-[13px] font-medium text-ink hover:bg-hairline"
+                    className="flex items-center gap-1.5 rounded-full bg-canvas px-3 py-1.5 text-[13px] font-medium text-ink transition-all duration-200 hover:-translate-y-0.5 hover:bg-hairline/60"
                   >
                     <Play size={12} className="fill-ink text-ink" />
                     {l.provider}

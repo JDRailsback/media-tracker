@@ -1,19 +1,27 @@
 import type { Metadata, Viewport } from "next";
+import { Plus_Jakarta_Sans } from "next/font/google";
+import { THEME_INIT_SCRIPT } from "@/lib/theme";
 import "./globals.css";
+
+const jakarta = Plus_Jakarta_Sans({
+  subsets: ["latin"],
+  variable: "--font-sans",
+  weight: ["400", "500", "600", "700", "800"],
+});
 
 export const metadata: Metadata = {
   title: "Media Tracker",
-  description: "Track releases across movies, games, and manga.",
+  description: "Follow movies, shows, games, and manga — know the moment something new drops.",
   manifest: "/manifest.json",
   appleWebApp: {
     capable: true,
-    statusBarStyle: "default",
+    statusBarStyle: "black-translucent",
     title: "Media Tracker",
   },
 };
 
 export const viewport: Viewport = {
-  themeColor: "#f2f2f7",
+  themeColor: "#16130f",
   viewportFit: "cover",
 };
 
@@ -23,8 +31,11 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
-      <body className="font-sans">{children}</body>
+    <html lang="en" className={jakarta.variable} suppressHydrationWarning>
+      <body className="bg-canvas font-sans text-ink">
+        <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
+        {children}
+      </body>
     </html>
   );
 }

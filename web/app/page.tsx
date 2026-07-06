@@ -10,6 +10,8 @@ import DetailModal from "@/components/DetailModal";
 import MediaCard from "@/components/MediaCard";
 import FeedRow from "@/components/FeedRow";
 import Sidebar, { View } from "@/components/Sidebar";
+import ThemeToggle from "@/components/ThemeToggle";
+import AmbientBackground from "@/components/AmbientBackground";
 
 export default function Home() {
   const [view, setView] = useState<View>("feed");
@@ -54,10 +56,11 @@ export default function Home() {
   const selectedFollowed = selected ? isFollowed(selected.id) : false;
 
   return (
-    <div className="min-h-screen bg-surface">
+    <div className="relative min-h-screen bg-canvas">
+      <AmbientBackground />
       <Sidebar active={view} onChange={setView} />
 
-      <main className="mx-auto max-w-3xl px-6 py-10 md:ml-60 md:px-10">
+      <main className="relative mx-auto max-w-3xl px-6 py-12 md:ml-64 md:px-12">
         {view === "feed" && (
           <>
             <PageHeader title="Home" subtitle="What's new with what you follow." />
@@ -68,17 +71,18 @@ export default function Home() {
                 text="Follow a movie, show, game, or manga in Discover to see release updates here."
               />
             ) : (
-              <div className="space-y-8">
+              <div className="space-y-9">
                 {feed.map((group) => (
                   <section key={group.key}>
-                    <h2 className="mb-2 text-[13px] font-medium uppercase tracking-wide text-subtle">
+                    <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-subtle">
                       {group.title}
                     </h2>
-                    <div className="rounded-2xl bg-white p-1.5 shadow-sm ring-1 ring-black/[0.03]">
-                      {group.items.map((item) => (
+                    <div className="rounded-2xl border border-hairline bg-panel/70 p-1.5 shadow-sm backdrop-blur-xl">
+                      {group.items.map((item, i) => (
                         <FeedRow
                           key={item.id}
                           item={item}
+                          index={i}
                           badge={describeRelease(item) ?? undefined}
                           onSelect={setSelected}
                         />
@@ -94,22 +98,25 @@ export default function Home() {
         {view === "discover" && (
           <>
             <PageHeader title="Discover" subtitle="Search movies, TV, games, and manga." />
-            <form onSubmit={search} className="flex items-center gap-2 rounded-xl bg-white px-4 py-3 shadow-sm ring-1 ring-black/[0.03]">
+            <form
+              onSubmit={search}
+              className="flex items-center gap-2.5 rounded-xl border border-hairline bg-panel/70 px-4 py-3 shadow-sm backdrop-blur-xl transition-shadow focus-within:shadow-md focus-within:shadow-accent/10"
+            >
               <SearchIcon size={18} className="text-subtle" />
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search for something to follow…"
-                className="w-full bg-transparent text-[15px] outline-none placeholder:text-subtle"
+                className="w-full bg-transparent text-[15px] text-ink outline-none placeholder:text-subtle"
               />
             </form>
 
-            {loading && <p className="mt-4 text-[13px] text-subtle">Searching…</p>}
+            {loading && <SearchSkeleton />}
 
-            {results.length > 0 && (
-              <div className="mt-6 grid grid-cols-2 gap-x-4 gap-y-6 sm:grid-cols-3 lg:grid-cols-4">
-                {results.map((item) => (
-                  <MediaCard key={item.id} item={item} onSelect={setSelected} />
+            {!loading && results.length > 0 && (
+              <div className="mt-7 grid grid-cols-2 gap-x-5 gap-y-7 sm:grid-cols-3 lg:grid-cols-4">
+                {results.map((item, i) => (
+                  <MediaCard key={item.id} item={item} index={i} onSelect={setSelected} />
                 ))}
               </div>
             )}
@@ -118,7 +125,10 @@ export default function Home() {
 
         {view === "following" && (
           <>
-            <PageHeader title="Following" subtitle={`${followed.length} item${followed.length === 1 ? "" : "s"}.`} />
+            <PageHeader
+              title="Following"
+              subtitle={`${followed.length} item${followed.length === 1 ? "" : "s"}.`}
+            />
             {followed.length === 0 ? (
               <EmptyState
                 icon={<Sparkles size={22} className="text-subtle" />}
@@ -126,11 +136,12 @@ export default function Home() {
                 text="Find something in Discover and follow it to start tracking releases."
               />
             ) : (
-              <div className="rounded-2xl bg-white p-1.5 shadow-sm ring-1 ring-black/[0.03]">
-                {followed.map((item) => (
+              <div className="rounded-2xl border border-hairline bg-panel/70 p-1.5 shadow-sm backdrop-blur-xl">
+                {followed.map((item, i) => (
                   <FeedRow
                     key={item.id}
                     item={item}
+                    index={i}
                     badge={describeRelease(item) ?? undefined}
                     onSelect={setSelected}
                   />
@@ -143,15 +154,19 @@ export default function Home() {
         {view === "settings" && (
           <>
             <PageHeader title="Settings" />
-            <div className="overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-black/[0.03]">
-              <button
-                onClick={handleEnablePush}
-                className="flex w-full items-center gap-3 px-4 py-3.5 text-left hover:bg-surface"
-              >
-                <Bell size={18} className="text-accent" />
-                <span className="flex-1 text-[15px] text-ink">Enable notifications</span>
-                {pushEnabled && <span className="text-[13px] text-subtle">On</span>}
-              </button>
+            <div className="space-y-4">
+              <SettingsRow label="Appearance">
+                <ThemeToggle />
+              </SettingsRow>
+              <SettingsRow label="Notifications">
+                <button
+                  onClick={handleEnablePush}
+                  className="flex items-center gap-2 rounded-full bg-gradient-to-r from-accent to-accent-2 px-3.5 py-1.5 text-[13px] font-semibold text-on-accent shadow-sm shadow-accent/25 transition-all duration-200 hover:brightness-110 active:scale-95"
+                >
+                  <Bell size={14} />
+                  {pushEnabled ? "Enabled" : "Enable"}
+                </button>
+              </SettingsRow>
             </div>
           </>
         )}
@@ -172,9 +187,18 @@ export default function Home() {
 
 function PageHeader({ title, subtitle }: { title: string; subtitle?: string }) {
   return (
-    <div className="mb-6">
-      <h1 className="text-[26px] font-semibold tracking-tight text-ink">{title}</h1>
-      {subtitle && <p className="mt-1 text-[14px] text-subtle">{subtitle}</p>}
+    <div className="mb-7 animate-fade-up">
+      <h1 className="text-[28px] font-bold tracking-tight text-ink">{title}</h1>
+      {subtitle && <p className="mt-1.5 text-[14px] text-subtle">{subtitle}</p>}
+    </div>
+  );
+}
+
+function SettingsRow({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-center justify-between rounded-2xl border border-hairline bg-panel/70 px-5 py-4 shadow-sm backdrop-blur-xl">
+      <span className="text-[15px] font-medium text-ink">{label}</span>
+      {children}
     </div>
   );
 }
@@ -189,12 +213,26 @@ function EmptyState({
   text: string;
 }) {
   return (
-    <div className="flex flex-col items-center rounded-2xl bg-white px-6 py-16 text-center shadow-sm ring-1 ring-black/[0.03]">
-      <div className="mb-3 flex h-11 w-11 items-center justify-center rounded-full bg-surface">
+    <div className="flex animate-fade-up flex-col items-center rounded-2xl border border-hairline bg-panel/70 px-6 py-16 text-center shadow-sm backdrop-blur-xl">
+      <div className="mb-3 flex h-11 w-11 items-center justify-center rounded-full bg-gradient-to-br from-accent/15 to-accent-2/10">
         {icon}
       </div>
-      <div className="text-[15px] font-medium text-ink">{title}</div>
+      <div className="text-[15px] font-semibold text-ink">{title}</div>
       <p className="mt-1 max-w-xs text-[13.5px] text-subtle">{text}</p>
+    </div>
+  );
+}
+
+function SearchSkeleton() {
+  return (
+    <div className="mt-7 grid grid-cols-2 gap-x-5 gap-y-7 sm:grid-cols-3 lg:grid-cols-4">
+      {Array.from({ length: 8 }).map((_, i) => (
+        <div key={i} className="animate-pulse">
+          <div className="aspect-[2/3] w-full rounded-xl2 bg-gradient-to-br from-surface to-panel" />
+          <div className="mt-2.5 h-3 w-4/5 rounded bg-surface" />
+          <div className="mt-2 h-3 w-1/3 rounded bg-surface" />
+        </div>
+      ))}
     </div>
   );
 }
