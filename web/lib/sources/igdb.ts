@@ -1,5 +1,5 @@
-import type { MediaItem } from "@/lib/types";
-import { isExactMatch } from "./textMatch";
+import type { ExternalLink, MediaItem } from "@/lib/types";
+import { isExactMatch, RankedItem } from "./textMatch";
 
 // IGDB adapter (TS port). OAuth token + POST query body.
 
@@ -36,6 +36,15 @@ function passesQualityBar(g: IGDBGame, isExact: boolean): boolean {
   if (isFuture) return true;
   const minCount = isExact ? MIN_RATING_COUNT : NON_EXACT_MIN_RATING_COUNT;
   return (g.total_rating_count ?? 0) >= minCount;
+}
+
+// Would this game clear the bar even judged as a non-exact match? Ranking
+// signal only (see RankedItem) — lets a hugely popular near-match outrank an
+// obscure exact-match title.
+function isSignificant(g: IGDBGame): boolean {
+  const isFuture = g.first_release_date ? g.first_release_date * 1000 > Date.now() : true;
+  if (isFuture) return (g.hypes ?? 0) > 0;
+  return (g.total_rating_count ?? 0) >= NON_EXACT_MIN_RATING_COUNT;
 }
 
 // IGDB tags every sub-entry (seasons, episodes, DLC, packs, updates...) as
@@ -121,21 +130,48 @@ function dedupeByTitle(games: IGDBGame[]): IGDBGame[] {
   return [...best.values()];
 }
 
-export async function searchIGDB(q: string): Promise<MediaItem[]> {
+export async function searchIGDB(q: string): Promise<RankedItem[]> {
   // Fetch a larger raw candidate pool since filtering (quality + main-game)
   // happens after the fetch, not in the query itself.
   const games = await query(`search "${q}"; fields ${SEARCH_FIELDS}; limit 50;`);
   return dedupeByTitle(
     games.filter(isMainGame).filter((g) => passesQualityBar(g, isExactMatch(g.name, q)))
-  ).map(mapGame);
+  ).map((g) => ({ ...mapGame(g), significant: isSignificant(g) }));
+}
+
+// Recognized storefront domains. Verified live against a real IGDB response
+// (The Witcher 3): IGDB's `websites` field has NO usable category field (it
+// came back empty even when requested), so we match by URL domain instead —
+// robust and doesn't depend on an undocumented/uncertain enum.
+const STORE_DOMAINS: { pattern: string; provider: string }[] = [
+  { pattern: "store.steampowered.com", provider: "Steam" },
+  { pattern: "epicgames.com", provider: "Epic Games Store" },
+  { pattern: "xbox.com", provider: "Xbox" },
+  { pattern: "playstation.com", provider: "PlayStation Store" },
+  { pattern: "nintendo.com", provider: "Nintendo eShop" },
+  { pattern: "gog.com", provider: "GOG" },
+];
+
+function storeLinks(websites: { url?: string }[] | undefined): ExternalLink[] | undefined {
+  if (!websites) return undefined;
+  const links: ExternalLink[] = [];
+  for (const w of websites) {
+    if (!w.url) continue;
+    const match = STORE_DOMAINS.find((d) => w.url!.includes(d.pattern));
+    if (match) links.push({ provider: match.provider, url: w.url, kind: "store" });
+  }
+  return links.length ? links : undefined;
 }
 
 export async function detailsIGDB(id: string): Promise<MediaItem> {
   const games = await query(
-    `fields name,summary,cover.url,first_release_date; where id = ${id};`
+    `fields name,summary,cover.url,first_release_date,websites.url; where id = ${id};`
   );
   if (games.length === 0) throw new Error(`Game ${id} not found`);
-  return mapGame(games[0]);
+  const game = games[0] as IGDBGame & { websites?: { url?: string }[] };
+  const item = mapGame(game);
+  item.externalLinks = storeLinks(game.websites);
+  return item;
 }
 
 // Popular, already-released games (for the Discover page's "Popular games" shelf).

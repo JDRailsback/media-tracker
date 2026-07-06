@@ -1,5 +1,5 @@
 import type { ExternalLink, LinkKind, MediaItem } from "@/lib/types";
-import { isExactMatch } from "./textMatch";
+import { isExactMatch, RankedItem } from "./textMatch";
 
 // TMDB adapter (TS port). Maps TMDB's JSON into our MediaItem.
 // Runs server-side only (in an API route), so TMDB_API_KEY stays secret.
@@ -43,6 +43,15 @@ function passesQualityBar(opts: {
   return opts.voteCount >= minVotes || opts.popularity >= minPopularity * 4;
 }
 
+// Would this item clear the bar even if judged as a non-exact match? Used
+// purely for ranking (see RankedItem) — lets "Toy Story 2" (a hugely popular
+// near-match) outrank an obscure "Toy Story"-titled game/exact-match.
+function isSignificant(voteCount: number, popularity: number, dateStr?: string): boolean {
+  const isFuture = dateStr ? new Date(dateStr) > new Date() : true;
+  if (isFuture) return popularity >= NON_EXACT_MIN_POPULARITY;
+  return voteCount >= NON_EXACT_MIN_VOTE_COUNT || popularity >= NON_EXACT_MIN_POPULARITY * 4;
+}
+
 function key(): string {
   const k = process.env.TMDB_API_KEY;
   if (!k) throw new Error("TMDB_API_KEY is not set");
@@ -61,7 +70,7 @@ interface TMDBMovie {
   vote_count?: number;
 }
 
-export async function searchTMDBMovie(query: string): Promise<MediaItem[]> {
+export async function searchTMDBMovie(query: string): Promise<RankedItem[]> {
   const url = `https://api.themoviedb.org/3/search/movie?api_key=${key()}&query=${encodeURIComponent(query)}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`TMDB movie search failed: ${res.status}`);
@@ -76,7 +85,10 @@ export async function searchTMDBMovie(query: string): Promise<MediaItem[]> {
         isExact: isExactMatch(m.title, query),
       })
     )
-    .map(mapMovie);
+    .map((m) => ({
+      ...mapMovie(m),
+      significant: isSignificant(m.vote_count ?? 0, m.popularity ?? 0, m.release_date),
+    }));
 }
 
 function mapMovie(m: TMDBMovie): MediaItem {
@@ -141,7 +153,7 @@ interface TMDBShow {
   } | null;
 }
 
-export async function searchTMDBTV(query: string): Promise<MediaItem[]> {
+export async function searchTMDBTV(query: string): Promise<RankedItem[]> {
   const url = `https://api.themoviedb.org/3/search/tv?api_key=${key()}&query=${encodeURIComponent(query)}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`TMDB TV search failed: ${res.status}`);
@@ -156,7 +168,10 @@ export async function searchTMDBTV(query: string): Promise<MediaItem[]> {
         isExact: isExactMatch(s.name, query),
       })
     )
-    .map(mapShow);
+    .map((s) => ({
+      ...mapShow(s),
+      significant: isSignificant(s.vote_count ?? 0, s.popularity ?? 0, s.first_air_date),
+    }));
 }
 
 function mapShow(s: TMDBShow): MediaItem {

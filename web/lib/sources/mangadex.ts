@@ -1,5 +1,5 @@
-import type { MediaItem } from "@/lib/types";
-import { isExactMatch, matchTier } from "./textMatch";
+import type { ExternalLink, MediaItem } from "@/lib/types";
+import { isExactMatch, matchTier, RankedItem } from "./textMatch";
 
 // MangaDex adapter (TS port). v1 = official English chapter dates only.
 
@@ -40,8 +40,38 @@ interface MDManga {
     title: Record<string, string>;
     description?: Record<string, string>;
     year?: number;
+    links?: Record<string, string>;
   };
   relationships: MDRelationship[];
+}
+
+// Would this manga clear the bar even judged as a non-exact match? Ranking
+// signal only (see RankedItem).
+function isSignificant(follows: number): boolean {
+  return follows >= NON_EXACT_MIN_FOLLOWS;
+}
+
+// MangaDex's `links` field, verified live against a real response (One
+// Piece): most keys are just cross-reference IDs to OTHER catalog sites
+// (AniList, MyAnimeList, Kitsu, MangaUpdates...) — not places to actually
+// read/buy the manga, so we skip those. A few keys ARE real, direct links:
+//   engtl -> official English translation (e.g. Manga Plus) — the best link
+//   bw    -> BookWalker; only a URL PATH, needs the domain prepended
+//   amz/ebj/cdj -> Amazon/eBookJapan/CDJapan — already full URLs
+//   raw   -> official Japanese source; used only as a fallback if no engtl
+function readBuyLinks(mangaID: string, links?: Record<string, string>): ExternalLink[] {
+  const out: ExternalLink[] = [];
+  if (links?.engtl) out.push({ provider: "Official (English)", url: links.engtl, kind: "stream" });
+  else if (links?.raw) out.push({ provider: "Official (Japanese)", url: links.raw, kind: "info" });
+  if (links?.bw) out.push({ provider: "BookWalker", url: `https://bookwalker.jp/${links.bw}`, kind: "buy" });
+  if (links?.amz) out.push({ provider: "Amazon", url: links.amz, kind: "buy" });
+  if (links?.ebj) out.push({ provider: "eBookJapan", url: links.ebj, kind: "buy" });
+  if (links?.cdj) out.push({ provider: "CDJapan", url: links.cdj, kind: "buy" });
+  // Always link to SOMETHING — fall back to the manga's own MangaDex page.
+  if (out.length === 0) {
+    out.push({ provider: "MangaDex", url: `https://mangadex.org/title/${mangaID}`, kind: "info" });
+  }
+  return out;
 }
 
 function coverURL(m: MDManga): string | undefined {
@@ -83,7 +113,7 @@ async function fetchFollows(ids: string[]): Promise<Record<string, number>> {
   return out;
 }
 
-export async function searchMangaDex(q: string): Promise<MediaItem[]> {
+export async function searchMangaDex(q: string): Promise<RankedItem[]> {
   const url = `https://api.mangadex.org/manga?title=${encodeURIComponent(q)}&limit=15&includes[]=cover_art&${CONTENT_RATING}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`MangaDex search failed: ${res.status}`);
@@ -105,7 +135,7 @@ export async function searchMangaDex(q: string): Promise<MediaItem[]> {
       return (follows[m.id] ?? 0) >= threshold;
     })
     .sort((a, b) => (follows[b.id] ?? 0) - (follows[a.id] ?? 0))
-    .map((m) => mapManga(m));
+    .map((m) => ({ ...mapManga(m), significant: isSignificant(follows[m.id] ?? 0) }));
 }
 
 export async function detailsMangaDex(id: string): Promise<MediaItem> {
@@ -114,7 +144,9 @@ export async function detailsMangaDex(id: string): Promise<MediaItem> {
   const manga = (await res.json()).data as MDManga;
 
   const next = await nextOfficialChapter(id);
-  return mapManga(manga, next?.date, next ? `Ch. ${next.chapter}` : undefined);
+  const item = mapManga(manga, next?.date, next ? `Ch. ${next.chapter}` : undefined);
+  item.externalLinks = readBuyLinks(id, manga.attributes.links);
+  return item;
 }
 
 // Popular manga (for the Discover page's "Popular manga" shelf). MangaDex can
