@@ -7,6 +7,23 @@ import type { ExternalLink, LinkKind, MediaItem } from "@/lib/types";
 
 const IMAGE_BASE = "https://image.tmdb.org/t/p/w500";
 
+// Quality bar: cuts out obscure/low-signal entries (see docs/DISCOVER_AND_SEARCH.md).
+// Unreleased titles get a pass on vote count — they legitimately have none yet.
+const MIN_VOTE_COUNT = 20;
+const MIN_POPULARITY = 3;
+
+function passesQualityBar(opts: {
+  posterPath?: string | null;
+  voteCount: number;
+  popularity: number;
+  dateStr?: string;
+}): boolean {
+  if (!opts.posterPath) return false;
+  const isFuture = opts.dateStr ? new Date(opts.dateStr) > new Date() : true;
+  if (isFuture) return opts.popularity >= MIN_POPULARITY;
+  return opts.voteCount >= MIN_VOTE_COUNT || opts.popularity >= MIN_POPULARITY * 4;
+}
+
 function key(): string {
   const k = process.env.TMDB_API_KEY;
   if (!k) throw new Error("TMDB_API_KEY is not set");
@@ -21,6 +38,8 @@ interface TMDBMovie {
   overview?: string;
   poster_path?: string | null;
   release_date?: string;
+  popularity?: number;
+  vote_count?: number;
 }
 
 export async function searchTMDBMovie(query: string): Promise<MediaItem[]> {
@@ -28,7 +47,16 @@ export async function searchTMDBMovie(query: string): Promise<MediaItem[]> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`TMDB movie search failed: ${res.status}`);
   const data = await res.json();
-  return (data.results as TMDBMovie[]).map(mapMovie);
+  return (data.results as TMDBMovie[])
+    .filter((m) =>
+      passesQualityBar({
+        posterPath: m.poster_path,
+        voteCount: m.vote_count ?? 0,
+        popularity: m.popularity ?? 0,
+        dateStr: m.release_date,
+      })
+    )
+    .map(mapMovie);
 }
 
 function mapMovie(m: TMDBMovie): MediaItem {
@@ -52,6 +80,28 @@ export async function detailsTMDBMovie(id: string): Promise<MediaItem> {
   return base;
 }
 
+// Popular movies (for the Discover page's "Trending movies" shelf).
+export async function discoverTMDBMovies(limit = 20): Promise<MediaItem[]> {
+  const url = `https://api.themoviedb.org/3/discover/movie?api_key=${key()}&sort_by=popularity.desc&vote_count.gte=100`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`TMDB discover movies failed: ${res.status}`);
+  const data = await res.json();
+  return (data.results as TMDBMovie[]).slice(0, limit).map(mapMovie);
+}
+
+// Popular, not-yet-released movies (for "Popular upcoming").
+export async function discoverTMDBUpcomingMovies(limit = 12): Promise<MediaItem[]> {
+  const today = new Date().toISOString().slice(0, 10);
+  const url = `https://api.themoviedb.org/3/discover/movie?api_key=${key()}&sort_by=popularity.desc&primary_release_date.gte=${today}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`TMDB discover upcoming movies failed: ${res.status}`);
+  const data = await res.json();
+  return (data.results as TMDBMovie[])
+    .filter((m) => m.poster_path)
+    .slice(0, limit)
+    .map(mapMovie);
+}
+
 // ---------- TV shows ----------
 
 interface TMDBShow {
@@ -61,6 +111,8 @@ interface TMDBShow {
   poster_path?: string | null;
   first_air_date?: string;
   status?: string; // "Returning Series", "Ended", "Canceled", ...
+  popularity?: number;
+  vote_count?: number;
   next_episode_to_air?: {
     air_date: string;
     episode_number: number;
@@ -74,7 +126,16 @@ export async function searchTMDBTV(query: string): Promise<MediaItem[]> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`TMDB TV search failed: ${res.status}`);
   const data = await res.json();
-  return (data.results as TMDBShow[]).map(mapShow);
+  return (data.results as TMDBShow[])
+    .filter((s) =>
+      passesQualityBar({
+        posterPath: s.poster_path,
+        voteCount: s.vote_count ?? 0,
+        popularity: s.popularity ?? 0,
+        dateStr: s.first_air_date,
+      })
+    )
+    .map(mapShow);
 }
 
 function mapShow(s: TMDBShow): MediaItem {
@@ -102,6 +163,42 @@ export async function detailsTMDBTV(id: string): Promise<MediaItem> {
   const base = mapShow(d as TMDBShow);
   base.externalLinks = watchLinks(d["watch/providers"]?.results?.US);
   return base;
+}
+
+// Popular TV shows (for the Discover page's "Trending TV" shelf).
+export async function discoverTMDBTV(limit = 20): Promise<MediaItem[]> {
+  const url = `https://api.themoviedb.org/3/discover/tv?api_key=${key()}&sort_by=popularity.desc&vote_count.gte=100`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`TMDB discover TV failed: ${res.status}`);
+  const data = await res.json();
+  return (data.results as TMDBShow[]).slice(0, limit).map((s) => ({
+    id: `tvShow:${s.id}`,
+    type: "tvShow" as const,
+    title: s.name,
+    overview: s.overview || undefined,
+    posterURL: s.poster_path ? `${IMAGE_BASE}${s.poster_path}` : undefined,
+    releaseDate: undefined,
+  }));
+}
+
+// Popular, soon-to-premiere shows (for "Popular upcoming").
+export async function discoverTMDBUpcomingTV(limit = 12): Promise<MediaItem[]> {
+  const today = new Date().toISOString().slice(0, 10);
+  const url = `https://api.themoviedb.org/3/discover/tv?api_key=${key()}&sort_by=popularity.desc&first_air_date.gte=${today}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`TMDB discover upcoming TV failed: ${res.status}`);
+  const data = await res.json();
+  return (data.results as TMDBShow[])
+    .filter((s) => s.poster_path)
+    .slice(0, limit)
+    .map((s) => ({
+      id: `tvShow:${s.id}`,
+      type: "tvShow" as const,
+      title: s.name,
+      overview: s.overview || undefined,
+      posterURL: s.poster_path ? `${IMAGE_BASE}${s.poster_path}` : undefined,
+      releaseDate: s.first_air_date,
+    }));
 }
 
 // ---------- Shared: watch providers ----------

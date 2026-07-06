@@ -1,12 +1,13 @@
 "use client";
 
-import { Home, Search, Bookmark, Settings, Clapperboard } from "lucide-react";
+import { Home, Search, Compass, Bookmark, Settings, Clapperboard } from "lucide-react";
 
-export type View = "feed" | "discover" | "following" | "settings";
+export type View = "feed" | "discover" | "search" | "following" | "settings";
 
 const ITEMS: { id: View; label: string; icon: typeof Home }[] = [
   { id: "feed", label: "Home", icon: Home },
-  { id: "discover", label: "Discover", icon: Search },
+  { id: "discover", label: "Discover", icon: Compass },
+  { id: "search", label: "Search", icon: Search },
   { id: "following", label: "Following", icon: Bookmark },
   { id: "settings", label: "Settings", icon: Settings },
 ];

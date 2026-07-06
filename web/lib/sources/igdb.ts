@@ -2,12 +2,27 @@ import type { MediaItem } from "@/lib/types";
 
 // IGDB adapter (TS port). OAuth token + POST query body.
 
+// Quality bar: released games need real rating volume; unreleased games get a
+// pass (they legitimately have none yet) as long as they have cover art.
+const MIN_RATING_COUNT = 5;
+
 interface IGDBGame {
   id: number;
   name: string;
   summary?: string;
   cover?: { url?: string };
   first_release_date?: number; // Unix seconds
+  total_rating_count?: number;
+  hypes?: number;
+}
+
+function passesQualityBar(g: IGDBGame): boolean {
+  if (!g.cover?.url) return false;
+  const isFuture = g.first_release_date
+    ? g.first_release_date * 1000 > Date.now()
+    : true;
+  if (isFuture) return true;
+  return (g.total_rating_count ?? 0) >= MIN_RATING_COUNT;
 }
 
 async function getToken(): Promise<string> {
@@ -55,11 +70,11 @@ function mapGame(g: IGDBGame): MediaItem {
   };
 }
 
+const SEARCH_FIELDS = "name,summary,cover.url,first_release_date,total_rating_count,hypes";
+
 export async function searchIGDB(q: string): Promise<MediaItem[]> {
-  const games = await query(
-    `search "${q}"; fields name,summary,cover.url,first_release_date; limit 20;`
-  );
-  return games.map(mapGame);
+  const games = await query(`search "${q}"; fields ${SEARCH_FIELDS}; limit 30;`);
+  return games.filter(passesQualityBar).map(mapGame);
 }
 
 export async function detailsIGDB(id: string): Promise<MediaItem> {
@@ -68,4 +83,21 @@ export async function detailsIGDB(id: string): Promise<MediaItem> {
   );
   if (games.length === 0) throw new Error(`Game ${id} not found`);
   return mapGame(games[0]);
+}
+
+// Popular, already-released games (for the Discover page's "Popular games" shelf).
+export async function discoverIGDBPopular(limit = 20): Promise<MediaItem[]> {
+  const games = await query(
+    `fields ${SEARCH_FIELDS}; where total_rating_count > 50 & cover != null; sort total_rating_count desc; limit ${limit};`
+  );
+  return games.map(mapGame);
+}
+
+// Anticipated, not-yet-released games (for "Popular upcoming").
+export async function discoverIGDBUpcoming(limit = 12): Promise<MediaItem[]> {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const games = await query(
+    `fields ${SEARCH_FIELDS}; where first_release_date > ${nowSeconds} & cover != null & hypes != null; sort hypes desc; limit ${limit};`
+  );
+  return games.map(mapGame);
 }

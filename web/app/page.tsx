@@ -1,38 +1,75 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Search as SearchIcon, Bell, Sparkles } from "lucide-react";
+import { Search as SearchIcon, Bell, Sparkles, ArrowLeft } from "lucide-react";
 import type { MediaItem } from "@/lib/types";
 import { addFollow, getFollowed, isFollowed, removeFollow, FollowedItem } from "@/lib/library";
 import { buildFeed, describeRelease } from "@/lib/feed";
 import { enablePush, syncFollow } from "@/lib/push-client";
+import type { DiscoverPayload } from "@/lib/sources";
 import DetailModal from "@/components/DetailModal";
 import MediaCard from "@/components/MediaCard";
 import FeedRow from "@/components/FeedRow";
+import Shelf from "@/components/Shelf";
 import Sidebar, { View } from "@/components/Sidebar";
 import ThemeToggle from "@/components/ThemeToggle";
 import AmbientBackground from "@/components/AmbientBackground";
 
+const CATEGORY_TITLE: Record<string, string> = {
+  movies: "Trending movies",
+  tv: "Trending TV",
+  games: "Popular games",
+  manga: "Popular manga",
+  upcoming: "Popular upcoming",
+};
+
 export default function Home() {
   const [view, setView] = useState<View>("feed");
-  const [query, setQuery] = useState("");
-  const [results, setResults] = useState<MediaItem[]>([]);
-  const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<MediaItem | null>(null);
   const [followed, setFollowed] = useState<FollowedItem[]>([]);
   const [pushEnabled, setPushEnabled] = useState(false);
 
+  // Discover
+  const [discoverData, setDiscoverData] = useState<DiscoverPayload | null>(null);
+  const [discoverLoading, setDiscoverLoading] = useState(false);
+  const [category, setCategory] = useState<string | null>(null);
+  const [categoryItems, setCategoryItems] = useState<MediaItem[]>([]);
+  const [categoryLoading, setCategoryLoading] = useState(false);
+
+  // Search
+  const [query, setQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<MediaItem[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+
   useEffect(() => setFollowed(getFollowed()), []);
+
+  useEffect(() => {
+    if (view !== "discover" || discoverData || discoverLoading) return;
+    setDiscoverLoading(true);
+    fetch("/api/discover")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => d && setDiscoverData(d))
+      .finally(() => setDiscoverLoading(false));
+  }, [view, discoverData, discoverLoading]);
+
+  function openCategory(cat: string) {
+    setCategory(cat);
+    setCategoryLoading(true);
+    fetch(`/api/discover?category=${cat}`)
+      .then((r) => (r.ok ? r.json() : []))
+      .then(setCategoryItems)
+      .finally(() => setCategoryLoading(false));
+  }
 
   async function search(e: React.FormEvent) {
     e.preventDefault();
     if (!query.trim()) return;
-    setLoading(true);
+    setSearchLoading(true);
     try {
       const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
-      setResults(res.ok ? await res.json() : []);
+      setSearchResults(res.ok ? await res.json() : []);
     } finally {
-      setLoading(false);
+      setSearchLoading(false);
     }
   }
 
@@ -58,9 +95,15 @@ export default function Home() {
   return (
     <div className="relative min-h-screen bg-canvas">
       <AmbientBackground />
-      <Sidebar active={view} onChange={setView} />
+      <Sidebar
+        active={view}
+        onChange={(v) => {
+          setView(v);
+          setCategory(null);
+        }}
+      />
 
-      <main className="relative mx-auto max-w-3xl px-6 py-12 md:ml-64 md:px-12">
+      <main className="relative mx-auto max-w-4xl px-6 py-12 md:ml-64 md:px-12">
         {view === "feed" && (
           <>
             <PageHeader title="Home" subtitle="What's new with what you follow." />
@@ -95,9 +138,74 @@ export default function Home() {
           </>
         )}
 
-        {view === "discover" && (
+        {view === "discover" && category === null && (
           <>
-            <PageHeader title="Discover" subtitle="Search movies, TV, games, and manga." />
+            <PageHeader title="Discover" subtitle="Popular picks and what's coming up next." />
+            {discoverLoading && !discoverData && (
+              <p className="text-[13px] text-subtle">Loading…</p>
+            )}
+            {discoverData && (
+              <>
+                <Shelf
+                  title={CATEGORY_TITLE.upcoming}
+                  items={discoverData.popularUpcoming}
+                  onSelect={setSelected}
+                  onSeeAll={() => openCategory("upcoming")}
+                />
+                <Shelf
+                  title={CATEGORY_TITLE.movies}
+                  items={discoverData.trendingMovies}
+                  onSelect={setSelected}
+                  onSeeAll={() => openCategory("movies")}
+                />
+                <Shelf
+                  title={CATEGORY_TITLE.tv}
+                  items={discoverData.trendingTV}
+                  onSelect={setSelected}
+                  onSeeAll={() => openCategory("tv")}
+                />
+                <Shelf
+                  title={CATEGORY_TITLE.games}
+                  items={discoverData.popularGames}
+                  onSelect={setSelected}
+                  onSeeAll={() => openCategory("games")}
+                />
+                <Shelf
+                  title={CATEGORY_TITLE.manga}
+                  items={discoverData.popularManga}
+                  onSelect={setSelected}
+                  onSeeAll={() => openCategory("manga")}
+                />
+              </>
+            )}
+          </>
+        )}
+
+        {view === "discover" && category !== null && (
+          <>
+            <button
+              onClick={() => setCategory(null)}
+              className="mb-4 flex items-center gap-1.5 text-[13px] font-medium text-subtle transition-colors hover:text-ink"
+            >
+              <ArrowLeft size={15} />
+              Discover
+            </button>
+            <PageHeader title={CATEGORY_TITLE[category] ?? category} />
+            {categoryLoading ? (
+              <p className="text-[13px] text-subtle">Loading…</p>
+            ) : (
+              <div className="grid grid-cols-2 gap-x-5 gap-y-7 sm:grid-cols-3 lg:grid-cols-4">
+                {categoryItems.map((item, i) => (
+                  <MediaCard key={item.id} item={item} index={i} onSelect={setSelected} />
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {view === "search" && (
+          <>
+            <PageHeader title="Search" subtitle="Find anything, across every category." />
             <form
               onSubmit={search}
               className="flex items-center gap-2.5 rounded-xl border border-hairline bg-panel/70 px-4 py-3 shadow-sm backdrop-blur-xl transition-shadow focus-within:shadow-md focus-within:shadow-accent/10"
@@ -106,16 +214,16 @@ export default function Home() {
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search for something to follow…"
+                placeholder="Search movies, TV, games, and manga…"
                 className="w-full bg-transparent text-[15px] text-ink outline-none placeholder:text-subtle"
               />
             </form>
 
-            {loading && <SearchSkeleton />}
+            {searchLoading && <SearchSkeleton />}
 
-            {!loading && results.length > 0 && (
+            {!searchLoading && searchResults.length > 0 && (
               <div className="mt-7 grid grid-cols-2 gap-x-5 gap-y-7 sm:grid-cols-3 lg:grid-cols-4">
-                {results.map((item, i) => (
+                {searchResults.map((item, i) => (
                   <MediaCard key={item.id} item={item} index={i} onSelect={setSelected} />
                 ))}
               </div>
@@ -133,7 +241,7 @@ export default function Home() {
               <EmptyState
                 icon={<Sparkles size={22} className="text-subtle" />}
                 title="Nothing followed yet"
-                text="Find something in Discover and follow it to start tracking releases."
+                text="Find something in Discover or Search and follow it to start tracking releases."
               />
             ) : (
               <div className="rounded-2xl border border-hairline bg-panel/70 p-1.5 shadow-sm backdrop-blur-xl">

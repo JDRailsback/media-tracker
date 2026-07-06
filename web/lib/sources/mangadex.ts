@@ -2,6 +2,12 @@ import type { MediaItem } from "@/lib/types";
 
 // MangaDex adapter (TS port). v1 = official English chapter dates only.
 
+// Quality bar: manga has no per-item popularity in the base search response,
+// so we batch-fetch "follows" via /statistics/manga (one extra request per
+// search, not one per result) and require a minimum. Confirmed live:
+// GET /statistics/manga?manga[]=id1&manga[]=id2 -> { statistics: { [id]: { follows } } }
+const MIN_FOLLOWS = 50;
+
 interface MDRelationship {
   id: string;
   type: string;
@@ -39,12 +45,34 @@ function mapManga(m: MDManga, releaseDate?: string, subtitle?: string): MediaIte
   };
 }
 
+// Batch-fetch follow counts for a set of manga ids in ONE request.
+async function fetchFollows(ids: string[]): Promise<Record<string, number>> {
+  if (ids.length === 0) return {};
+  const params = ids.map((id) => `manga[]=${id}`).join("&");
+  const res = await fetch(`https://api.mangadex.org/statistics/manga?${params}`);
+  if (!res.ok) return {};
+  const data = await res.json();
+  const out: Record<string, number> = {};
+  for (const id of ids) {
+    out[id] = data.statistics?.[id]?.follows ?? 0;
+  }
+  return out;
+}
+
 export async function searchMangaDex(q: string): Promise<MediaItem[]> {
-  const url = `https://api.mangadex.org/manga?title=${encodeURIComponent(q)}&limit=10&includes[]=cover_art`;
+  const url = `https://api.mangadex.org/manga?title=${encodeURIComponent(q)}&limit=15&includes[]=cover_art`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`MangaDex search failed: ${res.status}`);
   const data = await res.json();
-  return (data.data as MDManga[]).map((m) => mapManga(m));
+  const results = data.data as MDManga[];
+
+  const withCovers = results.filter((m) => coverURL(m));
+  const follows = await fetchFollows(withCovers.map((m) => m.id));
+
+  return withCovers
+    .filter((m) => (follows[m.id] ?? 0) >= MIN_FOLLOWS)
+    .sort((a, b) => (follows[b.id] ?? 0) - (follows[a.id] ?? 0))
+    .map((m) => mapManga(m));
 }
 
 export async function detailsMangaDex(id: string): Promise<MediaItem> {
@@ -54,6 +82,16 @@ export async function detailsMangaDex(id: string): Promise<MediaItem> {
 
   const next = await nextOfficialChapter(id);
   return mapManga(manga, next?.date, next ? `Ch. ${next.chapter}` : undefined);
+}
+
+// Popular manga (for the Discover page's "Popular manga" shelf). MangaDex can
+// sort server-side by follow count, so no extra statistics call is needed here.
+export async function discoverMangaDex(limit = 20): Promise<MediaItem[]> {
+  const url = `https://api.mangadex.org/manga?order[followedCount]=desc&limit=${limit}&includes[]=cover_art&hasAvailableChapters=true`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`MangaDex discover failed: ${res.status}`);
+  const data = await res.json();
+  return (data.data as MDManga[]).filter((m) => coverURL(m)).map((m) => mapManga(m));
 }
 
 async function nextOfficialChapter(
