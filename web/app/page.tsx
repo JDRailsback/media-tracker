@@ -1,20 +1,24 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { Search as SearchIcon, Bell, Sparkles } from "lucide-react";
 import type { MediaItem } from "@/lib/types";
-import { addFollow, getFollowed, isFollowed, removeFollow } from "@/lib/library";
+import { addFollow, getFollowed, isFollowed, removeFollow, FollowedItem } from "@/lib/library";
+import { buildFeed, describeRelease } from "@/lib/feed";
 import { enablePush, syncFollow } from "@/lib/push-client";
 import DetailModal from "@/components/DetailModal";
-
-type Tab = "discover" | "library" | "upcoming";
+import MediaCard from "@/components/MediaCard";
+import FeedRow from "@/components/FeedRow";
+import Sidebar, { View } from "@/components/Sidebar";
 
 export default function Home() {
-  const [tab, setTab] = useState<Tab>("discover");
+  const [view, setView] = useState<View>("feed");
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<MediaItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<MediaItem | null>(null);
-  const [followed, setFollowed] = useState<MediaItem[]>([]);
+  const [followed, setFollowed] = useState<FollowedItem[]>([]);
+  const [pushEnabled, setPushEnabled] = useState(false);
 
   useEffect(() => setFollowed(getFollowed()), []);
 
@@ -30,116 +34,167 @@ export default function Home() {
     }
   }
 
-  function toggleFollow(item: MediaItem) {
-    if (isFollowed(item.id)) {
-      removeFollow(item.id);
-      void syncFollow(item.id, false);
-    } else {
-      addFollow(item);
-      void syncFollow(item.id, true);
-    }
+  function handleFollow(item: MediaItem) {
+    addFollow(item);
+    void syncFollow(item.id, true);
     setFollowed(getFollowed());
   }
 
-  const upcoming = followed
-    .filter((i) => i.releaseDate && new Date(i.releaseDate) >= new Date())
-    .sort((a, b) => (a.releaseDate! < b.releaseDate! ? -1 : 1));
+  function handleUnfollow(id: string) {
+    removeFollow(id);
+    void syncFollow(id, false);
+    setFollowed(getFollowed());
+  }
+
+  async function handleEnablePush() {
+    setPushEnabled(await enablePush());
+  }
+
+  const feed = buildFeed(followed);
+  const selectedFollowed = selected ? isFollowed(selected.id) : false;
 
   return (
-    <main style={{ maxWidth: 640, margin: "0 auto", padding: "1.5rem 1rem", fontFamily: "system-ui, sans-serif" }}>
-      <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <h1 style={{ margin: 0 }}>Media Tracker</h1>
-        <button onClick={() => enablePush()}>Enable notifications</button>
-      </header>
+    <div className="min-h-screen bg-surface">
+      <Sidebar active={view} onChange={setView} />
 
-      <nav style={{ display: "flex", gap: 8, margin: "1rem 0" }}>
-        {(["discover", "library", "upcoming"] as Tab[]).map((t) => (
-          <button key={t} onClick={() => setTab(t)} style={{ fontWeight: tab === t ? 700 : 400 }}>
-            {t[0].toUpperCase() + t.slice(1)}
-          </button>
-        ))}
-      </nav>
+      <main className="mx-auto max-w-3xl px-6 py-10 md:ml-60 md:px-10">
+        {view === "feed" && (
+          <>
+            <PageHeader title="Home" subtitle="What's new with what you follow." />
+            {feed.length === 0 ? (
+              <EmptyState
+                icon={<Sparkles size={22} className="text-subtle" />}
+                title="You're all caught up"
+                text="Follow a movie, show, game, or manga in Discover to see release updates here."
+              />
+            ) : (
+              <div className="space-y-8">
+                {feed.map((group) => (
+                  <section key={group.key}>
+                    <h2 className="mb-2 text-[13px] font-medium uppercase tracking-wide text-subtle">
+                      {group.title}
+                    </h2>
+                    <div className="rounded-2xl bg-white p-1.5 shadow-sm ring-1 ring-black/[0.03]">
+                      {group.items.map((item) => (
+                        <FeedRow
+                          key={item.id}
+                          item={item}
+                          badge={describeRelease(item) ?? undefined}
+                          onSelect={setSelected}
+                        />
+                      ))}
+                    </div>
+                  </section>
+                ))}
+              </div>
+            )}
+          </>
+        )}
 
-      {tab === "discover" && (
-        <>
-          <form onSubmit={search} style={{ display: "flex", gap: 8 }}>
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Movies, games, manga…"
-              style={{ flex: 1, padding: 8 }}
-            />
-            <button type="submit">Search</button>
-          </form>
-          {loading && <p>Searching…</p>}
-          <MediaList items={results} onSelect={setSelected} />
-        </>
-      )}
+        {view === "discover" && (
+          <>
+            <PageHeader title="Discover" subtitle="Search movies, TV, games, and manga." />
+            <form onSubmit={search} className="flex items-center gap-2 rounded-xl bg-white px-4 py-3 shadow-sm ring-1 ring-black/[0.03]">
+              <SearchIcon size={18} className="text-subtle" />
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search for something to follow…"
+                className="w-full bg-transparent text-[15px] outline-none placeholder:text-subtle"
+              />
+            </form>
 
-      {tab === "library" &&
-        (followed.length ? (
-          <MediaList items={followed} onSelect={setSelected} />
-        ) : (
-          <p style={{ color: "#666" }}>Nothing followed yet.</p>
-        ))}
+            {loading && <p className="mt-4 text-[13px] text-subtle">Searching…</p>}
 
-      {tab === "upcoming" &&
-        (upcoming.length ? (
-          <MediaList items={upcoming} onSelect={setSelected} showDate />
-        ) : (
-          <p style={{ color: "#666" }}>No upcoming releases.</p>
-        ))}
+            {results.length > 0 && (
+              <div className="mt-6 grid grid-cols-2 gap-x-4 gap-y-6 sm:grid-cols-3 lg:grid-cols-4">
+                {results.map((item) => (
+                  <MediaCard key={item.id} item={item} onSelect={setSelected} />
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {view === "following" && (
+          <>
+            <PageHeader title="Following" subtitle={`${followed.length} item${followed.length === 1 ? "" : "s"}.`} />
+            {followed.length === 0 ? (
+              <EmptyState
+                icon={<Sparkles size={22} className="text-subtle" />}
+                title="Nothing followed yet"
+                text="Find something in Discover and follow it to start tracking releases."
+              />
+            ) : (
+              <div className="rounded-2xl bg-white p-1.5 shadow-sm ring-1 ring-black/[0.03]">
+                {followed.map((item) => (
+                  <FeedRow
+                    key={item.id}
+                    item={item}
+                    badge={describeRelease(item) ?? undefined}
+                    onSelect={setSelected}
+                  />
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {view === "settings" && (
+          <>
+            <PageHeader title="Settings" />
+            <div className="overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-black/[0.03]">
+              <button
+                onClick={handleEnablePush}
+                className="flex w-full items-center gap-3 px-4 py-3.5 text-left hover:bg-surface"
+              >
+                <Bell size={18} className="text-accent" />
+                <span className="flex-1 text-[15px] text-ink">Enable notifications</span>
+                {pushEnabled && <span className="text-[13px] text-subtle">On</span>}
+              </button>
+            </div>
+          </>
+        )}
+      </main>
 
       {selected && (
         <DetailModal
           item={selected}
-          isFollowed={isFollowed(selected.id)}
-          onToggleFollow={(full) => {
-            toggleFollow(full);
-          }}
+          isFollowed={selectedFollowed}
+          onFollow={handleFollow}
+          onUnfollow={() => handleUnfollow(selected.id)}
           onClose={() => setSelected(null)}
         />
       )}
-    </main>
+    </div>
   );
 }
 
-function MediaList({
-  items,
-  onSelect,
-  showDate,
+function PageHeader({ title, subtitle }: { title: string; subtitle?: string }) {
+  return (
+    <div className="mb-6">
+      <h1 className="text-[26px] font-semibold tracking-tight text-ink">{title}</h1>
+      {subtitle && <p className="mt-1 text-[14px] text-subtle">{subtitle}</p>}
+    </div>
+  );
+}
+
+function EmptyState({
+  icon,
+  title,
+  text,
 }: {
-  items: MediaItem[];
-  onSelect: (i: MediaItem) => void;
-  showDate?: boolean;
+  icon: React.ReactNode;
+  title: string;
+  text: string;
 }) {
   return (
-    <ul style={{ listStyle: "none", padding: 0, display: "grid", gap: 12, marginTop: 12 }}>
-      {items.map((item) => (
-        <li
-          key={item.id}
-          onClick={() => onSelect(item)}
-          style={{ display: "flex", gap: 12, alignItems: "center", cursor: "pointer" }}
-        >
-          {item.posterURL ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={item.posterURL} alt="" width={46} height={69} style={{ borderRadius: 6, objectFit: "cover" }} />
-          ) : (
-            <div style={{ width: 46, height: 69, background: "#eee", borderRadius: 6 }} />
-          )}
-          <div>
-            <div style={{ fontWeight: 600 }}>{item.title}</div>
-            <div style={{ fontSize: 13, color: "#666" }}>
-              {item.type}
-              {showDate && item.releaseDate
-                ? ` · ${new Date(item.releaseDate).toLocaleDateString()}`
-                : item.subtitle
-                ? ` · ${item.subtitle}`
-                : ""}
-            </div>
-          </div>
-        </li>
-      ))}
-    </ul>
+    <div className="flex flex-col items-center rounded-2xl bg-white px-6 py-16 text-center shadow-sm ring-1 ring-black/[0.03]">
+      <div className="mb-3 flex h-11 w-11 items-center justify-center rounded-full bg-surface">
+        {icon}
+      </div>
+      <div className="text-[15px] font-medium text-ink">{title}</div>
+      <p className="mt-1 max-w-xs text-[13.5px] text-subtle">{text}</p>
+    </div>
   );
 }

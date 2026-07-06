@@ -21,7 +21,9 @@ interface MDManga {
 function coverURL(m: MDManga): string | undefined {
   const cover = m.relationships.find((r) => r.type === "cover_art");
   const file = cover?.attributes?.fileName;
-  return file ? `https://uploads.mangadex.org/covers/${m.id}/${file}.512.jpg` : undefined;
+  // Routed through OUR proxy, not uploads.mangadex.org directly — see
+  // app/api/cover/mangadex/[mangaId]/[fileName]/route.ts for why.
+  return file ? `/api/cover/mangadex/${m.id}/${file}.512.jpg` : undefined;
 }
 
 function mapManga(m: MDManga, releaseDate?: string, subtitle?: string): MediaItem {

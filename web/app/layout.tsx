@@ -1,13 +1,20 @@
 import type { Metadata, Viewport } from "next";
+import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Media Tracker",
   description: "Track releases across movies, games, and manga.",
   manifest: "/manifest.json",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "default",
+    title: "Media Tracker",
+  },
 };
 
 export const viewport: Viewport = {
-  themeColor: "#111111",
+  themeColor: "#f2f2f7",
+  viewportFit: "cover",
 };
 
 export default function RootLayout({
@@ -17,7 +24,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body style={{ margin: 0 }}>{children}</body>
+      <body className="font-sans">{children}</body>
     </html>
   );
 }
