@@ -1,5 +1,5 @@
 import type { ExternalLink, MediaItem } from "@/lib/types";
-import { isExactMatch, matchTier, RankedItem } from "./textMatch";
+import { fuzzyMatches, isExactMatch, matchTier, RankedItem } from "./textMatch";
 
 // MangaDex adapter (TS port). v1 = official English chapter dates only.
 
@@ -126,7 +126,9 @@ export async function searchMangaDex(q: string): Promise<RankedItem[]> {
   // titles. Require the displayed title to at least CONTAIN the query before
   // any popularity consideration; a title that isn't even a loose text match
   // shouldn't show up regardless of how followed it is.
-  const withCovers = results.filter((m) => coverURL(m) && matchTier(titleOf(m), q) < 3);
+  const withCovers = results.filter(
+    (m) => coverURL(m) && (matchTier(titleOf(m), q) < 3 || fuzzyMatches(titleOf(m), q))
+  );
   const follows = await fetchFollows(withCovers.map((m) => m.id));
 
   return withCovers

@@ -1,9 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { X, Play, Plus, Check } from "lucide-react";
+import { X, Play, Plus, Check, Star } from "lucide-react";
 import type { MediaItem } from "@/lib/types";
 import { describeRelease } from "@/lib/feed";
+import { getPreferredPlatforms, isPreferredProvider } from "@/lib/platformPrefs";
 import TypeTag from "./TypeTag";
 
 export default function DetailModal({
@@ -20,6 +21,9 @@ export default function DetailModal({
   onClose: () => void;
 }) {
   const [full, setFull] = useState<MediaItem>(item);
+  const [preferred, setPreferred] = useState<string[]>([]);
+
+  useEffect(() => setPreferred(getPreferredPlatforms()), []);
 
   useEffect(() => {
     const idx = item.id.indexOf(":");
@@ -87,24 +91,77 @@ export default function DetailModal({
             <p className="mt-5 text-[14px] leading-relaxed text-ink/80">{full.overview}</p>
           )}
 
+          {full.episodes && full.episodes.length > 0 && (
+            <div className="mt-5">
+              <h2 className="mb-2 text-[12.5px] font-semibold uppercase tracking-wide text-subtle">
+                {full.episodeCount ?? full.episodes.length} episode
+                {(full.episodeCount ?? full.episodes.length) === 1 ? "" : "s"}
+                {" · "}
+                {new Set(full.episodes.map((e) => e.season)).size} season
+                {new Set(full.episodes.map((e) => e.season)).size === 1 ? "" : "s"}
+              </h2>
+              <div className="max-h-64 space-y-1 overflow-y-auto rounded-xl bg-canvas p-2">
+                {full.episodes.map((ep) => (
+                  <div
+                    key={`${ep.season}-${ep.episode}`}
+                    className="flex items-center justify-between gap-3 rounded-lg px-2 py-1.5 text-[13px] hover:bg-hairline/40"
+                  >
+                    <span className="min-w-0 truncate text-ink">
+                      <span className="font-medium text-subtle">
+                        S{ep.season}E{ep.episode}
+                      </span>{" "}
+                      {ep.title}
+                    </span>
+                    {ep.airDate && (
+                      <span className="shrink-0 text-subtle">
+                        {new Date(ep.airDate).toLocaleDateString(undefined, {
+                          year: "numeric",
+                          month: "short",
+                          day: "numeric",
+                        })}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {full.externalLinks && full.externalLinks.length > 0 && (
             <div className="mt-5">
               <h2 className="mb-2 text-[12.5px] font-semibold uppercase tracking-wide text-subtle">
                 Available on
               </h2>
               <div className="flex flex-wrap gap-2">
-                {full.externalLinks.map((l) => (
-                  <a
-                    key={`${l.provider}-${l.kind}-${l.url}`}
-                    href={l.url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="flex items-center gap-1.5 rounded-full bg-canvas px-3 py-1.5 text-[13px] font-medium text-ink transition-all duration-200 hover:-translate-y-0.5 hover:bg-hairline/60"
-                  >
-                    <Play size={12} className="fill-ink text-ink" />
-                    {l.provider}
-                  </a>
-                ))}
+                {[...full.externalLinks]
+                  .sort((a, b) => {
+                    const aPref = isPreferredProvider(a.provider, preferred);
+                    const bPref = isPreferredProvider(b.provider, preferred);
+                    return aPref === bPref ? 0 : aPref ? -1 : 1;
+                  })
+                  .map((l) => {
+                    const isPreferred = isPreferredProvider(l.provider, preferred);
+                    return (
+                      <a
+                        key={`${l.provider}-${l.kind}-${l.url}`}
+                        href={l.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[13px] font-medium transition-all duration-200 hover:-translate-y-0.5 ${
+                          isPreferred
+                            ? "bg-accent/12 text-accent ring-1 ring-accent/40 hover:bg-accent/18"
+                            : "bg-canvas text-ink hover:bg-hairline/60"
+                        }`}
+                      >
+                        {isPreferred ? (
+                          <Star size={12} className="fill-accent text-accent" />
+                        ) : (
+                          <Play size={12} className="fill-ink text-ink" />
+                        )}
+                        {l.provider}
+                      </a>
+                    );
+                  })}
               </div>
             </div>
           )}

@@ -13,6 +13,14 @@ const MIN_RATING_COUNT = 5;
 // Applies ONLY to already-released games — see passesQualityBar.
 const NON_EXACT_MIN_RATING_COUNT = 50;
 
+// A minimum "hypes" (people marked as looking forward to it) for an
+// unreleased game to count as genuinely significant for RANKING purposes.
+// Verified live: an old, dateless "Toy Story" catalog entry (almost
+// certainly a data-incomplete duplicate, not a real upcoming release) had
+// hypes: 1 and was wrongly ranked as significant — 1 hype is noise, not a
+// real anticipation signal.
+const MIN_SIGNIFICANT_HYPES = 10;
+
 interface IGDBGame {
   id: number;
   name: string;
@@ -24,68 +32,153 @@ interface IGDBGame {
   game_type?: number | null;
 }
 
+// A CONFIRMED future (or just-released) title — a real date on the record,
+// either still upcoming or recent enough that it hasn't had time to earn
+// ratings yet. This is the only case that gets an unconditional pass. A
+// MISSING date is NOT the same thing and must not be treated as
+// "unreleased" — verified live twice: an obscure "Toy Story" entry and "One
+// Piece Kings" both have NO date, NO rating count, and ~0 hype (almost
+// certainly old/incomplete or fan-made catalog entries, not real upcoming
+// releases), and were wrongly admitted unconditionally when a missing date
+// was treated as "isFuture = true". A grace period after the release date
+// (not just a strict future check) matters too — see the identical fix and
+// its rationale in lib/sources/tmdb.ts (RECENT_RELEASE_GRACE_DAYS).
+const RECENT_RELEASE_GRACE_DAYS = 14;
+
+function isConfirmedFuture(g: IGDBGame): boolean {
+  if (!g.first_release_date) return false;
+  const graceMs = RECENT_RELEASE_GRACE_DAYS * 24 * 60 * 60 * 1000;
+  return g.first_release_date * 1000 + graceMs > Date.now();
+}
+
 function passesQualityBar(g: IGDBGame, isExact: boolean): boolean {
   if (!g.cover?.url) return false;
-  const isFuture = g.first_release_date
-    ? g.first_release_date * 1000 > Date.now()
-    : true;
-  // Unreleased/announced games ALWAYS get a pass, exact match or not — same
-  // reasoning as the TMDB adapter: surfacing new announcements before they
-  // have engagement data is the whole point, so the elevated non-exact bar
-  // only applies to already-released games (where tie-in/edition spam lives).
-  if (isFuture) return true;
+  if (isConfirmedFuture(g)) return true;
+  // Already-released OR no date on file at all: needs a real signal (rating
+  // count or hype) — scaled by exact vs. non-exact, same as every other
+  // source. No more automatic pass just because a date is absent.
   const minCount = isExact ? MIN_RATING_COUNT : NON_EXACT_MIN_RATING_COUNT;
-  return (g.total_rating_count ?? 0) >= minCount;
+  const minHypes = isExact ? 1 : MIN_SIGNIFICANT_HYPES;
+  return (g.total_rating_count ?? 0) >= minCount || (g.hypes ?? 0) >= minHypes;
 }
 
 // Would this game clear the bar even judged as a non-exact match? Ranking
 // signal only (see RankedItem) — lets a hugely popular near-match outrank an
 // obscure exact-match title.
 function isSignificant(g: IGDBGame): boolean {
-  const isFuture = g.first_release_date ? g.first_release_date * 1000 > Date.now() : true;
-  if (isFuture) return (g.hypes ?? 0) > 0;
+  if (isConfirmedFuture(g)) return (g.hypes ?? 0) >= MIN_SIGNIFICANT_HYPES;
   return (g.total_rating_count ?? 0) >= NON_EXACT_MIN_RATING_COUNT;
 }
 
-// IGDB tags every sub-entry (seasons, episodes, DLC, packs, updates...) as
-// its own "game" with a `game_type`. Verified LIVE against real responses
-// (see docs/DISCOVER_AND_SEARCH.md) — searching "fortnite"/"minecraft" and
-// inspecting the raw game_type per result:
-//   7 = season      ("Fortnite: Season 6/7/8...")
-//   13 = pack        ("Fortnite Festival: <song>", "Minecraft: ... Skin Pack")
-//   6 = episode      ("Minecraft: Story Mode - Episode 5")
-//   14 = update      ("Minecraft: Nether Update", "Caves & Cliffs")
-//   5 = dlc_addon    ("A Minecraft Movie DLC")
-//   3 = bundle       ("Minecraft Dungeons: Ultimate DLC Bundle")
-//   2 = expansion    ("Fortnite: Save the World", "LEGO Fortnite")
+// IGDB tags every sub-entry (seasons, episodes, DLC, packs, updates,
+// remasters, editions...) as its own "game" with a `game_type`. Verified LIVE
+// against real responses (see docs/DISCOVER_AND_SEARCH.md):
+//   7  = season       ("Fortnite: Season 6/7/8...")
+//   13 = pack          ("Fortnite Festival: <song>", "Minecraft: ... Skin Pack")
+//   6  = episode       ("Minecraft: Story Mode - Episode 5")
+//   14 = update        ("Minecraft: Nether Update", "Caves & Cliffs")
+//   5  = mod           ("A Minecraft Movie DLC/Add-On/Hero Pack" — community content)
+//   3  = bundle        ("Cyberpunk 2077: Ultimate Edition", "Skyrim: Legendary Edition")
+//   2  = expansion     ("Fortnite: Save the World", "Cyberpunk 2077: Phantom Liberty")
+//   1  = dlc_addon     ("Skyrim: Dawnguard/Hearthfire" — official paid DLC)
+//   9  = remaster      ("Skyrim - Special Edition", total_rating_count 437 —
+//                        would otherwise clear the popularity bar easily)
+//   10 = expanded_game ("Skyrim - Anniversary Edition")
+// Note 1 vs 5 vs 2 all superficially look like "DLC" but are genuinely
+// distinct IGDB categories (official small DLC / community mod / larger
+// official expansion) — confirmed by cross-checking Bethesda's official
+// Dawnguard/Hearthfire (1) against Minecraft's community add-on packs (5).
 // A DENYLIST, not an allowlist: the real flagship "Minecraft" entry itself
 // is tagged 11 ("port"), not 0 ("main_game") — an allowlist of just {0}
 // silently excluded the actual base game. Deny only the confirmed-junk
 // types; let everything else (0, 11, and anything unobserved) through.
-const JUNK_GAME_TYPES = new Set([2, 3, 5, 6, 7, 13, 14]);
+// Deliberately NOT denied: 8 (remake) — a ground-up rebuild (e.g. Resident
+// Evil 2 Remake) is a distinct, separately-worth-tracking product, unlike a
+// remaster (a cosmetic re-release of the same game).
+const JUNK_GAME_TYPES = new Set([1, 2, 3, 5, 6, 7, 9, 10, 13, 14]);
 
 function isMainGame(g: IGDBGame): boolean {
   return g.game_type == null || !JUNK_GAME_TYPES.has(g.game_type);
 }
 
-async function getToken(): Promise<string> {
-  const id = process.env.IGDB_CLIENT_ID;
-  const secret = process.env.IGDB_CLIENT_SECRET;
-  if (!id || !secret) throw new Error("IGDB credentials not set");
+// Twitch client_credentials tokens are valid for ~60 days, but this was
+// fetching a BRAND NEW token on every single search call — wasteful on its
+// own, and directly responsible for a real reliability problem: the typo
+// retry fallback (up to ~80 concurrent search attempts) was ALSO firing ~80
+// concurrent token requests, hitting Twitch's auth endpoint hard enough to
+// trigger real 429s that made otherwise-correct typo corrections silently
+// fail. Cached module-level, including the in-flight PROMISE (not just the
+// resolved value) so concurrent callers share one request instead of each
+// starting their own before the first one resolves.
+let cachedToken: { token: string; expiresAt: number } | null = null;
+let pendingToken: Promise<string> | null = null;
 
-  const res = await fetch(
-    `https://id.twitch.tv/oauth2/token?client_id=${id}&client_secret=${secret}&grant_type=client_credentials`,
-    { method: "POST" }
-  );
-  if (!res.ok) throw new Error(`IGDB auth failed: ${res.status}`);
-  const data = await res.json();
-  return data.access_token as string;
+async function getToken(): Promise<string> {
+  if (cachedToken && cachedToken.expiresAt > Date.now()) return cachedToken.token;
+  if (pendingToken) return pendingToken;
+
+  pendingToken = (async () => {
+    const id = process.env.IGDB_CLIENT_ID;
+    const secret = process.env.IGDB_CLIENT_SECRET;
+    if (!id || !secret) throw new Error("IGDB credentials not set");
+
+    const res = await fetch(
+      `https://id.twitch.tv/oauth2/token?client_id=${id}&client_secret=${secret}&grant_type=client_credentials`,
+      { method: "POST" }
+    );
+    if (!res.ok) throw new Error(`IGDB auth failed: ${res.status}`);
+    const data = await res.json();
+    // Refresh 5 minutes early rather than cutting it exactly at expiry.
+    cachedToken = {
+      token: data.access_token as string,
+      expiresAt: Date.now() + (data.expires_in - 300) * 1000,
+    };
+    return cachedToken.token;
+  })();
+
+  try {
+    return await pendingToken;
+  } finally {
+    pendingToken = null;
+  }
+}
+
+// IGDB enforces ~4 requests/second per API key — verified live: even with the
+// token cached, a plain single-word search ("skyrim") started throwing real
+// 429s once the typo-fallback path's concurrent workers (see
+// mapWithConcurrency in lib/sources/index.ts) were in flight at the same
+// time. Bounding CONCURRENCY isn't enough to respect a rate-over-time limit
+// (4 in-flight slots with ~300ms latency each still starts far more than 4
+// requests/sec) — this tracks actual request start times in a rolling
+// 1-second window and makes every caller wait its turn, globally, regardless
+// of how many callers (typo variants, discover shelves, concurrent users)
+// are asking at once. Chained through `gate` so concurrent callers check the
+// window serially instead of racing each other to the same slot.
+const MAX_REQUESTS_PER_WINDOW = 4;
+const WINDOW_MS = 1000;
+const requestTimestamps: number[] = [];
+let gate: Promise<void> = Promise.resolve();
+
+function throttle(): Promise<void> {
+  gate = gate.then(async () => {
+    for (;;) {
+      const now = Date.now();
+      while (requestTimestamps.length && requestTimestamps[0] <= now - WINDOW_MS) {
+        requestTimestamps.shift();
+      }
+      if (requestTimestamps.length < MAX_REQUESTS_PER_WINDOW) break;
+      await new Promise((r) => setTimeout(r, requestTimestamps[0] + WINDOW_MS - now));
+    }
+    requestTimestamps.push(Date.now());
+  });
+  return gate;
 }
 
 async function query(body: string): Promise<IGDBGame[]> {
   const clientID = process.env.IGDB_CLIENT_ID as string;
   const token = await getToken();
 
+  await throttle();
   const res = await fetch("https://api.igdb.com/v4/games", {
     method: "POST",
     headers: { "Client-ID": clientID, Authorization: `Bearer ${token}` },
@@ -132,8 +225,12 @@ function dedupeByTitle(games: IGDBGame[]): IGDBGame[] {
 
 export async function searchIGDB(q: string): Promise<RankedItem[]> {
   // Fetch a larger raw candidate pool since filtering (quality + main-game)
-  // happens after the fetch, not in the query itself.
-  const games = await query(`search "${q}"; fields ${SEARCH_FIELDS}; limit 50;`);
+  // happens after the fetch, not in the query itself. 200, not 50 — verified
+  // live that IGDB's own search relevance for a broad query (e.g. "mario",
+  // "minecraft") can rank a genuinely massive hit (Super Mario Galaxy,
+  // total_rating_count 1265; Minecraft: Story Mode, 133) past position 50,
+  // purely because so many other same-franchise entries also match.
+  const games = await query(`search "${q}"; fields ${SEARCH_FIELDS}; limit 200;`);
   return dedupeByTitle(
     games.filter(isMainGame).filter((g) => passesQualityBar(g, isExactMatch(g.name, q)))
   ).map((g) => ({ ...mapGame(g), significant: isSignificant(g) }));

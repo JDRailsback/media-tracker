@@ -13,6 +13,7 @@ import FeedRow from "@/components/FeedRow";
 import Shelf from "@/components/Shelf";
 import Sidebar, { View } from "@/components/Sidebar";
 import ThemeToggle from "@/components/ThemeToggle";
+import PlatformPrefs from "@/components/PlatformPrefs";
 import AmbientBackground from "@/components/AmbientBackground";
 
 const CATEGORY_TITLE: Record<string, string> = {
@@ -22,6 +23,15 @@ const CATEGORY_TITLE: Record<string, string> = {
   manga: "Popular manga",
   upcoming: "Popular upcoming",
 };
+
+const SEARCH_TYPE_FILTERS: { value: string; label: string }[] = [
+  { value: "", label: "All" },
+  { value: "movie", label: "Movies" },
+  { value: "tvShow", label: "TV" },
+  { value: "game", label: "Games" },
+  { value: "manga", label: "Manga" },
+  { value: "collection", label: "Franchises" },
+];
 
 export default function Home() {
   const [view, setView] = useState<View>("feed");
@@ -38,8 +48,10 @@ export default function Home() {
 
   // Search
   const [query, setQuery] = useState("");
+  const [searchType, setSearchType] = useState("");
   const [searchResults, setSearchResults] = useState<MediaItem[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
+  const [hasSearched, setHasSearched] = useState(false);
 
   useEffect(() => setFollowed(getFollowed()), []);
 
@@ -61,16 +73,36 @@ export default function Home() {
       .finally(() => setCategoryLoading(false));
   }
 
-  async function search(e: React.FormEvent) {
-    e.preventDefault();
-    if (!query.trim()) return;
+async function runSearch(q: string, type: string) {
+    if (!q.trim()) return;
     setSearchLoading(true);
     try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+      const url = type
+        ? `/api/search?q=${encodeURIComponent(q)}&type=${type}`
+        : `/api/search?q=${encodeURIComponent(q)}`;
+      const res = await fetch(url);
       setSearchResults(res.ok ? await res.json() : []);
     } finally {
       setSearchLoading(false);
+      setHasSearched(true);
     }
+  }
+
+  function search(e: React.FormEvent) {
+    e.preventDefault();
+    void runSearch(query, searchType);
+  }
+
+  function selectSearchType(type: string) {
+    setSearchType(type);
+    if (query.trim()) void runSearch(query, type);
+  }
+
+  function resetSearch() {
+    setQuery("");
+    setSearchType("");
+    setSearchResults([]);
+    setHasSearched(false);
   }
 
   function handleFollow(item: MediaItem) {
@@ -98,6 +130,9 @@ export default function Home() {
       <Sidebar
         active={view}
         onChange={(v) => {
+          // Clicking "Search" again while already there starts a fresh search
+          // instead of doing nothing (React bails out on an unchanged state).
+          if (v === "search" && view === "search") resetSearch();
           setView(v);
           setCategory(null);
         }}
@@ -214,10 +249,26 @@ export default function Home() {
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search movies, TV, games, and manga…"
+                placeholder="Search movies, TV, games, franchises, and manga…"
                 className="w-full bg-transparent text-[15px] text-ink outline-none placeholder:text-subtle"
               />
             </form>
+
+            <div className="mt-3 flex flex-wrap gap-2">
+              {SEARCH_TYPE_FILTERS.map(({ value, label }) => (
+                <button
+                  key={value}
+                  onClick={() => selectSearchType(value)}
+                  className={`rounded-full px-3 py-1.5 text-[13px] font-medium transition-colors duration-150 ${
+                    searchType === value
+                      ? "bg-accent text-on-accent"
+                      : "bg-panel/70 text-subtle hover:text-ink"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
 
             {searchLoading && <SearchSkeleton />}
 
@@ -226,6 +277,16 @@ export default function Home() {
                 {searchResults.map((item, i) => (
                   <MediaCard key={item.id} item={item} index={i} onSelect={setSelected} />
                 ))}
+              </div>
+            )}
+
+            {!searchLoading && hasSearched && searchResults.length === 0 && (
+              <div className="mt-7">
+                <EmptyState
+                  icon={<SearchIcon size={22} className="text-subtle" />}
+                  title="No results"
+                  text={`Nothing turned up for "${query}". Try a different spelling or a broader term.`}
+                />
               </div>
             )}
           </>
@@ -275,6 +336,15 @@ export default function Home() {
                   {pushEnabled ? "Enabled" : "Enable"}
                 </button>
               </SettingsRow>
+              <div className="rounded-2xl border border-hairline bg-panel/70 px-5 py-4 shadow-sm backdrop-blur-xl">
+                <div className="mb-3">
+                  <span className="text-[15px] font-medium text-ink">Preferred platforms</span>
+                  <p className="mt-0.5 text-[13px] text-subtle">
+                    Highlighted first under &ldquo;Available on&rdquo; for anything you look up.
+                  </p>
+                </div>
+                <PlatformPrefs />
+              </div>
             </div>
           </>
         )}
