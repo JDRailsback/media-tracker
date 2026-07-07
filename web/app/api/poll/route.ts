@@ -42,14 +42,18 @@ export async function GET(request: Request) {
           JOIN subscription_follows sf ON sf.subscription_id = ps.id
           WHERE sf.followed_item_id = ${item.id}`;
 
+        // Prefer subtitle when present — for a franchise, `title` alone is
+        // just the franchise name ("Star Wars"), giving no indication of
+        // *which* part is releasing. subtitle carries that ("Next: Ahsoka"),
+        // and TV shows already have one too (e.g. "S2 E4") that was
+        // previously being ignored here.
+        const body = fetched.subtitle
+          ? `${fetched.title}: ${fetched.subtitle} — ${newDate.toDateString()}`
+          : `${fetched.title} — now releasing ${newDate.toDateString()}`;
         for (const s of subs) {
           const ok = await sendPush(
             { endpoint: s.endpoint, p256dh: s.p256dh, auth: s.auth },
-            {
-              title: "New release date",
-              body: `${fetched.title} — now releasing ${newDate.toDateString()}`,
-              url: "/",
-            }
+            { title: "New release date", body, url: "/" }
           );
           if (ok) notified++;
         }

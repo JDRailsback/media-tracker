@@ -52,3 +52,23 @@ body {
 .scrollbar-none::-webkit-scrollbar {
   display: none;
 }
+
+/* Shared text-input styling for form-heavy components (e.g. the franchise
+   editor) — avoids repeating the same long Tailwind class string on every
+   field. */
+.input {
+  width: 100%;
+  border-radius: 0.5rem;
+  border: 1px solid rgb(var(--color-hairline));
+  background: rgb(var(--color-canvas));
+  padding: 0.5rem 0.75rem;
+  font-size: 13.5px;
+  color: rgb(var(--color-ink));
+}
+.input:focus {
+  outline: none;
+  box-shadow: 0 0 0 2px rgb(var(--color-accent) / 0.25);
+}
+.input::placeholder {
+  color: rgb(var(--color-subtle));
+}

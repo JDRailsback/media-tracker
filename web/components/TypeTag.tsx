@@ -17,7 +17,7 @@ const STYLE: Record<MediaType, { label: string; className: string }> = {
     label: "Manga",
     className: "bg-pink-50 text-pink-700 dark:bg-pink-500/15 dark:text-pink-300",
   },
-  collection: {
+  franchise: {
     label: "Franchise",
     className: "bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300",
   },

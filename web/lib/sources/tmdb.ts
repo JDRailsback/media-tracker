@@ -86,7 +86,17 @@ interface TMDBMovie {
   vote_count?: number;
 }
 
-export async function searchTMDBMovie(query: string): Promise<RankedItem[]> {
+// `lenient` (used only by franchise resolution — lib/sources/franchise.ts)
+// treats every result as if it were an exact title match for quality-bar
+// purposes. The elevated non-exact bar exists to fight general-search
+// clutter (see docs/DISCOVER_AND_SEARCH.md — "importance filtering"), not to
+// thin out a franchise's own already-precise, curated query — most of a
+// franchise's real entries are non-exact matches by construction (e.g.
+// "One Piece: Stampede" is not literally "One Piece").
+export async function searchTMDBMovie(
+  query: string,
+  opts?: { lenient?: boolean }
+): Promise<RankedItem[]> {
   const url = `https://api.themoviedb.org/3/search/movie?api_key=${key()}&query=${encodeURIComponent(query)}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`TMDB movie search failed: ${res.status}`);
@@ -98,12 +108,23 @@ export async function searchTMDBMovie(query: string): Promise<RankedItem[]> {
         voteCount: m.vote_count ?? 0,
         popularity: m.popularity ?? 0,
         dateStr: m.release_date,
-        isExact: isExactMatch(m.title, query),
+        isExact: opts?.lenient || isExactMatch(m.title, query),
       })
     )
     .map((m) => ({
       ...mapMovie(m),
       significant: isSignificant(m.vote_count ?? 0, m.popularity ?? 0, m.release_date),
+      // RankedItem.popularity feeds cross-type "Most Popular" ranking (see
+      // lib/sources/franchise.ts) — deliberately vote_count, NOT TMDB's
+      // `popularity` field. Verified live that `popularity` is a
+      // trending/momentary-buzz metric, not a durable one: "Toy Story 5"
+      // (unreleased, hyped) had popularity 615 vs. the 1995 original's 72,
+      // even though the original has 20,108 votes against Toy Story 5's
+      // 508 — using `popularity` here put the least-proven entry first.
+      // vote_count accumulates over a title's whole lifetime, matching how
+      // IGDB's total_rating_count and MangaDex's follows already behave
+      // (both stable/cumulative, not trending).
+      popularity: m.vote_count ?? 0,
     }));
 }
 
@@ -171,7 +192,10 @@ interface TMDBShow {
   } | null;
 }
 
-export async function searchTMDBTV(query: string): Promise<RankedItem[]> {
+export async function searchTMDBTV(
+  query: string,
+  opts?: { lenient?: boolean }
+): Promise<RankedItem[]> {
   const url = `https://api.themoviedb.org/3/search/tv?api_key=${key()}&query=${encodeURIComponent(query)}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`TMDB TV search failed: ${res.status}`);
@@ -183,12 +207,15 @@ export async function searchTMDBTV(query: string): Promise<RankedItem[]> {
         voteCount: s.vote_count ?? 0,
         popularity: s.popularity ?? 0,
         dateStr: s.first_air_date,
-        isExact: isExactMatch(s.name, query),
+        isExact: opts?.lenient || isExactMatch(s.name, query),
       })
     )
     .map((s) => ({
       ...mapShow(s),
       significant: isSignificant(s.vote_count ?? 0, s.popularity ?? 0, s.first_air_date),
+      // See the identical comment in searchTMDBMovie — vote_count, not
+      // TMDB's trending `popularity` field, for the same reason.
+      popularity: s.vote_count ?? 0,
     }));
 }
 
@@ -294,74 +321,56 @@ export async function discoverTMDBUpcomingTV(limit = 12): Promise<MediaItem[]> {
     }));
 }
 
-// ---------- Franchises (TMDB "collections") ----------
-// A collection is a curated set of movies (e.g. "Star Wars Collection",
-// "The Lord of the Rings Collection") — following one tracks the franchise
-// as a whole rather than one entry at a time. Verified live: TMDB models
-// clean single-franchise collections well, but does NOT have one unified
-// "Marvel Cinematic Universe" entity — /search/collection for that query
-// returns zero results, since MCU is split across dozens of sub-collections
-// (Avengers Collection, Iron Man Collection, ...). Following one of those
-// sub-collections works fine; there's no single "follow the whole MCU" yet.
-
-interface TMDBCollection {
-  id: number;
-  name: string;
-  overview?: string;
-  poster_path?: string | null;
-}
+// ---------- Franchise movie parts (TMDB "collections") ----------
+// TMDB's Collection API is a curated, authoritative list of a franchise's
+// films — internal-only now, consumed by lib/sources/franchise.ts for the
+// movie side of a curated cross-media franchise (see lib/franchises.ts's
+// `movieCollectionId`, resolved once live during authoring, not guessed).
+// More accurate than a plain title-text search for movies whose titles
+// don't contain the franchise name (e.g. "Solo: A Star Wars Story"). Note:
+// TMDB does NOT have one unified "Marvel Cinematic Universe" collection —
+// verified live, MCU is split across dozens of sub-collections — so
+// franchises like that fall back to plain per-title text search instead.
 
 interface TMDBCollectionPart {
+  id: number;
   title: string;
+  overview?: string;
   release_date?: string;
   poster_path?: string | null;
+  // Verified live against a real response (One Piece Collection, id 23456):
+  // collection parts carry the same popularity/vote_count fields a normal
+  // movie search result does.
+  popularity?: number;
+  vote_count?: number;
 }
 
-function mapCollection(c: TMDBCollection): MediaItem {
-  return {
-    id: `collection:${c.id}`,
-    type: "collection",
-    title: c.name,
-    overview: c.overview || undefined,
-    posterURL: c.poster_path ? `${IMAGE_BASE}${c.poster_path}` : undefined,
-  };
-}
-
-export async function searchTMDBCollection(query: string): Promise<RankedItem[]> {
-  const url = `https://api.themoviedb.org/3/search/collection?api_key=${key()}&query=${encodeURIComponent(query)}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`TMDB collection search failed: ${res.status}`);
-  const data = await res.json();
-  // Collections have no popularity/vote data at all — significance just
-  // tracks whether it has a poster (a real, maintained collection) since
-  // there's no other signal available to separate real franchises from
-  // one-off curator mistakes.
-  return (data.results as TMDBCollection[])
-    .filter((c) => c.poster_path)
-    .map((c) => ({ ...mapCollection(c), significant: true }));
-}
-
-export async function detailsTMDBCollection(id: string): Promise<MediaItem> {
+// All of a collection's films, mapped as RankedItems (same shape
+// searchTMDBMovie produces) — so a franchise part behaves identically to any
+// other movie (clickable, followable via the existing DetailModal, and
+// carries a real `popularity` value for the franchise's "Most Popular" row)
+// regardless of which path found it. No quality-bar filtering here — the
+// whole point of using the collection is that it's already a complete,
+// authoritative list, including older/obscure entries a popularity bar
+// would otherwise cut.
+export async function tmdbCollectionParts(id: number): Promise<RankedItem[]> {
   const url = `https://api.themoviedb.org/3/collection/${id}?api_key=${key()}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`TMDB collection details failed: ${res.status}`);
   const data = await res.json();
-  const base = mapCollection(data as TMDBCollection);
-
-  // The franchise's "release date" for feed/poller purposes = the soonest
-  // upcoming (not yet released) entry in it, so following "Star Wars
-  // Collection" surfaces the next film the same way following one movie would.
   const parts = (data.parts ?? []) as TMDBCollectionPart[];
-  const upcoming = parts
-    .filter((p) => p.release_date && new Date(p.release_date) > new Date())
-    .sort((a, b) => (a.release_date! < b.release_date! ? -1 : 1));
-  if (upcoming.length > 0) {
-    base.releaseDate = upcoming[0].release_date;
-    base.subtitle = `Next: ${upcoming[0].title}`;
-  } else {
-    base.subtitle = `${parts.length} film${parts.length === 1 ? "" : "s"}`;
-  }
-  return base;
+  return parts.map((p) => ({
+    id: `movie:${p.id}`,
+    type: "movie" as const,
+    title: p.title,
+    overview: p.overview || undefined,
+    posterURL: p.poster_path ? `${IMAGE_BASE}${p.poster_path}` : undefined,
+    releaseDate: p.release_date || undefined,
+    significant: isSignificant(p.vote_count ?? 0, p.popularity ?? 0, p.release_date),
+    // vote_count, not TMDB's trending `popularity` field — see the
+    // identical comment in searchTMDBMovie.
+    popularity: p.vote_count ?? 0,
+  }));
 }
 
 // ---------- Shared: watch providers ----------

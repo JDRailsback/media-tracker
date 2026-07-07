@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Search as SearchIcon, Bell, Sparkles, ArrowLeft } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { Search as SearchIcon, Bell, Sparkles, ArrowLeft, Plus } from "lucide-react";
 import type { MediaItem } from "@/lib/types";
 import { addFollow, getFollowed, isFollowed, removeFollow, FollowedItem } from "@/lib/library";
 import { buildFeed, describeRelease } from "@/lib/feed";
@@ -9,6 +10,8 @@ import { enablePush, syncFollow } from "@/lib/push-client";
 import type { DiscoverPayload } from "@/lib/sources";
 import DetailModal from "@/components/DetailModal";
 import MediaCard from "@/components/MediaCard";
+import FranchiseCard from "@/components/FranchiseCard";
+import FranchiseEditForm from "@/components/FranchiseEditForm";
 import FeedRow from "@/components/FeedRow";
 import Shelf from "@/components/Shelf";
 import Sidebar, { View } from "@/components/Sidebar";
@@ -22,6 +25,7 @@ const CATEGORY_TITLE: Record<string, string> = {
   games: "Popular games",
   manga: "Popular manga",
   upcoming: "Popular upcoming",
+  franchises: "Explore franchises",
 };
 
 const SEARCH_TYPE_FILTERS: { value: string; label: string }[] = [
@@ -30,10 +34,11 @@ const SEARCH_TYPE_FILTERS: { value: string; label: string }[] = [
   { value: "tvShow", label: "TV" },
   { value: "game", label: "Games" },
   { value: "manga", label: "Manga" },
-  { value: "collection", label: "Franchises" },
+  { value: "franchise", label: "Franchises" },
 ];
 
 export default function Home() {
+  const router = useRouter();
   const [view, setView] = useState<View>("feed");
   const [selected, setSelected] = useState<MediaItem | null>(null);
   const [followed, setFollowed] = useState<FollowedItem[]>([]);
@@ -45,6 +50,7 @@ export default function Home() {
   const [category, setCategory] = useState<string | null>(null);
   const [categoryItems, setCategoryItems] = useState<MediaItem[]>([]);
   const [categoryLoading, setCategoryLoading] = useState(false);
+  const [creatingFranchise, setCreatingFranchise] = useState(false);
 
   // Search
   const [query, setQuery] = useState("");
@@ -121,6 +127,18 @@ async function runSearch(q: string, type: string) {
     setPushEnabled(await enablePush());
   }
 
+  // Franchises open their own themed page, not the generic DetailModal —
+  // used everywhere a MediaItem can be clicked (feed, following, discover,
+  // search) so a followed/discovered franchise routes correctly regardless
+  // of where it was clicked from.
+  function handleSelect(item: MediaItem) {
+    if (item.type === "franchise") {
+      router.push(`/franchise/${item.id.slice(item.id.indexOf(":") + 1)}`);
+    } else {
+      setSelected(item);
+    }
+  }
+
   const feed = buildFeed(followed);
   const selectedFollowed = selected ? isFollowed(selected.id) : false;
 
@@ -162,7 +180,7 @@ async function runSearch(q: string, type: string) {
                           item={item}
                           index={i}
                           badge={describeRelease(item) ?? undefined}
-                          onSelect={setSelected}
+                          onSelect={handleSelect}
                         />
                       ))}
                     </div>
@@ -184,31 +202,47 @@ async function runSearch(q: string, type: string) {
                 <Shelf
                   title={CATEGORY_TITLE.upcoming}
                   items={discoverData.popularUpcoming}
-                  onSelect={setSelected}
+                  onSelect={handleSelect}
                   onSeeAll={() => openCategory("upcoming")}
+                />
+                <div className="mb-2 flex items-center justify-end">
+                  <button
+                    onClick={() => setCreatingFranchise(true)}
+                    className="flex items-center gap-1 text-[13px] font-medium text-accent transition-opacity hover:opacity-70"
+                  >
+                    <Plus size={14} />
+                    New franchise
+                  </button>
+                </div>
+                <Shelf
+                  title="Franchises"
+                  items={discoverData.featuredFranchises}
+                  onSelect={handleSelect}
+                  onSeeAll={() => openCategory("franchises")}
+                  renderItem={(item, i) => <FranchiseCard item={item} index={i} />}
                 />
                 <Shelf
                   title={CATEGORY_TITLE.movies}
                   items={discoverData.trendingMovies}
-                  onSelect={setSelected}
+                  onSelect={handleSelect}
                   onSeeAll={() => openCategory("movies")}
                 />
                 <Shelf
                   title={CATEGORY_TITLE.tv}
                   items={discoverData.trendingTV}
-                  onSelect={setSelected}
+                  onSelect={handleSelect}
                   onSeeAll={() => openCategory("tv")}
                 />
                 <Shelf
                   title={CATEGORY_TITLE.games}
                   items={discoverData.popularGames}
-                  onSelect={setSelected}
+                  onSelect={handleSelect}
                   onSeeAll={() => openCategory("games")}
                 />
                 <Shelf
                   title={CATEGORY_TITLE.manga}
                   items={discoverData.popularManga}
-                  onSelect={setSelected}
+                  onSelect={handleSelect}
                   onSeeAll={() => openCategory("manga")}
                 />
               </>
@@ -225,14 +259,29 @@ async function runSearch(q: string, type: string) {
               <ArrowLeft size={15} />
               Discover
             </button>
-            <PageHeader title={CATEGORY_TITLE[category] ?? category} />
+            <div className="mb-4 flex items-center justify-between">
+              <PageHeader title={CATEGORY_TITLE[category] ?? category} />
+              {category === "franchises" && (
+                <button
+                  onClick={() => setCreatingFranchise(true)}
+                  className="flex shrink-0 items-center gap-1 text-[13px] font-medium text-accent transition-opacity hover:opacity-70"
+                >
+                  <Plus size={14} />
+                  New franchise
+                </button>
+              )}
+            </div>
             {categoryLoading ? (
               <p className="text-[13px] text-subtle">Loading…</p>
             ) : (
               <div className="grid grid-cols-2 gap-x-5 gap-y-7 sm:grid-cols-3 lg:grid-cols-4">
-                {categoryItems.map((item, i) => (
-                  <MediaCard key={item.id} item={item} index={i} onSelect={setSelected} />
-                ))}
+                {categoryItems.map((item, i) =>
+                  category === "franchises" ? (
+                    <FranchiseCard key={item.id} item={item} index={i} />
+                  ) : (
+                    <MediaCard key={item.id} item={item} index={i} onSelect={handleSelect} />
+                  )
+                )}
               </div>
             )}
           </>
@@ -274,9 +323,13 @@ async function runSearch(q: string, type: string) {
 
             {!searchLoading && searchResults.length > 0 && (
               <div className="mt-7 grid grid-cols-2 gap-x-5 gap-y-7 sm:grid-cols-3 lg:grid-cols-4">
-                {searchResults.map((item, i) => (
-                  <MediaCard key={item.id} item={item} index={i} onSelect={setSelected} />
-                ))}
+                {searchResults.map((item, i) =>
+                  item.type === "franchise" ? (
+                    <FranchiseCard key={item.id} item={item} index={i} />
+                  ) : (
+                    <MediaCard key={item.id} item={item} index={i} onSelect={handleSelect} />
+                  )
+                )}
               </div>
             )}
 
@@ -312,7 +365,7 @@ async function runSearch(q: string, type: string) {
                     item={item}
                     index={i}
                     badge={describeRelease(item) ?? undefined}
-                    onSelect={setSelected}
+                    onSelect={handleSelect}
                   />
                 ))}
               </div>
@@ -357,6 +410,17 @@ async function runSearch(q: string, type: string) {
           onFollow={handleFollow}
           onUnfollow={() => handleUnfollow(selected.id)}
           onClose={() => setSelected(null)}
+        />
+      )}
+
+      {creatingFranchise && (
+        <FranchiseEditForm
+          mode="create"
+          onSaved={(saved) => {
+            setCreatingFranchise(false);
+            router.push(`/franchise/${saved.slug}`);
+          }}
+          onClose={() => setCreatingFranchise(false)}
         />
       )}
     </div>

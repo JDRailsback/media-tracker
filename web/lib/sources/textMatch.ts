@@ -14,6 +14,36 @@ import type { MediaItem } from "@/lib/types";
 // never part of the public MediaItem contract.
 export interface RankedItem extends MediaItem {
   significant: boolean;
+  // Raw, source-specific popularity signal — TMDB movies/TV use vote_count
+  // (NOT TMDB's own `popularity` field, which is a trending/momentary-buzz
+  // metric — verified live it badly distorts rankings: an unreleased,
+  // hyped sequel can have a `popularity` far above a decades-old classic
+  // despite a tiny fraction of the votes), IGDB uses total_rating_count,
+  // MangaDex uses follows. Deliberately NOT cross-source comparable on its
+  // own (wildly different scales) — always run through normalizedScores()
+  // before comparing items from different sources/types. Stripped before
+  // any API response, same as `significant`.
+  popularity: number;
+}
+
+export function stripRanking(items: RankedItem[]): MediaItem[] {
+  return items.map(({ significant, popularity, ...item }) => item);
+}
+
+// Min-max normalizes a list's popularity to 0-1 — comparing raw popularity
+// across sources/types directly would let whichever one happens to use
+// bigger numbers dominate (MangaDex follows can run into the hundreds of
+// thousands; IGDB rating counts rarely exceed a few thousand). Normalizing
+// each list to its own max first makes "most popular" comparisons meaningful
+// across sources: an item's score reflects how popular it is relative to
+// its own siblings, not an incomparable raw magnitude. Used by both the
+// franchise "Most Popular" row (lib/sources/franchise.ts) and combined
+// general search ranking (lib/sources/index.ts).
+export function normalizedScores(items: RankedItem[]): Map<string, number> {
+  const scores = new Map<string, number>();
+  const max = Math.max(0, ...items.map((i) => i.popularity));
+  for (const i of items) scores.set(i.id, max > 0 ? i.popularity / max : 0);
+  return scores;
 }
 
 // Lowercase AND strip accents/diacritics — a real title is often "Pokémon"

@@ -223,7 +223,7 @@ function dedupeByTitle(games: IGDBGame[]): IGDBGame[] {
   return [...best.values()];
 }
 
-export async function searchIGDB(q: string): Promise<RankedItem[]> {
+export async function searchIGDB(q: string, opts?: { lenient?: boolean }): Promise<RankedItem[]> {
   // Fetch a larger raw candidate pool since filtering (quality + main-game)
   // happens after the fetch, not in the query itself. 200, not 50 — verified
   // live that IGDB's own search relevance for a broad query (e.g. "mario",
@@ -231,9 +231,17 @@ export async function searchIGDB(q: string): Promise<RankedItem[]> {
   // total_rating_count 1265; Minecraft: Story Mode, 133) past position 50,
   // purely because so many other same-franchise entries also match.
   const games = await query(`search "${q}"; fields ${SEARCH_FIELDS}; limit 200;`);
+  // `lenient` (used only by franchise resolution — lib/sources/franchise.ts)
+  // treats every result as if it were an exact match for quality-bar
+  // purposes. Verified live: searching "One Piece" returns 128 raw games,
+  // almost none literally titled just "One Piece" — real, well-known entries
+  // like "One Piece: World Seeker" (total_rating_count 32) and "One Piece:
+  // Burning Blood" (38) were being cut by the NON-exact-match bar (needs
+  // >=50), which exists to fight general-search clutter, not to thin out a
+  // franchise's own already-precise, curated query.
   return dedupeByTitle(
-    games.filter(isMainGame).filter((g) => passesQualityBar(g, isExactMatch(g.name, q)))
-  ).map((g) => ({ ...mapGame(g), significant: isSignificant(g) }));
+    games.filter(isMainGame).filter((g) => passesQualityBar(g, opts?.lenient || isExactMatch(g.name, q)))
+  ).map((g) => ({ ...mapGame(g), significant: isSignificant(g), popularity: g.total_rating_count ?? 0 }));
 }
 
 // Recognized storefront domains. Verified live against a real IGDB response

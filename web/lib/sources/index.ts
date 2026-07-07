@@ -4,8 +4,6 @@ import {
   detailsTMDBMovie,
   searchTMDBTV,
   detailsTMDBTV,
-  searchTMDBCollection,
-  detailsTMDBCollection,
   discoverTMDBMovies,
   discoverTMDBTV,
   discoverTMDBUpcomingMovies,
@@ -13,7 +11,8 @@ import {
 } from "./tmdb";
 import { searchIGDB, detailsIGDB, discoverIGDBPopular, discoverIGDBUpcoming } from "./igdb";
 import { searchMangaDex, detailsMangaDex, discoverMangaDex } from "./mangadex";
-import { fuzzyMatches, matchTier, RankedItem, typoVariants } from "./textMatch";
+import { searchFranchises, detailsFranchise, discoverFranchises } from "./franchise";
+import { fuzzyMatches, matchTier, normalizedScores, RankedItem, stripRanking, typoVariants } from "./textMatch";
 
 // Round-robin interleave instead of concatenating. Without this, a combined
 // search for "minecraft" would show 20 irrelevant movies (fetched first, in
@@ -42,34 +41,35 @@ function relevantOnly(items: RankedItem[], query: string): RankedItem[] {
   return items.filter((i) => matchTier(i.title, query) < 3 || fuzzyMatches(i.title, query));
 }
 
-// Rank by (significant desc, matchTier asc) — NOT match tier alone. An exact
-// match doesn't automatically win: a hugely popular near-match (e.g. "Toy
-// Story 2") should outrank a barely-passing exact match (e.g. an obscure
-// "Toy Story"-titled game). "significant" means the item would clear each
-// adapter's stricter non-exact-match bar regardless of its actual match
-// tier — see lib/sources/textMatch.ts. Array.prototype.sort is stable in all
-// modern JS engines, so items tied on both keys keep their interleaved
-// (cross-category) relative order. `query` here must be whichever string
-// actually produced `items` — see withTypoFallback's `query` field below;
-// filtering/sorting a typo-corrected result set against the ORIGINAL
-// misspelled query (rather than the correction that found it) was a real bug
-// ("toystroy" -> the "toystory" variant correctly found Toy Story on TMDB,
-// but got discarded a moment later because fuzzyMatches("Toy Story",
-// "toystroy") exceeds the edit-distance budget — the correction had already
-// happened, this check was re-litigating it against the wrong string).
+// Rank by (significant desc, matchTier asc, popularity desc) — NOT match
+// tier alone. An exact match doesn't automatically win: a hugely popular
+// near-match (e.g. "Toy Story 2") should outrank a barely-passing exact
+// match (e.g. an obscure "Toy Story"-titled game). "significant" means the
+// item would clear each adapter's stricter non-exact-match bar regardless
+// of its actual match tier — see lib/sources/textMatch.ts. The popularity
+// key is real (raw, single-source — see RankedItem.popularity), not just a
+// stable-sort artifact of interleave order: items tied on significance and
+// tier used to fall back to whatever order the source's OWN API returned
+// them in, which isn't necessarily popularity order. `query` here must be
+// whichever string actually produced `items` — see withTypoFallback's
+// `query` field below; filtering/sorting a typo-corrected result set against
+// the ORIGINAL misspelled query (rather than the correction that found it)
+// was a real bug ("toystroy" -> the "toystory" variant correctly found Toy
+// Story on TMDB, but got discarded a moment later because
+// fuzzyMatches("Toy Story", "toystroy") exceeds the edit-distance budget —
+// the correction had already happened, this check was re-litigating it
+// against the wrong string).
 function filterAndSort(items: RankedItem[], query: string): RankedItem[] {
   return relevantOnly(items, query).sort((a, b) => {
     if (a.significant !== b.significant) return a.significant ? -1 : 1;
-    return matchTier(a.title, query) - matchTier(b.title, query);
+    const tierDiff = matchTier(a.title, query) - matchTier(b.title, query);
+    if (tierDiff !== 0) return tierDiff;
+    return b.popularity - a.popularity;
   });
 }
 
-function stripSignificant(items: RankedItem[]): MediaItem[] {
-  return items.map(({ significant, ...item }) => item);
-}
-
 function byRelevance(items: RankedItem[], query: string): MediaItem[] {
-  return stripSignificant(filterAndSort(items, query));
+  return stripRanking(filterAndSort(items, query));
 }
 
 // A source's OWN search can come back completely empty for a misspelled
@@ -186,9 +186,12 @@ async function withTypoFallback(
 
 // Search dispatch. No type -> search all sources concurrently, quality-filter
 // (done inside each adapter), and interleave — never grouped by category.
-// Franchises ("collection") are deliberately NOT part of the combined/"All"
-// search — a franchise container alongside its own individual entries would
-// be confusing in one flat list. They only show up when explicitly filtered.
+// Franchises are deliberately NOT part of the combined/"All" search — a
+// franchise container alongside its own individual entries would be
+// confusing in one flat list. They only show up when explicitly filtered.
+// Franchise search is a pure in-memory fuzzy match (see
+// lib/sources/franchise.ts) — no typo-fallback machinery needed, it's not a
+// rate-limited network call.
 export async function search(query: string, type?: string | null): Promise<MediaItem[]> {
   switch (type) {
     case "movie": {
@@ -207,10 +210,8 @@ export async function search(query: string, type?: string | null): Promise<Media
       const r = await withTypoFallback(query, searchMangaDex);
       return byRelevance(r.items, r.query);
     }
-    case "collection": {
-      const r = await withTypoFallback(query, searchTMDBCollection);
-      return byRelevance(r.items, r.query);
-    }
+    case "franchise":
+      return await searchFranchises(query);
     default: {
       const settled = await Promise.allSettled([
         withTypoFallback(query, searchTMDBMovie),
@@ -225,10 +226,21 @@ export async function search(query: string, type?: string | null): Promise<Media
       const lists = settled.map((r) =>
         r.status === "fulfilled" ? filterAndSort(r.value.items, r.value.query) : []
       );
-      const merged = interleave(lists).sort((a, b) =>
-        a.significant === b.significant ? 0 : a.significant ? -1 : 1
-      );
-      return stripSignificant(merged);
+      // Popularity is real now (not just a stable-sort artifact of
+      // interleave position) but each source's raw numbers are on wildly
+      // different scales (MangaDex follows vs. IGDB rating counts vs. TMDB
+      // vote counts) — normalize each source's OWN list to 0-1 before
+      // comparing across sources, same approach as the franchise "Most
+      // Popular" row (lib/sources/franchise.ts).
+      const scores = new Map<string, number>();
+      for (const list of lists) {
+        for (const [id, score] of normalizedScores(list)) scores.set(id, score);
+      }
+      const merged = interleave(lists).sort((a, b) => {
+        if (a.significant !== b.significant) return a.significant ? -1 : 1;
+        return (scores.get(b.id) ?? 0) - (scores.get(a.id) ?? 0);
+      });
+      return stripRanking(merged);
     }
   }
 }
@@ -243,8 +255,8 @@ export async function details(type: string, id: string): Promise<MediaItem> {
       return detailsIGDB(id);
     case "manga":
       return detailsMangaDex(id);
-    case "collection":
-      return detailsTMDBCollection(id);
+    case "franchise":
+      return detailsFranchise(id);
     default:
       throw new Error(`Unsupported type: ${type}`);
   }
@@ -256,6 +268,7 @@ export interface DiscoverPayload {
   popularGames: MediaItem[];
   popularManga: MediaItem[];
   popularUpcoming: MediaItem[];
+  featuredFranchises: MediaItem[];
 }
 
 // Curated groupings for the Discover page. Each shelf is independent — one
@@ -279,7 +292,11 @@ export async function discover(): Promise<DiscoverPayload> {
     .sort((a, b) => (a.releaseDate! < b.releaseDate! ? -1 : 1))
     .slice(0, 16);
 
-  return { trendingMovies, trendingTV, popularGames, popularManga, popularUpcoming };
+  // No TMDB/IGDB/MangaDex calls — just curated data plus one DB read for
+  // any admin overrides (see lib/sources/franchise.ts).
+  const featuredFranchises = await discoverFranchises(true);
+
+  return { trendingMovies, trendingTV, popularGames, popularManga, popularUpcoming, featuredFranchises };
 }
 
 // A single category, expanded (for "see all" drill-down on the Discover page).
@@ -293,6 +310,11 @@ export async function discoverCategory(category: string): Promise<MediaItem[]> {
       return discoverIGDBPopular(40);
     case "manga":
       return discoverMangaDex(40);
+    case "franchises":
+      // Curated list plus admin overrides — returned in full (there are
+      // 150+, but no TMDB/IGDB/MangaDex calls, unlike every other category
+      // here).
+      return await discoverFranchises(false);
     case "upcoming": {
       const [movies, tv, games] = await Promise.allSettled([
         discoverTMDBUpcomingMovies(20),

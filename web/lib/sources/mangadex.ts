@@ -19,6 +19,18 @@ const MIN_FOLLOWS = 50;
 // the important thing," so this is a deliberately high, adjustable bar.
 const NON_EXACT_MIN_FOLLOWS = 25000;
 
+// A separate, MIDDLE-GROUND bar used only by franchise resolution (see
+// `opts.lenient` below) — neither the strict exact-match bar (50, too
+// permissive here — verified live it lets real doujinshi through, e.g. a
+// One Piece/One-Punch Man crossover doujinshi with 935 follows) nor the
+// general-search NON_EXACT_MIN_FOLLOWS (25,000, too strict — verified live
+// it excludes real official spin-offs, e.g. "One Piece: Ace's Story—The
+// Manga" at 3,158 follows). Follow count alone can't perfectly separate
+// "official-ish franchise content" from "popular fan work" (some doujinshi
+// out-follow obscure official one-shots), so this is a deliberate, tunable
+// compromise favoring "show more of the franchise" over perfect purity.
+const FRANCHISE_MIN_FOLLOWS = 500;
+
 // MangaDex's API returns ALL content ratings — including erotica/pornographic
 // — unless you explicitly restrict it. Verified live: searching "toy story"
 // (which has no real match) returned several suggestive/erotica results that
@@ -113,8 +125,17 @@ async function fetchFollows(ids: string[]): Promise<Record<string, number>> {
   return out;
 }
 
-export async function searchMangaDex(q: string): Promise<RankedItem[]> {
-  const url = `https://api.mangadex.org/manga?title=${encodeURIComponent(q)}&limit=15&includes[]=cover_art&${CONTENT_RATING}`;
+// `lenient` (used only by franchise resolution — lib/sources/franchise.ts)
+// raises the result limit (MangaDex's own relevance ranking can push real
+// spin-offs past 15 — verified live: "One Piece" has 34 raw matches) and
+// swaps the exact/non-exact bar pair for the single FRANCHISE_MIN_FOLLOWS
+// middle ground.
+export async function searchMangaDex(
+  q: string,
+  opts?: { lenient?: boolean }
+): Promise<RankedItem[]> {
+  const limit = opts?.lenient ? 40 : 15;
+  const url = `https://api.mangadex.org/manga?title=${encodeURIComponent(q)}&limit=${limit}&includes[]=cover_art&${CONTENT_RATING}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`MangaDex search failed: ${res.status}`);
   const data = await res.json();
@@ -133,11 +154,19 @@ export async function searchMangaDex(q: string): Promise<RankedItem[]> {
 
   return withCovers
     .filter((m) => {
-      const threshold = isExactMatch(titleOf(m), q) ? MIN_FOLLOWS : NON_EXACT_MIN_FOLLOWS;
+      const threshold = opts?.lenient
+        ? FRANCHISE_MIN_FOLLOWS
+        : isExactMatch(titleOf(m), q)
+        ? MIN_FOLLOWS
+        : NON_EXACT_MIN_FOLLOWS;
       return (follows[m.id] ?? 0) >= threshold;
     })
     .sort((a, b) => (follows[b.id] ?? 0) - (follows[a.id] ?? 0))
-    .map((m) => ({ ...mapManga(m), significant: isSignificant(follows[m.id] ?? 0) }));
+    .map((m) => ({
+      ...mapManga(m),
+      significant: isSignificant(follows[m.id] ?? 0),
+      popularity: follows[m.id] ?? 0,
+    }));
 }
 
 export async function detailsMangaDex(id: string): Promise<MediaItem> {
