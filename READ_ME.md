@@ -1,0 +1,24 @@
+To-Do:
+- Switch from live queries to full database of media items
+- Develop database of specifically upcoming releases that updates live
+- Improve look of homescreen cards
+- Fix links for unreleased or newly released shows
+- Fix upcoming media list
+- Populate collections
+- Adjust collection page layouts
+- Add books as media type
+- Add music as media type
+- Add comics as media type
+- Fix poster rendering with hover
+- Customize collection pages with headers, logos, and posters
+- Improve speed of search engine
+- Rename "Collections" to "Curated Collections"
+- Add "Collections" tab to collect followed collections and allow custom collection creation
+- Remove slop from search results
+- Add media status tracker - watching/playing/reading, finished, dropped
+- Add likes/hearts for media items
+- Add "Queue" page to line up what users want to see next
+- Add notifications for upcoming releases
+- Add live events as media type
+- Add sports as media type
+- Separate Franchises and Collections - franchises as IPs on Discover and Search page, Collections as curated groups of media on Collections page

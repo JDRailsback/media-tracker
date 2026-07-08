@@ -857,3 +857,99 @@ near-match can still outrank a barely-passing exact match — `significant`
 still wins first) while replacing what used to be an arbitrary tiebreaker
 with the same real, cross-source-normalized popularity signal used
 throughout the franchise system.
+
+## Ten polish fixes: real search-speed root cause, franchise cards, platform links
+
+**The actual reason search felt slow — not the typo-correction budget
+itself.** Verified live: a plain, correctly-spelled query like "star wars"
+returns real results from movie/TV/game in well under 300ms combined, but
+"star wars" has zero MangaDex matches — not a typo, there's just no Star Wars
+manga. The combined search ran typo-fallback **per source, unconditionally**,
+so that one legitimately-empty category alone cost the full ~1.2s typo
+budget and dragged the WHOLE combined search down to match it, on nearly
+every query (it's rare for all four media types to have a real hit
+simultaneously). Fixed in `lib/sources/index.ts`'s default search case:
+run plain primary searches on all four sources first; only fall back to
+typo-correction if the search comes up empty **as a whole**. Also removed a
+redundant duplicate primary fetch that the first version of this fix
+introduced (`withTypoFallback` now accepts an already-fetched primary result
+instead of re-fetching it). Net effect verified live: "star wars"/"zelda"/
+"minecraft"/"the witcher" dropped from 1.6-3s to 200-1000ms; a genuinely
+misspelled query with no match anywhere ("toystroy") still gets corrected,
+just costs the typo budget once instead of never being attempted for the
+common case.
+
+**Franchise search results get their own row, not mixed into the flat
+grid.** `search()`'s default case now also runs `searchFranchises()` (free,
+in-memory) and returns matches alongside the regular results; the client
+(`app/page.tsx`) partitions them into a dedicated `FranchiseRow` above the
+main grid — only on the "All" filter (the "Franchises" filter already shows
+every franchise in its own wider grid, making a redundant row there). Caught
+a real data bug in the process: two separate curated entries were both named
+"The Witcher" (`the-witcher` for the games, `the-witcher-tv` for the show) —
+merged into one entry with both `game` and `tvShow` queries, since the
+system already supports multi-type franchises and this was just leftover
+duplication from authoring, not an intentional design choice.
+
+**`FranchiseCard` rebuilt to fix three related complaints at once** (poster
+hover rendering oddly, unwanted text baked onto the poster, wanting a wider
+card). Root cause of all three: the old card had an absolutely-positioned
+image UNDER a persistently-visible gradient+text overlay — a structurally
+different, more fragile pattern than `MediaCard`'s proven one (normal-flow
+image, hover-only overlay). Rebuilt to match `MediaCard`'s structure exactly
+(fixing the hover glitch as a side effect), dropped the overlay text entirely
+(title/tagline now sit below the image like every other card), and switched
+the aspect ratio from portrait 2:3 to landscape 3:2 with wider container
+widths (`Shelf`/`FranchiseRow` both gained an `itemWidthClassName` prop) —
+franchises are themed collections, not box art, and the wider landscape tile
+keeps them visually distinct in a mixed page.
+
+**The back button led to Home, not wherever the user actually came from.**
+Root cause: this app is a single-route SPA (`app/page.tsx`) — switching
+between Home/Discover/Search/Following is pure `useState`, never reflected
+in the URL. `/franchise/[slug]` is a real, different route, so the browser's
+back button could only ever land back on "/" at its hardcoded default state,
+losing whatever view or search results were active. Verified live before
+concluding `router.back()` alone would fix it — it didn't; Next.js still
+remounted `/` fresh. Fixed by persisting the relevant state
+(`view`/`query`/`searchType`/`searchResults`/`hasSearched`/`category`/
+`categoryItems`) to `sessionStorage` on every change, restored once on mount
+— not the URL, since redesigning this SPA's routing to encode view state
+there was a much larger change than the bug warranted.
+
+**Platform-preference matching couldn't tell a service from its reseller
+bundle.** `isPreferredProvider()` (`lib/platformPrefs.ts`) did a plain
+substring match, so a preference for "Apple TV" also matched "Apple TV
+Amazon Channel" — verified live TMDB lists these as genuinely separate
+provider entries (different subscription/billing products, "Max" similarly
+matched both "HBO Max" and "HBO Max Amazon Channel"). Fixed with a
+`CHANNEL_SUFFIXES` check: a provider that's a channel bundle only matches a
+preference that's ALSO specifically for that channel — verified live
+against a real title with both "HBO Max" and "HBO Max Amazon Channel" as
+separate providers; only the base service now gets the preferred
+highlight/star.
+
+**Movies/TV with zero watch-provider data got an empty "Available on"
+section.** Verified live: "THE GHOST IN THE SHELL" (a brand-new show) has a
+completely empty `watch/providers.results` object from TMDB — not just
+missing US data, nothing at all. Same "always link to SOMETHING" principle
+MangaDex already followed (falls back to the manga's own MangaDex page) now
+applies to movies/TV (fall back to the title's TMDB page) and games (fall
+back to the game's own IGDB page) — verified live that IGDB's page URLs are
+slug-based (`/games/the-witcher-3-wild-hunt`), not numeric-id-based, so this
+uses IGDB's own `url` field rather than constructing one.
+
+**`DetailModal`'s poster panel had no controlled aspect ratio.** It was a
+flex-row sibling with no fixed height, so it stretched to match whatever
+height the text column happened to need (overview length, episode list, etc.
+all vary a lot) — `object-cover` doesn't stretch/distort an image, but it
+does crop harder or looser depending on that arbitrary height, which reads
+as "the poster looks wrong." Fixed with `self-start` (opts out of the flex
+row's default stretch) plus a fixed `aspect-[2/3]`, matching every other
+poster box in the app.
+
+**Scrollbars were visible on several containers that forgot the existing
+`scrollbar-none` utility** (`app/globals.css`) — the TV episode list and
+main content area in `DetailModal`, and two list containers in
+`FranchiseEditForm`. `Shelf` and `FranchiseRow`'s horizontal rows already had
+it; this was just inconsistently applied, not a new mechanism.

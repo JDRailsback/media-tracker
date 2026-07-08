@@ -10,8 +10,9 @@ import { enablePush, syncFollow } from "@/lib/push-client";
 import type { DiscoverPayload } from "@/lib/sources";
 import DetailModal from "@/components/DetailModal";
 import MediaCard from "@/components/MediaCard";
-import FranchiseCard from "@/components/FranchiseCard";
-import FranchiseEditForm from "@/components/FranchiseEditForm";
+import CollectionCard from "@/components/CollectionCard";
+import CollectionEditForm from "@/components/CollectionEditForm";
+import CollectionRow from "@/components/CollectionRow";
 import FeedRow from "@/components/FeedRow";
 import Shelf from "@/components/Shelf";
 import Sidebar, { View } from "@/components/Sidebar";
@@ -25,7 +26,7 @@ const CATEGORY_TITLE: Record<string, string> = {
   games: "Popular games",
   manga: "Popular manga",
   upcoming: "Popular upcoming",
-  franchises: "Explore franchises",
+  collections: "Explore collections",
 };
 
 const SEARCH_TYPE_FILTERS: { value: string; label: string }[] = [
@@ -34,8 +35,20 @@ const SEARCH_TYPE_FILTERS: { value: string; label: string }[] = [
   { value: "tvShow", label: "TV" },
   { value: "game", label: "Games" },
   { value: "manga", label: "Manga" },
-  { value: "franchise", label: "Franchises" },
+  { value: "franchise", label: "Collections" },
 ];
+
+// See the restore/persist effects in Home() for why this exists.
+const SESSION_KEY = "appViewState";
+interface PersistedState {
+  view: View;
+  query: string;
+  searchType: string;
+  searchResults: MediaItem[];
+  hasSearched: boolean;
+  category: string | null;
+  categoryItems: MediaItem[];
+}
 
 export default function Home() {
   const router = useRouter();
@@ -50,7 +63,7 @@ export default function Home() {
   const [category, setCategory] = useState<string | null>(null);
   const [categoryItems, setCategoryItems] = useState<MediaItem[]>([]);
   const [categoryLoading, setCategoryLoading] = useState(false);
-  const [creatingFranchise, setCreatingFranchise] = useState(false);
+  const [creatingCollection, setCreatingCollection] = useState(false);
 
   // Search
   const [query, setQuery] = useState("");
@@ -69,6 +82,53 @@ export default function Home() {
       .then((d) => d && setDiscoverData(d))
       .finally(() => setDiscoverLoading(false));
   }, [view, discoverData, discoverLoading]);
+
+  // This SPA never reflects `view`/search state in the URL — it's all one
+  // route ("/"). That means the browser's back button, on its own, can only
+  // ever land back on "/" at its DEFAULT state (Home), even coming back from
+  // a real route like /collection/[slug] — verified live that this was
+  // exactly the bug: search results were lost every time. Persisting to
+  // sessionStorage (not the URL) is the simplest fix that doesn't require
+  // redesigning this page's routing — restored once on mount, kept in sync
+  // on every change.
+  const [restored, setRestored] = useState(false);
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem(SESSION_KEY);
+      const saved = raw ? (JSON.parse(raw) as Partial<PersistedState>) : null;
+      if (saved) {
+        if (saved.view) setView(saved.view);
+        setQuery(saved.query ?? "");
+        setSearchType(saved.searchType ?? "");
+        setSearchResults(saved.searchResults ?? []);
+        setHasSearched(saved.hasSearched ?? false);
+        setCategory(saved.category ?? null);
+        setCategoryItems(saved.categoryItems ?? []);
+      }
+    } catch {
+      // Corrupt/unavailable sessionStorage just means starting fresh.
+    } finally {
+      setRestored(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!restored) return; // don't clobber saved state with defaults before it's loaded
+    const state: PersistedState = {
+      view,
+      query,
+      searchType,
+      searchResults,
+      hasSearched,
+      category,
+      categoryItems,
+    };
+    try {
+      sessionStorage.setItem(SESSION_KEY, JSON.stringify(state));
+    } catch {
+      // Storage full/unavailable — losing "restore where I was" is harmless.
+    }
+  }, [restored, view, query, searchType, searchResults, hasSearched, category, categoryItems]);
 
   function openCategory(cat: string) {
     setCategory(cat);
@@ -127,13 +187,13 @@ async function runSearch(q: string, type: string) {
     setPushEnabled(await enablePush());
   }
 
-  // Franchises open their own themed page, not the generic DetailModal —
+  // Collections open their own themed page, not the generic DetailModal —
   // used everywhere a MediaItem can be clicked (feed, following, discover,
-  // search) so a followed/discovered franchise routes correctly regardless
+  // search) so a followed/discovered collection routes correctly regardless
   // of where it was clicked from.
   function handleSelect(item: MediaItem) {
     if (item.type === "franchise") {
-      router.push(`/franchise/${item.id.slice(item.id.indexOf(":") + 1)}`);
+      router.push(`/collection/${item.id.slice(item.id.indexOf(":") + 1)}`);
     } else {
       setSelected(item);
     }
@@ -207,19 +267,20 @@ async function runSearch(q: string, type: string) {
                 />
                 <div className="mb-2 flex items-center justify-end">
                   <button
-                    onClick={() => setCreatingFranchise(true)}
+                    onClick={() => setCreatingCollection(true)}
                     className="flex items-center gap-1 text-[13px] font-medium text-accent transition-opacity hover:opacity-70"
                   >
                     <Plus size={14} />
-                    New franchise
+                    New collection
                   </button>
                 </div>
                 <Shelf
-                  title="Franchises"
-                  items={discoverData.featuredFranchises}
+                  title="Collections"
+                  items={discoverData.featuredCollections}
                   onSelect={handleSelect}
-                  onSeeAll={() => openCategory("franchises")}
-                  renderItem={(item, i) => <FranchiseCard item={item} index={i} />}
+                  onSeeAll={() => openCategory("collections")}
+                  renderItem={(item, i) => <CollectionCard item={item} index={i} />}
+                  itemWidthClassName="w-48 sm:w-56"
                 />
                 <Shelf
                   title={CATEGORY_TITLE.movies}
@@ -261,23 +322,29 @@ async function runSearch(q: string, type: string) {
             </button>
             <div className="mb-4 flex items-center justify-between">
               <PageHeader title={CATEGORY_TITLE[category] ?? category} />
-              {category === "franchises" && (
+              {category === "collections" && (
                 <button
-                  onClick={() => setCreatingFranchise(true)}
+                  onClick={() => setCreatingCollection(true)}
                   className="flex shrink-0 items-center gap-1 text-[13px] font-medium text-accent transition-opacity hover:opacity-70"
                 >
                   <Plus size={14} />
-                  New franchise
+                  New collection
                 </button>
               )}
             </div>
             {categoryLoading ? (
               <p className="text-[13px] text-subtle">Loading…</p>
             ) : (
-              <div className="grid grid-cols-2 gap-x-5 gap-y-7 sm:grid-cols-3 lg:grid-cols-4">
+              <div
+                className={
+                  category === "collections"
+                    ? "grid grid-cols-2 gap-x-5 gap-y-7 sm:grid-cols-3"
+                    : "grid grid-cols-2 gap-x-5 gap-y-7 sm:grid-cols-3 lg:grid-cols-4"
+                }
+              >
                 {categoryItems.map((item, i) =>
-                  category === "franchises" ? (
-                    <FranchiseCard key={item.id} item={item} index={i} />
+                  category === "collections" ? (
+                    <CollectionCard key={item.id} item={item} index={i} />
                   ) : (
                     <MediaCard key={item.id} item={item} index={i} onSelect={handleSelect} />
                   )
@@ -298,7 +365,7 @@ async function runSearch(q: string, type: string) {
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search movies, TV, games, franchises, and manga…"
+                placeholder="Search movies, TV, games, collections, and manga…"
                 className="w-full bg-transparent text-[15px] text-ink outline-none placeholder:text-subtle"
               />
             </form>
@@ -321,17 +388,47 @@ async function runSearch(q: string, type: string) {
 
             {searchLoading && <SearchSkeleton />}
 
-            {!searchLoading && searchResults.length > 0 && (
-              <div className="mt-7 grid grid-cols-2 gap-x-5 gap-y-7 sm:grid-cols-3 lg:grid-cols-4">
-                {searchResults.map((item, i) =>
-                  item.type === "franchise" ? (
-                    <FranchiseCard key={item.id} item={item} index={i} />
-                  ) : (
-                    <MediaCard key={item.id} item={item} index={i} onSelect={handleSelect} />
-                  )
-                )}
-              </div>
-            )}
+            {!searchLoading &&
+              searchResults.length > 0 &&
+              (() => {
+                // On the "All" filter, a matched collection gets its own row
+                // up top instead of being mixed into the flat media grid —
+                // it's a themed collection, not a single title, and lumping
+                // it in with individual movies/games/etc. reads as confusing
+                // clutter. The "Collections" filter already shows ALL of them
+                // in their own dedicated (wider) grid below, so this row is
+                // redundant there and skipped.
+                const collectionMatches = searchResults.filter((i) => i.type === "franchise");
+                const showCollectionRow = searchType === "" && collectionMatches.length > 0;
+                return (
+                  <>
+                    {showCollectionRow && (
+                      <CollectionRow
+                        title="Collections"
+                        items={collectionMatches}
+                        onSelect={handleSelect}
+                        renderItem={(item, i) => <CollectionCard item={item} index={i} />}
+                        itemWidthClassName="w-48 sm:w-56"
+                      />
+                    )}
+                    <div
+                      className={`${showCollectionRow ? "mt-2" : "mt-7"} grid grid-cols-2 gap-x-5 gap-y-7 ${
+                        searchType === "franchise" ? "sm:grid-cols-3" : "sm:grid-cols-3 lg:grid-cols-4"
+                      }`}
+                    >
+                      {searchResults
+                        .filter((item) => searchType === "franchise" || item.type !== "franchise")
+                        .map((item, i) =>
+                          item.type === "franchise" ? (
+                            <CollectionCard key={item.id} item={item} index={i} />
+                          ) : (
+                            <MediaCard key={item.id} item={item} index={i} onSelect={handleSelect} />
+                          )
+                        )}
+                    </div>
+                  </>
+                );
+              })()}
 
             {!searchLoading && hasSearched && searchResults.length === 0 && (
               <div className="mt-7">
@@ -413,14 +510,14 @@ async function runSearch(q: string, type: string) {
         />
       )}
 
-      {creatingFranchise && (
-        <FranchiseEditForm
+      {creatingCollection && (
+        <CollectionEditForm
           mode="create"
           onSaved={(saved) => {
-            setCreatingFranchise(false);
-            router.push(`/franchise/${saved.slug}`);
+            setCreatingCollection(false);
+            router.push(`/collection/${saved.slug}`);
           }}
-          onClose={() => setCreatingFranchise(false)}
+          onClose={() => setCreatingCollection(false)}
         />
       )}
     </div>

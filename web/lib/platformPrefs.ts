@@ -96,9 +96,27 @@ export function togglePreferredPlatform(name: string): void {
   localStorage.setItem(KEY, JSON.stringify(next));
 }
 
+// TMDB's watch-provider list includes reseller "channel" bundles — a
+// separate subscription/billing product sold THROUGH another platform, not
+// the base service itself. Verified live: selecting "Apple TV" as preferred
+// also highlighted "Apple TV Amazon Channel," a distinct provider entry, just
+// because the plain substring match found "apple tv" inside its name too.
+const CHANNEL_SUFFIXES = ["amazon channel", "apple tv channel", "roku premium channel"];
+
+function isChannelBundle(providerLower: string): boolean {
+  return CHANNEL_SUFFIXES.some((suffix) => providerLower.includes(suffix));
+}
+
 // Loose match: a provider like "Netflix Standard with Ads" or "Amazon Video"
-// should still count as a match for the preference "Netflix" / "Amazon".
+// should still count as a match for the preference "Netflix" / "Amazon" —
+// but a channel bundle (see above) only matches if the preference is
+// SPECIFICALLY for that channel, not just the base service it resells.
 export function isPreferredProvider(provider: string, preferred: string[]): boolean {
   const p = provider.toLowerCase();
-  return preferred.some((pref) => p.includes(pref.toLowerCase()));
+  return preferred.some((pref) => {
+    const prefLower = pref.toLowerCase();
+    if (!p.includes(prefLower)) return false;
+    if (isChannelBundle(p) && !isChannelBundle(prefLower)) return false;
+    return true;
+  });
 }

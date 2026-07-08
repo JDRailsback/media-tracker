@@ -145,7 +145,8 @@ export async function detailsTMDBMovie(id: string): Promise<MediaItem> {
   if (!res.ok) throw new Error(`TMDB movie details failed: ${res.status}`);
   const d = await res.json();
   const base = mapMovie(d as TMDBMovie);
-  base.externalLinks = watchLinks(d["watch/providers"]?.results?.US);
+  base.externalLinks =
+    watchLinks(d["watch/providers"]?.results?.US) ?? tmdbPageFallback("movie", id);
   return base;
 }
 
@@ -279,7 +280,7 @@ export async function detailsTMDBTV(id: string): Promise<MediaItem> {
   if (!res.ok) throw new Error(`TMDB TV details failed: ${res.status}`);
   const d = await res.json();
   const base = mapShow(d as TMDBShow);
-  base.externalLinks = watchLinks(d["watch/providers"]?.results?.US);
+  base.externalLinks = watchLinks(d["watch/providers"]?.results?.US) ?? tmdbPageFallback("tv", id);
   base.episodeCount = d.number_of_episodes;
   base.episodes = await allEpisodes(id, d.seasons);
   return base;
@@ -394,4 +395,21 @@ function watchLinks(country: any): ExternalLink[] | undefined {
   add(country.rent, "rent");
   add(country.buy, "buy");
   return links.length ? links : undefined;
+}
+
+// TMDB has zero watch-provider data for some titles (verified live: "THE
+// GHOST IN THE SHELL," a brand-new show, has an entirely empty
+// `watch/providers.results` object — not just missing for the US region).
+// Everything should link to SOMEWHERE (the same principle MangaDex already
+// follows — see detailsMangaDex's own page fallback in
+// lib/sources/mangadex.ts) rather than showing an empty "Available on"
+// section with nothing to click.
+function tmdbPageFallback(kind: "movie" | "tv", id: string): ExternalLink[] {
+  return [
+    {
+      provider: "TMDB",
+      url: `https://www.themoviedb.org/${kind}/${id}`,
+      kind: "info",
+    },
+  ];
 }

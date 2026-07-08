@@ -270,12 +270,18 @@ function storeLinks(websites: { url?: string }[] | undefined): ExternalLink[] | 
 
 export async function detailsIGDB(id: string): Promise<MediaItem> {
   const games = await query(
-    `fields name,summary,cover.url,first_release_date,websites.url; where id = ${id};`
+    `fields name,summary,cover.url,first_release_date,websites.url,url; where id = ${id};`
   );
   if (games.length === 0) throw new Error(`Game ${id} not found`);
-  const game = games[0] as IGDBGame & { websites?: { url?: string }[] };
+  const game = games[0] as IGDBGame & { websites?: { url?: string }[]; url?: string };
   const item = mapGame(game);
-  item.externalLinks = storeLinks(game.websites);
+  // Always link to SOMETHING (same principle as MangaDex/TMDB fallbacks) —
+  // a game with no recognized storefront link still gets its own IGDB page.
+  // IGDB's own page URL is slug-based (e.g. "/games/the-witcher-3-wild-hunt"),
+  // NOT the numeric id — verified live, so this uses IGDB's own `url` field
+  // rather than guessing a URL shape.
+  item.externalLinks = storeLinks(game.websites) ??
+    (game.url ? [{ provider: "IGDB", url: game.url, kind: "info" }] : undefined);
   return item;
 }
 

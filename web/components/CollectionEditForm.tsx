@@ -1,20 +1,21 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { X, Plus, Search, Trash2 } from "lucide-react";
 import type { MediaItem, MediaType } from "@/lib/types";
-import type { FranchiseQueries } from "@/lib/franchises";
-import type { IncludedPart } from "@/lib/sources/franchise";
+import type { CollectionQueries } from "@/lib/collections";
+import type { IncludedPart } from "@/lib/sources/collection";
 
-export interface FranchiseFormData {
+export interface CollectionFormData {
   name: string;
   tagline: string;
   theme: { primary: string; secondary: string };
-  queries: FranchiseQueries;
+  queries: CollectionQueries;
   movieCollectionId: number | null;
   featured: boolean;
   posterURL: string | null;
   bannerURL: string | null;
+  logoURL: string | null;
   includeOverrides: IncludedPart[];
   excludeIds: string[];
 }
@@ -53,10 +54,125 @@ function textToQueries(text: string): string[] | undefined {
   return lines.length ? lines : undefined;
 }
 
-// Shared editor for both creating a brand-new custom franchise and editing
-// an existing one (curated or custom) — same fields either way, only the
-// save endpoint and the presence of delete/revert differs.
-export default function FranchiseEditForm({
+// Color picker + hex text input, kept in sync
+function ColorInput({
+  value,
+  onChange,
+}: {
+  value: string; // "R G B" triplet
+  onChange: (v: string) => void;
+}) {
+  const [hexText, setHexText] = useState(() => rgbToHex(value));
+  useEffect(() => setHexText(rgbToHex(value)), [value]);
+
+  return (
+    <div className="flex gap-2">
+      <input
+        type="color"
+        value={rgbToHex(value)}
+        onChange={(e) => {
+          onChange(hexToRgb(e.target.value));
+          setHexText(e.target.value);
+        }}
+        className="h-10 w-12 shrink-0 cursor-pointer rounded-lg border border-hairline bg-transparent p-0.5"
+      />
+      <input
+        type="text"
+        value={hexText}
+        onChange={(e) => {
+          setHexText(e.target.value);
+          if (/^#[0-9a-fA-F]{6}$/.test(e.target.value)) {
+            onChange(hexToRgb(e.target.value));
+          }
+        }}
+        onBlur={() => setHexText(rgbToHex(value))}
+        className="input flex-1 font-mono text-[13px]"
+        placeholder="#1a1a2e"
+        maxLength={7}
+      />
+    </div>
+  );
+}
+
+// URL text input + drag-and-drop zone; converts dropped images to data URLs
+function DragDropInput({
+  value,
+  onChange,
+  placeholder = "https://…",
+  maxMB = 1,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  maxMB?: number;
+}) {
+  const [dragging, setDragging] = useState(false);
+  const [dropError, setDropError] = useState<string | null>(null);
+
+  function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setDragging(false);
+    setDropError(null);
+    const file = e.dataTransfer.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setDropError("Only image files are supported.");
+      return;
+    }
+    if (file.size > maxMB * 1024 * 1024) {
+      setDropError(`Image must be under ${maxMB} MB — use a URL link for larger files.`);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") onChange(reader.result);
+    };
+    reader.readAsDataURL(file);
+  }
+
+  return (
+    <div className="space-y-2">
+      <input
+        value={value}
+        onChange={(e) => {
+          setDropError(null);
+          onChange(e.target.value);
+        }}
+        className="input w-full"
+        placeholder={placeholder}
+      />
+      <div
+        className={`flex cursor-default select-none flex-col items-center justify-center rounded-lg border-2 border-dashed py-3 text-[12.5px] transition-colors ${
+          dragging ? "border-accent bg-accent/5 text-accent" : "border-hairline text-subtle"
+        }`}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragging(true);
+        }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={handleDrop}
+      >
+        {dragging ? "Drop to use this image" : `Drag & drop an image here (max ${maxMB} MB)`}
+      </div>
+      {dropError && <p className="text-[12px] text-red-500">{dropError}</p>}
+      {value && (
+        <div className="relative inline-block">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={value} alt="Preview" className="max-h-24 max-w-full rounded-lg object-contain" />
+          <button
+            type="button"
+            onClick={() => onChange("")}
+            className="absolute right-1 top-1 rounded-full bg-black/60 p-1 text-white hover:bg-black/80"
+          >
+            <X size={12} />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function CollectionEditForm({
   mode,
   slug,
   initial,
@@ -68,22 +184,22 @@ export default function FranchiseEditForm({
 }: {
   mode: "create" | "edit";
   slug?: string;
-  initial?: FranchiseFormData;
-  // Currently auto-resolved parts (from the parent's already-fetched detail
-  // payload) — used to offer a "hide" toggle without a second network call.
-  // Not available in create mode (nothing resolved yet for a brand-new one).
+  initial?: CollectionFormData;
   currentParts?: { movie: MediaItem[]; tvShow: MediaItem[]; game: MediaItem[]; manga: MediaItem[] };
   isCustom?: boolean;
-  onSaved: (effective: FranchiseFormData & { slug: string }) => void;
+  onSaved: (effective: CollectionFormData & { slug: string }) => void;
   onDeleted?: () => void;
   onClose: () => void;
 }) {
   const [name, setName] = useState(initial?.name ?? "");
   const [tagline, setTagline] = useState(initial?.tagline ?? "");
-  const [primary, setPrimary] = useState(initial?.theme.primary ?? "60 60 70");
-  const [secondary, setSecondary] = useState(initial?.theme.secondary ?? "140 140 160");
-  const [posterURL, setPosterURL] = useState(initial?.posterURL ?? "");
+  // primary = header background color; secondary kept in state for the data
+  // model but no longer editable (not used in the current page template).
+  const [primary, setPrimary] = useState(initial?.theme.primary ?? "17 17 24");
+  const [secondary] = useState(initial?.theme.secondary ?? "140 140 160");
   const [bannerURL, setBannerURL] = useState(initial?.bannerURL ?? "");
+  const [logoURL, setLogoURL] = useState(initial?.logoURL ?? "");
+  const [posterURL, setPosterURL] = useState(initial?.posterURL ?? "");
   const [movieCollectionId, setMovieCollectionId] = useState(
     initial?.movieCollectionId != null ? String(initial.movieCollectionId) : ""
   );
@@ -152,7 +268,7 @@ export default function FranchiseEditForm({
     }
     setSaving(true);
     setError(null);
-    const body: FranchiseFormData = {
+    const body: CollectionFormData = {
       name: name.trim(),
       tagline,
       theme: { primary, secondary },
@@ -166,11 +282,12 @@ export default function FranchiseEditForm({
       featured,
       posterURL: posterURL.trim() || null,
       bannerURL: bannerURL.trim() || null,
+      logoURL: logoURL.trim() || null,
       includeOverrides,
       excludeIds,
     };
     try {
-      const url = mode === "create" ? "/api/franchise" : `/api/franchise/${slug}`;
+      const url = mode === "create" ? "/api/collection" : `/api/collection/${slug}`;
       const method = mode === "create" ? "POST" : "PUT";
       const res = await fetch(url, {
         method,
@@ -192,7 +309,7 @@ export default function FranchiseEditForm({
     if (!slug) return;
     setSaving(true);
     try {
-      await fetch(`/api/franchise/${slug}`, { method: "DELETE" });
+      await fetch(`/api/collection/${slug}`, { method: "DELETE" });
       onDeleted?.();
     } finally {
       setSaving(false);
@@ -210,14 +327,14 @@ export default function FranchiseEditForm({
       >
         <div className="flex items-center justify-between border-b border-hairline px-6 py-4">
           <h2 className="text-[16px] font-bold text-ink">
-            {mode === "create" ? "New franchise" : `Edit ${initial?.name ?? "franchise"}`}
+            {mode === "create" ? "New collection" : `Edit ${initial?.name ?? "collection"}`}
           </h2>
           <button onClick={onClose} className="text-subtle hover:text-ink">
             <X size={18} />
           </button>
         </div>
 
-        <div className="flex-1 space-y-5 overflow-y-auto px-6 py-5">
+        <div className="scrollbar-none flex-1 space-y-5 overflow-y-auto px-6 py-5">
           {error && <p className="text-[13px] text-red-500">{error}</p>}
 
           <Field label="Name">
@@ -239,44 +356,24 @@ export default function FranchiseEditForm({
             />
           </Field>
 
-          <div className="grid grid-cols-2 gap-4">
-            <Field label="Primary color">
-              <input
-                type="color"
-                value={rgbToHex(primary)}
-                onChange={(e) => setPrimary(hexToRgb(e.target.value))}
-                className="h-10 w-full cursor-pointer rounded-lg border border-hairline bg-transparent"
-              />
-            </Field>
-            <Field label="Secondary color">
-              <input
-                type="color"
-                value={rgbToHex(secondary)}
-                onChange={(e) => setSecondary(hexToRgb(e.target.value))}
-                className="h-10 w-full cursor-pointer rounded-lg border border-hairline bg-transparent"
-              />
-            </Field>
-          </div>
-          <div
-            className="h-12 w-full rounded-lg"
-            style={{ backgroundImage: `linear-gradient(155deg, rgb(${primary}), rgb(${secondary}))` }}
-          />
+          <Field label="Header background color">
+            <ColorInput value={primary} onChange={setPrimary} />
+          </Field>
 
-          <Field label="Poster URL (used on cards and rows)">
+          <Field label="Header background image (optional — overrides color)">
+            <DragDropInput value={bannerURL} onChange={setBannerURL} maxMB={2} />
+          </Field>
+
+          <Field label="Logo (shown large and centered in the header)">
+            <DragDropInput value={logoURL} onChange={setLogoURL} maxMB={1} />
+          </Field>
+
+          <Field label="Poster URL (used on collection cards and rows)">
             <input
               value={posterURL}
               onChange={(e) => setPosterURL(e.target.value)}
               className="input"
               placeholder="https://…"
-            />
-          </Field>
-
-          <Field label="Banner URL (used on the detail page hero)">
-            <input
-              value={bannerURL}
-              onChange={(e) => setBannerURL(e.target.value)}
-              className="input"
-              placeholder="https://… (leave blank to auto-pick from a matched title)"
             />
           </Field>
 
@@ -370,7 +467,7 @@ export default function FranchiseEditForm({
             </div>
             {addSearching && <p className="mt-2 text-[12px] text-subtle">Searching…</p>}
             {addResults.length > 0 && (
-              <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto">
+              <ul className="scrollbar-none mt-2 max-h-40 space-y-1 overflow-y-auto">
                 {addResults.map((r) => (
                   <li key={r.id}>
                     <button
@@ -431,7 +528,7 @@ export default function FranchiseEditForm({
           <div>
             {mode === "edit" && isCustom && (
               <button onClick={handleDelete} className="text-[13px] font-medium text-red-500 hover:opacity-80">
-                Delete franchise
+                Delete collection
               </button>
             )}
             {mode === "edit" && !isCustom && (

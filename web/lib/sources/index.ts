@@ -11,7 +11,7 @@ import {
 } from "./tmdb";
 import { searchIGDB, detailsIGDB, discoverIGDBPopular, discoverIGDBUpcoming } from "./igdb";
 import { searchMangaDex, detailsMangaDex, discoverMangaDex } from "./mangadex";
-import { searchFranchises, detailsFranchise, discoverFranchises } from "./franchise";
+import { searchCollections, detailsCollection, discoverCollections } from "./collection";
 import { fuzzyMatches, matchTier, normalizedScores, RankedItem, stripRanking, typoVariants } from "./textMatch";
 
 // Round-robin interleave instead of concatenating. Without this, a combined
@@ -162,9 +162,15 @@ async function findTypoMatch(
 
 async function withTypoFallback(
   query: string,
-  searchFn: (q: string) => Promise<RankedItem[]>
+  searchFn: (q: string) => Promise<RankedItem[]>,
+  // Combined search (see the `default` case below) already fetches every
+  // source's primary result once, up front, to decide whether typo-fallback
+  // is even worth attempting. Accepting it here avoids fetching it a SECOND
+  // time — the same slow-search problem this budget was built to avoid,
+  // just relocated a few lines away.
+  knownPrimary?: RankedItem[]
 ): Promise<FallbackResult> {
-  const primary = await searchFn(query);
+  const primary = knownPrimary ?? (await searchFn(query));
   // A non-empty primary result isn't necessarily a GOOD one — verified live
   // that TMDB's own fuzzy search for a garbled query like "toystroy" already
   // returns some barely-related candidate rather than nothing, which used to
@@ -211,21 +217,53 @@ export async function search(query: string, type?: string | null): Promise<Media
       return byRelevance(r.items, r.query);
     }
     case "franchise":
-      return await searchFranchises(query);
+      return await searchCollections(query);
     default: {
-      const settled = await Promise.allSettled([
-        withTypoFallback(query, searchTMDBMovie),
-        withTypoFallback(query, searchTMDBTV),
-        withTypoFallback(query, searchIGDB),
-        withTypoFallback(query, searchMangaDex),
+      // Collection search is free (in-memory, no network call) — always run
+      // it, but kept entirely separate from the interleaved media results
+      // below. The client renders any matches as their own standalone row
+      // at the top of the results, never mixed into the flat media grid.
+      const franchiseResults = await searchCollections(query);
+
+      // Try PRIMARY (non-typo) searches on all four sources first. Verified
+      // live this is the actual fix for "search feels slow," not the typo
+      // budget itself: a query like "star wars" gets real results from
+      // movie/TV/game in under 300ms combined, but zero manga matches —
+      // that's not a typo, there's just no Star Wars manga. The previous
+      // version ran typo-fallback per source UNCONDITIONALLY, so that one
+      // legitimately-empty category alone cost the full ~1.2s typo budget
+      // and dragged the ENTIRE combined search down to match it — on
+      // essentially every query, since it's rare for all four media types
+      // to have a real hit simultaneously. Only pay for typo-correction
+      // when the search comes up empty as a WHOLE.
+      const primarySettled = await Promise.allSettled([
+        searchTMDBMovie(query),
+        searchTMDBTV(query),
+        searchIGDB(query),
+        searchMangaDex(query),
       ]);
-      // Each source may have resolved via a DIFFERENT typo correction, so
-      // filter/sort each against its own matched query before merging —
-      // matchTier comparisons only make sense within a single reference
-      // query, not across sources that corrected differently.
-      const lists = settled.map((r) =>
-        r.status === "fulfilled" ? filterAndSort(r.value.items, r.value.query) : []
-      );
+      const primaryLists = primarySettled.map((r) => (r.status === "fulfilled" ? r.value : []));
+      const anyRelevant = primaryLists.some((list) => relevantOnly(list, query).length > 0);
+
+      let lists: RankedItem[][];
+      if (anyRelevant) {
+        lists = primaryLists.map((list) => filterAndSort(list, query));
+      } else {
+        const settled = await Promise.allSettled([
+          withTypoFallback(query, searchTMDBMovie, primaryLists[0]),
+          withTypoFallback(query, searchTMDBTV, primaryLists[1]),
+          withTypoFallback(query, searchIGDB, primaryLists[2]),
+          withTypoFallback(query, searchMangaDex, primaryLists[3]),
+        ]);
+        // Each source may have resolved via a DIFFERENT typo correction, so
+        // filter/sort each against its own matched query before merging —
+        // matchTier comparisons only make sense within a single reference
+        // query, not across sources that corrected differently.
+        lists = settled.map((r) =>
+          r.status === "fulfilled" ? filterAndSort(r.value.items, r.value.query) : []
+        );
+      }
+
       // Popularity is real now (not just a stable-sort artifact of
       // interleave position) but each source's raw numbers are on wildly
       // different scales (MangaDex follows vs. IGDB rating counts vs. TMDB
@@ -240,7 +278,7 @@ export async function search(query: string, type?: string | null): Promise<Media
         if (a.significant !== b.significant) return a.significant ? -1 : 1;
         return (scores.get(b.id) ?? 0) - (scores.get(a.id) ?? 0);
       });
-      return stripRanking(merged);
+      return [...franchiseResults, ...stripRanking(merged)];
     }
   }
 }
@@ -256,7 +294,7 @@ export async function details(type: string, id: string): Promise<MediaItem> {
     case "manga":
       return detailsMangaDex(id);
     case "franchise":
-      return detailsFranchise(id);
+      return detailsCollection(id);
     default:
       throw new Error(`Unsupported type: ${type}`);
   }
@@ -268,7 +306,7 @@ export interface DiscoverPayload {
   popularGames: MediaItem[];
   popularManga: MediaItem[];
   popularUpcoming: MediaItem[];
-  featuredFranchises: MediaItem[];
+  featuredCollections: MediaItem[];
 }
 
 // Curated groupings for the Discover page. Each shelf is independent — one
@@ -293,10 +331,10 @@ export async function discover(): Promise<DiscoverPayload> {
     .slice(0, 16);
 
   // No TMDB/IGDB/MangaDex calls — just curated data plus one DB read for
-  // any admin overrides (see lib/sources/franchise.ts).
-  const featuredFranchises = await discoverFranchises(true);
+  // any admin overrides (see lib/sources/collection.ts).
+  const featuredCollections = await discoverCollections(true);
 
-  return { trendingMovies, trendingTV, popularGames, popularManga, popularUpcoming, featuredFranchises };
+  return { trendingMovies, trendingTV, popularGames, popularManga, popularUpcoming, featuredCollections };
 }
 
 // A single category, expanded (for "see all" drill-down on the Discover page).
@@ -310,11 +348,10 @@ export async function discoverCategory(category: string): Promise<MediaItem[]> {
       return discoverIGDBPopular(40);
     case "manga":
       return discoverMangaDex(40);
-    case "franchises":
-      // Curated list plus admin overrides — returned in full (there are
-      // 150+, but no TMDB/IGDB/MangaDex calls, unlike every other category
-      // here).
-      return await discoverFranchises(false);
+    case "collections":
+      // Curated list plus admin overrides — no TMDB/IGDB/MangaDex calls,
+      // unlike every other category here.
+      return await discoverCollections(false);
     case "upcoming": {
       const [movies, tv, games] = await Promise.allSettled([
         discoverTMDBUpcomingMovies(20),

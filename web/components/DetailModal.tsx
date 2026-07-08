@@ -55,6 +55,13 @@ export default function DetailModal({
           <X size={16} strokeWidth={2.5} />
         </button>
 
+        {/* Fills the full height of the modal (bounded by max-h-[85vh] on
+            the outer container below, so it's never unreasonably tall) —
+            object-cover crops to fit without ever distorting the image.
+            Tried a fixed aspect-[2/3] + self-start here instead, but that
+            traded "crop varies with content length" for "empty dead space
+            below a small, fixed-size poster whenever the content column
+            (episode list, long overview) is taller" — worse in practice. */}
         <div className="hidden w-56 shrink-0 bg-canvas sm:block">
           {full.posterURL ? (
             // eslint-disable-next-line @next/next/no-img-element
@@ -62,7 +69,7 @@ export default function DetailModal({
           ) : null}
         </div>
 
-        <div className="flex-1 overflow-y-auto p-6">
+        <div className="scrollbar-none flex-1 overflow-y-auto p-6">
           <TypeTag type={full.type} />
           <h1 className="mt-2.5 text-2xl font-bold text-ink">{full.title}</h1>
           <div className="mt-1.5 flex items-center gap-2 text-[13px] text-subtle">
@@ -100,7 +107,7 @@ export default function DetailModal({
                 {new Set(full.episodes.map((e) => e.season)).size} season
                 {new Set(full.episodes.map((e) => e.season)).size === 1 ? "" : "s"}
               </h2>
-              <div className="max-h-64 space-y-1 overflow-y-auto rounded-xl bg-canvas p-2">
+              <div className="scrollbar-none max-h-64 space-y-1 overflow-y-auto rounded-xl bg-canvas p-2">
                 {full.episodes.map((ep) => (
                   <div
                     key={`${ep.season}-${ep.episode}`}

@@ -1,5 +1,5 @@
 import type { MediaItem, MediaType } from "@/lib/types";
-import { FRANCHISES, FranchiseDef, FranchiseQueries, getFranchise } from "@/lib/franchises";
+import { COLLECTIONS, CollectionDef, CollectionQueries, getCollection } from "@/lib/collections";
 import { db, ensureSchema } from "@/lib/db";
 import { matchTier, fuzzyMatches, normalizedScores, RankedItem, stripRanking } from "./textMatch";
 import { searchTMDBMovie, searchTMDBTV, tmdbCollectionParts } from "./tmdb";
@@ -26,23 +26,31 @@ export interface IncludedPart {
 }
 
 // The fully-resolved definition used everywhere at runtime — a plain
-// FranchiseDef (from the static seed list) if never edited, or the complete
-// replacement row from franchise_overrides if it has been. `isCustom` marks
-// a franchise created entirely through the editor, with no static fallback
+// CollectionDef (from the static seed list) if never edited, or the complete
+// replacement row from collection_overrides if it has been. `isCustom` marks
+// a collection created entirely through the editor, with no static fallback
 // to revert to.
-export interface EffectiveFranchise {
+export interface EffectiveCollection {
   slug: string;
   name: string;
   tagline: string;
   theme: { primary: string; secondary: string };
-  queries: FranchiseQueries;
+  queries: CollectionQueries;
   movieCollectionId?: number;
   featured: boolean;
   posterURL?: string;
   bannerURL?: string;
+  // A big wordmark/brand logo, shown large at the top of the detail page
+  // hero INSTEAD of the plain text name — override-only, same as
+  // posterURL/bannerURL, since the curated seed list doesn't ship official
+  // logo art (licensing), only what someone adds through the editor.
+  logoURL?: string;
   includeOverrides: IncludedPart[];
   excludeIds: string[];
   isCustom: boolean;
+  // Mirrors CollectionDef.collectionType — preserved from the static seed
+  // even when a DB override row exists (see getEffectiveCollection).
+  collectionType?: "thematic";
 }
 
 interface OverrideRow {
@@ -53,7 +61,8 @@ interface OverrideRow {
   theme_secondary: string;
   poster_url: string | null;
   banner_url: string | null;
-  queries: FranchiseQueries | string;
+  logo_url: string | null;
+  queries: CollectionQueries | string;
   movie_collection_id: number | null;
   featured: boolean;
   include_overrides: IncludedPart[] | string;
@@ -63,7 +72,7 @@ interface OverrideRow {
 
 // Neon's driver returns JSONB columns already parsed in practice, but this
 // guards against a raw string coming back (e.g. a future driver change)
-// rather than throwing and breaking the whole franchise system over it.
+// rather than throwing and breaking the whole collection system over it.
 function parseJSON<T>(value: T | string | null | undefined, fallback: T): T {
   if (value == null) return fallback;
   if (typeof value !== "string") return value;
@@ -74,7 +83,7 @@ function parseJSON<T>(value: T | string | null | undefined, fallback: T): T {
   }
 }
 
-function defToEffective(def: FranchiseDef): EffectiveFranchise {
+function defToEffective(def: CollectionDef): EffectiveCollection {
   return {
     slug: def.slug,
     name: def.name,
@@ -83,23 +92,25 @@ function defToEffective(def: FranchiseDef): EffectiveFranchise {
     queries: def.queries,
     movieCollectionId: def.movieCollectionId,
     featured: !!def.featured,
+    collectionType: def.collectionType,
     includeOverrides: [],
     excludeIds: [],
     isCustom: false,
   };
 }
 
-function rowToEffective(row: OverrideRow): EffectiveFranchise {
+function rowToEffective(row: OverrideRow): EffectiveCollection {
   return {
     slug: row.slug,
     name: row.name,
     tagline: row.tagline ?? "",
     theme: { primary: row.theme_primary, secondary: row.theme_secondary },
-    queries: parseJSON(row.queries, {} as FranchiseQueries),
+    queries: parseJSON(row.queries, {} as CollectionQueries),
     movieCollectionId: row.movie_collection_id ?? undefined,
     featured: row.featured,
     posterURL: row.poster_url ?? undefined,
     bannerURL: row.banner_url ?? undefined,
+    logoURL: row.logo_url ?? undefined,
     includeOverrides: parseJSON(row.include_overrides, []),
     excludeIds: parseJSON(row.exclude_ids, []),
     isCustom: row.is_custom,
@@ -116,7 +127,7 @@ async function loadOverrideRow(slug: string): Promise<OverrideRow | null> {
   try {
     await ensureSchema();
     const sql = db();
-    const rows = await sql`SELECT * FROM franchise_overrides WHERE slug = ${slug}`;
+    const rows = await sql`SELECT * FROM collection_overrides WHERE slug = ${slug}`;
     return (rows[0] as OverrideRow | undefined) ?? null;
   } catch {
     return null;
@@ -127,37 +138,44 @@ async function loadAllOverrides(): Promise<OverrideRow[]> {
   try {
     await ensureSchema();
     const sql = db();
-    return (await sql`SELECT * FROM franchise_overrides`) as unknown as OverrideRow[];
+    return (await sql`SELECT * FROM collection_overrides`) as unknown as OverrideRow[];
   } catch {
     return [];
   }
 }
 
-export async function getEffectiveFranchise(slug: string): Promise<EffectiveFranchise | null> {
+export async function getEffectiveCollection(slug: string): Promise<EffectiveCollection | null> {
   const row = await loadOverrideRow(slug);
-  if (row) return rowToEffective(row);
-  const def = getFranchise(slug);
+  if (row) {
+    const effective = rowToEffective(row);
+    // collectionType is a static property of the seed data, not an editable
+    // field — preserve it from the static def even when a DB override exists.
+    const staticDef = getCollection(slug);
+    if (staticDef?.collectionType) effective.collectionType = staticDef.collectionType;
+    return effective;
+  }
+  const def = getCollection(slug);
   return def ? defToEffective(def) : null;
 }
 
 // The merged list used by search and Discover browsing: every static
-// franchise (with its override applied, if any) plus any brand-new custom
-// franchises created entirely through the editor.
-export async function effectiveFranchises(): Promise<EffectiveFranchise[]> {
+// collection (with its override applied, if any) plus any brand-new custom
+// collections created entirely through the editor.
+export async function effectiveCollections(): Promise<EffectiveCollection[]> {
   const overrides = await loadAllOverrides();
   const overrideBySlug = new Map(overrides.map((r) => [r.slug, r]));
-  const merged = FRANCHISES.map((def) => {
+  const merged = COLLECTIONS.map((def) => {
     const row = overrideBySlug.get(def.slug);
     return row ? rowToEffective(row) : defToEffective(def);
   });
-  const staticSlugs = new Set(FRANCHISES.map((f) => f.slug));
+  const staticSlugs = new Set(COLLECTIONS.map((f) => f.slug));
   for (const row of overrides) {
     if (!staticSlugs.has(row.slug)) merged.push(rowToEffective(row));
   }
   return merged;
 }
 
-function toSummary(f: EffectiveFranchise): MediaItem {
+function toSummary(f: EffectiveCollection): MediaItem {
   return {
     id: `franchise:${f.slug}`,
     type: "franchise",
@@ -169,22 +187,22 @@ function toSummary(f: EffectiveFranchise): MediaItem {
 }
 
 // In-memory-fast fuzzy match plus one DB read — no per-source (TMDB/IGDB/
-// MangaDex) network calls, so franchise search stays effectively free
+// MangaDex) network calls, so collection search stays effectively free
 // regardless of the 2-second budget that governs the other, real,
 // rate-limited sources.
-export async function searchFranchises(query: string): Promise<MediaItem[]> {
-  const list = await effectiveFranchises();
+export async function searchCollections(query: string): Promise<MediaItem[]> {
+  const list = await effectiveCollections();
   return list
     .filter((f) => matchTier(f.name, query) < 3 || fuzzyMatches(f.name, query))
     .sort((a, b) => matchTier(a.name, query) - matchTier(b.name, query))
     .map(toSummary);
 }
 
-// Used for Discover browsing (the "Featured Franchises" shelf and its "see
+// Used for Discover browsing (the "Featured Collections" shelf and its "see
 // all" grid). No TMDB/IGDB/MangaDex calls; that cost is paid only when a
-// specific franchise's detail page is opened (resolveFranchise below).
-export async function discoverFranchises(featuredOnly = false): Promise<MediaItem[]> {
-  const list = await effectiveFranchises();
+// specific collection's detail page is opened (resolveCollection below).
+export async function discoverCollections(featuredOnly = false): Promise<MediaItem[]> {
+  const list = await effectiveCollections();
   return (featuredOnly ? list.filter((f) => f.featured) : list).map(toSummary);
 }
 
@@ -249,21 +267,21 @@ function sortByRecency<T extends MediaItem>(items: T[]): T[] {
 // "Most Popular" row — normalized per type bucket so one type's bigger raw
 // numbers can't dominate a franchise's cross-type ranking.
 
-export interface FranchisePartsByType {
+export interface CollectionPartsByType {
   movie: MediaItem[];
   tvShow: MediaItem[];
   game: MediaItem[];
   manga: MediaItem[];
 }
 
-export interface ResolvedFranchise {
-  def: EffectiveFranchise;
-  parts: FranchisePartsByType;
+export interface ResolvedCollection {
+  def: EffectiveCollection;
+  parts: CollectionPartsByType;
   // Combined across all four types, ranked by popularity normalized within
   // each type (see normalizedScores) — manually included titles (no real
   // popularity signal) are never part of this, only auto-resolved parts.
   mostPopular: MediaItem[];
-  nextRelease: { date: string; title: string } | null;
+  nextRelease: { date: string; title: string; posterURL?: string } | null;
   bannerURL?: string;
 }
 
@@ -283,8 +301,8 @@ const MOST_POPULAR_LIMIT = 12;
 // literal exact match to "One Piece" — true of almost every real entry in
 // any franchise). That bar exists to fight general-search clutter, not to
 // thin out a franchise's own already-precise, curated query.
-export async function resolveFranchise(slug: string): Promise<ResolvedFranchise | null> {
-  const def = await getEffectiveFranchise(slug);
+export async function resolveCollection(slug: string): Promise<ResolvedCollection | null> {
+  const def = await getEffectiveCollection(slug);
   if (!def) return null;
 
   const [movieFromCollection, movieFromSearch, tvShow, game, manga] = await Promise.all([
@@ -298,7 +316,7 @@ export async function resolveFranchise(slug: string): Promise<ResolvedFranchise 
   ]);
 
   const excluded = new Set(def.excludeIds);
-  const ranked: Record<keyof FranchisePartsByType, RankedItem[]> = {
+  const ranked: Record<keyof CollectionPartsByType, RankedItem[]> = {
     movie: dedupeById([...movieFromCollection, ...movieFromSearch]).filter((i) => !excluded.has(i.id)),
     tvShow: dedupeById(tvShow).filter((i) => !excluded.has(i.id)),
     game: dedupeById(game).filter((i) => !excluded.has(i.id)),
@@ -317,8 +335,8 @@ export async function resolveFranchise(slug: string): Promise<ResolvedFranchise 
   const allRanked = [...ranked.movie, ...ranked.tvShow, ...ranked.game, ...ranked.manga];
   const mostPopular = stripRanking(
     [...allRanked]
-      .sort((a, b) => (scoresByType[b.type as keyof FranchisePartsByType]?.get(b.id) ?? 0) -
-        (scoresByType[a.type as keyof FranchisePartsByType]?.get(a.id) ?? 0))
+      .sort((a, b) => (scoresByType[b.type as keyof CollectionPartsByType]?.get(b.id) ?? 0) -
+        (scoresByType[a.type as keyof CollectionPartsByType]?.get(a.id) ?? 0))
       .slice(0, MOST_POPULAR_LIMIT)
   );
 
@@ -348,7 +366,9 @@ export async function resolveFranchise(slug: string): Promise<ResolvedFranchise 
   const upcoming = all
     .filter((i): i is RankedItem & { releaseDate: string } => !!i.releaseDate && new Date(i.releaseDate) > new Date())
     .sort((a, b) => (a.releaseDate < b.releaseDate ? -1 : 1));
-  const nextRelease = upcoming.length > 0 ? { date: upcoming[0].releaseDate, title: upcoming[0].title } : null;
+  const nextRelease = upcoming.length > 0
+    ? { date: upcoming[0].releaseDate, title: upcoming[0].title, posterURL: upcoming[0].posterURL }
+    : null;
 
   // Explicit override wins; otherwise fall back to the first resolved part
   // that has a poster, same as before the editor existed.
@@ -356,7 +376,7 @@ export async function resolveFranchise(slug: string): Promise<ResolvedFranchise 
 
   // Sorted "most recent first" within each type, then stripped down to the
   // plain MediaItem shape the API response/UI actually consumes.
-  const parts: FranchisePartsByType = {
+  const parts: CollectionPartsByType = {
     movie: stripRanking(sortByRecency(ranked.movie)),
     tvShow: stripRanking(sortByRecency(ranked.tvShow)),
     game: stripRanking(sortByRecency(ranked.game)),
@@ -367,11 +387,11 @@ export async function resolveFranchise(slug: string): Promise<ResolvedFranchise 
 }
 
 // What details("franchise", slug) returns — a thin summary over
-// resolveFranchise, consumed generically by the poll/notification pipeline
+// resolveCollection, consumed generically by the poll/notification pipeline
 // and app/api/item/[type]/[id] exactly like any other MediaType.
-export async function detailsFranchise(slug: string): Promise<MediaItem> {
-  const resolved = await resolveFranchise(slug);
-  if (!resolved) throw new Error(`Unknown franchise: ${slug}`);
+export async function detailsCollection(slug: string): Promise<MediaItem> {
+  const resolved = await resolveCollection(slug);
+  if (!resolved) throw new Error(`Unknown collection: ${slug}`);
   return {
     id: `franchise:${slug}`,
     type: "franchise",
