@@ -1,10 +1,8 @@
 import type { MediaItem, MediaType } from "@/lib/types";
 import { COLLECTIONS, CollectionDef, CollectionQueries, getCollection } from "@/lib/collections";
 import { db, ensureSchema } from "@/lib/db";
+import { searchCatalogRanked } from "@/lib/catalog";
 import { matchTier, fuzzyMatches, normalizedScores, RankedItem, stripRanking } from "./textMatch";
-import { searchTMDBMovie, searchTMDBTV, tmdbCollectionParts } from "./tmdb";
-import { searchIGDB } from "./igdb";
-import { searchMangaDex } from "./mangadex";
 
 // Deliberately does NOT import from ./index.ts — index.ts imports FROM this
 // file (to wire up the "franchise" case in search()/details()), so importing
@@ -287,37 +285,28 @@ export interface ResolvedCollection {
 
 const MOST_POPULAR_LIMIT = 12;
 
-// The one genuinely "live, multi-source" piece of the franchise system —
-// only paid for on a detail-page load or the nightly poll check, never on
-// search/browse. Movies use the pre-resolved TMDB Collection (accurate,
-// catches oddly-titled entries a text search would miss) when
-// `movieCollectionId` is set; everything else is plain per-type text search
-// against the curated query strings, in `lenient` mode (see each adapter) —
-// deliberately does NOT apply the general-search elevated non-exact-match
-// popularity bar here. Verified live it was cutting real franchise entries:
-// searching IGDB for "One Piece" returns 128 raw games, and the elevated bar
-// let only 2 through (real, well-known titles like "One Piece: World
-// Seeker" and "One Piece: Burning Blood" were excluded for not being a
-// literal exact match to "One Piece" — true of almost every real entry in
-// any franchise). That bar exists to fight general-search clutter, not to
-// thin out a franchise's own already-precise, curated query.
+// Resolves each collection's curated query strings against catalog_items —
+// no live TMDB/IGDB/MangaDex calls anywhere in the app right now (see
+// lib/catalog.ts's searchCatalogRanked). `movieCollectionId` (TMDB's own
+// live "Collection" endpoint) is disabled for the same reason — a collection
+// configured with one just falls through to its `queries.movie` text search
+// against the catalog like every other type. A franchise's deep-cut entries
+// that aren't popular enough to be in the top-N catalog simply won't appear
+// here; that's an accepted tradeoff of running catalog-only.
 export async function resolveCollection(slug: string): Promise<ResolvedCollection | null> {
   const def = await getEffectiveCollection(slug);
   if (!def) return null;
 
-  const [movieFromCollection, movieFromSearch, tvShow, game, manga] = await Promise.all([
-    def.movieCollectionId
-      ? tmdbCollectionParts(def.movieCollectionId).catch(() => [] as RankedItem[])
-      : Promise.resolve([] as RankedItem[]),
-    def.movieCollectionId ? Promise.resolve([] as RankedItem[]) : resolveQuery(def.queries.movie, searchTMDBMovie),
-    resolveQuery(def.queries.tvShow, searchTMDBTV),
-    resolveQuery(def.queries.game, searchIGDB),
-    resolveQuery(def.queries.manga, searchMangaDex),
+  const [movie, tvShow, game, manga] = await Promise.all([
+    resolveQuery(def.queries.movie, (q) => searchCatalogRanked(q, "movie")),
+    resolveQuery(def.queries.tvShow, (q) => searchCatalogRanked(q, "tvShow")),
+    resolveQuery(def.queries.game, (q) => searchCatalogRanked(q, "game")),
+    resolveQuery(def.queries.manga, (q) => searchCatalogRanked(q, "manga")),
   ]);
 
   const excluded = new Set(def.excludeIds);
   const ranked: Record<keyof CollectionPartsByType, RankedItem[]> = {
-    movie: dedupeById([...movieFromCollection, ...movieFromSearch]).filter((i) => !excluded.has(i.id)),
+    movie: dedupeById(movie).filter((i) => !excluded.has(i.id)),
     tvShow: dedupeById(tvShow).filter((i) => !excluded.has(i.id)),
     game: dedupeById(game).filter((i) => !excluded.has(i.id)),
     manga: dedupeById(manga).filter((i) => !excluded.has(i.id)),

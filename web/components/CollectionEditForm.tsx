@@ -1,10 +1,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { X, Plus, Search, Trash2 } from "lucide-react";
+import { X, Plus, Search, Trash2, Crop } from "lucide-react";
 import type { MediaItem, MediaType } from "@/lib/types";
 import type { CollectionQueries } from "@/lib/collections";
 import type { IncludedPart } from "@/lib/sources/collection";
+import ImageCropModal from "./ImageCropModal";
 
 export interface CollectionFormData {
   name: string;
@@ -94,20 +95,26 @@ function ColorInput({
   );
 }
 
-// URL text input + drag-and-drop zone; converts dropped images to data URLs
+// URL text input + drag-and-drop zone; converts dropped images to data URLs.
+// `cropAspect` (width/height, e.g. 2/3 for a poster) locks the crop tool to
+// that ratio; omit it for a freeform crop (used for the logo, which is
+// object-contain rather than a fixed frame).
 function DragDropInput({
   value,
   onChange,
   placeholder = "https://…",
   maxMB = 1,
+  cropAspect,
 }: {
   value: string;
   onChange: (v: string) => void;
   placeholder?: string;
   maxMB?: number;
+  cropAspect?: number;
 }) {
   const [dragging, setDragging] = useState(false);
   const [dropError, setDropError] = useState<string | null>(null);
+  const [cropping, setCropping] = useState(false);
 
   function handleDrop(e: React.DragEvent) {
     e.preventDefault();
@@ -159,14 +166,36 @@ function DragDropInput({
         <div className="relative inline-block">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img src={value} alt="Preview" className="max-h-24 max-w-full rounded-lg object-contain" />
-          <button
-            type="button"
-            onClick={() => onChange("")}
-            className="absolute right-1 top-1 rounded-full bg-black/60 p-1 text-white hover:bg-black/80"
-          >
-            <X size={12} />
-          </button>
+          <div className="absolute right-1 top-1 flex gap-1">
+            <button
+              type="button"
+              onClick={() => setCropping(true)}
+              title="Crop"
+              className="rounded-full bg-black/60 p-1 text-white hover:bg-black/80"
+            >
+              <Crop size={12} />
+            </button>
+            <button
+              type="button"
+              onClick={() => onChange("")}
+              title="Remove"
+              className="rounded-full bg-black/60 p-1 text-white hover:bg-black/80"
+            >
+              <X size={12} />
+            </button>
+          </div>
         </div>
+      )}
+      {cropping && (
+        <ImageCropModal
+          imageSrc={value}
+          aspect={cropAspect}
+          onCropped={(dataURL) => {
+            onChange(dataURL);
+            setCropping(false);
+          }}
+          onCancel={() => setCropping(false)}
+        />
       )}
     </div>
   );
@@ -361,20 +390,18 @@ export default function CollectionEditForm({
           </Field>
 
           <Field label="Header background image (optional — overrides color)">
-            <DragDropInput value={bannerURL} onChange={setBannerURL} maxMB={2} />
+            <DragDropInput value={bannerURL} onChange={setBannerURL} maxMB={2} cropAspect={3} />
           </Field>
 
           <Field label="Logo (shown large and centered in the header)">
             <DragDropInput value={logoURL} onChange={setLogoURL} maxMB={1} />
           </Field>
 
-          <Field label="Poster URL (used on collection cards and rows)">
-            <input
-              value={posterURL}
-              onChange={(e) => setPosterURL(e.target.value)}
-              className="input"
-              placeholder="https://…"
-            />
+          <Field label="Poster (used on collection cards and rows)">
+            {/* 3:2 landscape, NOT MediaCard's 2:3 portrait — CollectionCard
+                renders this in an aspect-[3/2] tile (see CollectionCard.tsx),
+                a wide tile deliberately distinct from a movie/show poster. */}
+            <DragDropInput value={posterURL} onChange={setPosterURL} maxMB={1} cropAspect={3 / 2} />
           </Field>
 
           <Field label="TMDB movie collection ID (optional)">

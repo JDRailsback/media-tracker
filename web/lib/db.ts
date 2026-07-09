@@ -78,6 +78,29 @@ export function ensureSchema(): Promise<void> {
       await sql`ALTER TABLE collection_overrides ADD COLUMN IF NOT EXISTS logo_url TEXT`;
       await sql`ALTER TABLE collection_overrides ADD COLUMN IF NOT EXISTS page_background TEXT`;
       await sql`ALTER TABLE collection_overrides ADD COLUMN IF NOT EXISTS color_scheme TEXT`;
+      // Bulk-populated catalog of established (already-released) titles —
+      // filled by scripts/ingest-catalog.ts, not by any live request path.
+      // search_vector is a generated column so full-text search never needs a
+      // separate write path to stay in sync with title.
+      await sql`CREATE TABLE IF NOT EXISTS catalog_items (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        overview TEXT,
+        poster_url TEXT,
+        release_date DATE,
+        popularity_score INTEGER NOT NULL DEFAULT 0,
+        genres JSONB NOT NULL DEFAULT '[]',
+        external_links JSONB NOT NULL DEFAULT '[]',
+        metadata JSONB NOT NULL DEFAULT '{}',
+        search_vector TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', title)) STORED,
+        created_at TIMESTAMPTZ DEFAULT now(),
+        updated_at TIMESTAMPTZ DEFAULT now()
+      )`;
+      await sql`CREATE INDEX IF NOT EXISTS catalog_items_search_idx ON catalog_items USING GIN (search_vector)`;
+      await sql`CREATE INDEX IF NOT EXISTS catalog_items_type_idx ON catalog_items (type)`;
+      // Added after the table's initial rollout — ALTER for anyone who already ran it.
+      await sql`ALTER TABLE catalog_items ADD COLUMN IF NOT EXISTS external_links JSONB NOT NULL DEFAULT '[]'`;
     })();
   }
   return schema;

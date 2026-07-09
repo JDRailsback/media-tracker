@@ -1,4 +1,5 @@
 import type { ExternalLink, MediaItem } from "@/lib/types";
+import type { CatalogRow } from "@/lib/catalog";
 import { fuzzyMatches, isExactMatch, matchTier, RankedItem } from "./textMatch";
 
 // MangaDex adapter (TS port). v1 = official English chapter dates only.
@@ -46,6 +47,10 @@ interface MDRelationship {
   attributes?: { fileName?: string };
 }
 
+interface MDTag {
+  attributes: { name: Record<string, string> };
+}
+
 interface MDManga {
   id: string;
   attributes: {
@@ -53,6 +58,8 @@ interface MDManga {
     description?: Record<string, string>;
     year?: number;
     links?: Record<string, string>;
+    tags?: MDTag[];
+    status?: string; // "ongoing" | "completed" | "hiatus" | "cancelled"
   };
   relationships: MDRelationship[];
 }
@@ -71,7 +78,10 @@ function isSignificant(follows: number): boolean {
 //   bw    -> BookWalker; only a URL PATH, needs the domain prepended
 //   amz/ebj/cdj -> Amazon/eBookJapan/CDJapan — already full URLs
 //   raw   -> official Japanese source; used only as a fallback if no engtl
-function readBuyLinks(mangaID: string, links?: Record<string, string>): ExternalLink[] {
+// Real, direct links only — no self-fallback to MangaDex's own page. Used
+// directly by the bulk catalog (see paginatedMangaDex); readBuyLinks below
+// wraps this with the self-fallback for the live single-item detail view.
+export function realBuyLinks(links?: Record<string, string>): ExternalLink[] {
   const out: ExternalLink[] = [];
   if (links?.engtl) out.push({ provider: "Official (English)", url: links.engtl, kind: "stream" });
   else if (links?.raw) out.push({ provider: "Official (Japanese)", url: links.raw, kind: "info" });
@@ -79,6 +89,11 @@ function readBuyLinks(mangaID: string, links?: Record<string, string>): External
   if (links?.amz) out.push({ provider: "Amazon", url: links.amz, kind: "buy" });
   if (links?.ebj) out.push({ provider: "eBookJapan", url: links.ebj, kind: "buy" });
   if (links?.cdj) out.push({ provider: "CDJapan", url: links.cdj, kind: "buy" });
+  return out;
+}
+
+function readBuyLinks(mangaID: string, links?: Record<string, string>): ExternalLink[] {
+  const out = realBuyLinks(links);
   // Always link to SOMETHING — fall back to the manga's own MangaDex page.
   if (out.length === 0) {
     out.push({ provider: "MangaDex", url: `https://mangadex.org/title/${mangaID}`, kind: "info" });
@@ -86,7 +101,7 @@ function readBuyLinks(mangaID: string, links?: Record<string, string>): External
   return out;
 }
 
-function coverURL(m: MDManga): string | undefined {
+export function coverURL(m: MDManga): string | undefined {
   const cover = m.relationships.find((r) => r.type === "cover_art");
   const file = cover?.attributes?.fileName;
   // Routed through OUR proxy, not uploads.mangadex.org directly — see
@@ -94,7 +109,7 @@ function coverURL(m: MDManga): string | undefined {
   return file ? `/api/cover/mangadex/${m.id}/${file}.512.jpg` : undefined;
 }
 
-function titleOf(m: MDManga): string {
+export function titleOf(m: MDManga): string {
   return m.attributes.title.en ?? Object.values(m.attributes.title)[0] ?? "Untitled";
 }
 
@@ -188,6 +203,50 @@ export async function discoverMangaDex(limit = 20): Promise<MediaItem[]> {
   if (!res.ok) throw new Error(`MangaDex discover failed: ${res.status}`);
   const data = await res.json();
   return (data.data as MDManga[]).filter((m) => coverURL(m)).map((m) => mapManga(m));
+}
+
+// ---------- Bulk catalog ingestion (scripts/ingest-catalog.ts only) ----------
+// Sorted by followedCount (the same stable, cumulative signal used for
+// search ranking — see the rationale in searchMangaDex), so "most popular N"
+// tracks real, sustained readership rather than any trending metric.
+// MangaDex caps `limit` at 100 per request; offset-paginated beyond that.
+const MANGADEX_PAGE_SIZE = 100;
+
+export async function paginatedMangaDex(
+  targetCount: number,
+  onPage?: (fetched: number) => void
+): Promise<CatalogRow[]> {
+  const rows: CatalogRow[] = [];
+  for (let offset = 0; rows.length < targetCount; offset += MANGADEX_PAGE_SIZE) {
+    const url = `https://api.mangadex.org/manga?order[followedCount]=desc&limit=${MANGADEX_PAGE_SIZE}&offset=${offset}&includes[]=cover_art&hasAvailableChapters=true&${CONTENT_RATING}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`MangaDex catalog page (offset ${offset}) failed: ${res.status}`);
+    const data = await res.json();
+    const page = (data.data as MDManga[]).filter((m) => coverURL(m));
+    if (page.length === 0) break;
+
+    const follows = await fetchFollows(page.map((m) => m.id));
+    for (const m of page) {
+      const tags = (m.attributes.tags ?? [])
+        .map((t) => t.attributes.name.en)
+        .filter((n): n is string => !!n);
+      rows.push({
+        id: `manga:${m.id}`,
+        type: "manga",
+        title: titleOf(m),
+        overview: m.attributes.description?.en,
+        posterURL: coverURL(m),
+        releaseDate: m.attributes.year ? `${m.attributes.year}-01-01` : undefined,
+        popularityScore: follows[m.id] ?? 0,
+        genres: tags,
+        externalLinks: realBuyLinks(m.attributes.links),
+        metadata: { status: m.attributes.status },
+      });
+    }
+    onPage?.(rows.length);
+    if (page.length < MANGADEX_PAGE_SIZE) break;
+  }
+  return rows.slice(0, targetCount);
 }
 
 async function nextOfficialChapter(

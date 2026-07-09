@@ -1,4 +1,5 @@
 import type { ExternalLink, MediaItem } from "@/lib/types";
+import type { CatalogRow } from "@/lib/catalog";
 import { isExactMatch, RankedItem } from "./textMatch";
 
 // IGDB adapter (TS port). OAuth token + POST query body.
@@ -95,9 +96,9 @@ function isSignificant(g: IGDBGame): boolean {
 // Deliberately NOT denied: 8 (remake) — a ground-up rebuild (e.g. Resident
 // Evil 2 Remake) is a distinct, separately-worth-tracking product, unlike a
 // remaster (a cosmetic re-release of the same game).
-const JUNK_GAME_TYPES = new Set([1, 2, 3, 5, 6, 7, 9, 10, 13, 14]);
+export const JUNK_GAME_TYPES = new Set([1, 2, 3, 5, 6, 7, 9, 10, 13, 14]);
 
-function isMainGame(g: IGDBGame): boolean {
+export function isMainGame(g: IGDBGame): boolean {
   return g.game_type == null || !JUNK_GAME_TYPES.has(g.game_type);
 }
 
@@ -257,7 +258,7 @@ const STORE_DOMAINS: { pattern: string; provider: string }[] = [
   { pattern: "gog.com", provider: "GOG" },
 ];
 
-function storeLinks(websites: { url?: string }[] | undefined): ExternalLink[] | undefined {
+export function storeLinks(websites: { url?: string }[] | undefined): ExternalLink[] | undefined {
   if (!websites) return undefined;
   const links: ExternalLink[] = [];
   for (const w of websites) {
@@ -300,4 +301,54 @@ export async function discoverIGDBUpcoming(limit = 12): Promise<MediaItem[]> {
     `fields ${SEARCH_FIELDS}; where first_release_date > ${nowSeconds} & cover != null & hypes != null; sort hypes desc; limit ${limit * 2};`
   );
   return games.filter(isMainGame).slice(0, limit).map(mapGame);
+}
+
+// ---------- Bulk catalog ingestion (scripts/ingest-catalog.ts only) ----------
+// Sorted by total_rating_count (the same stable, cumulative signal used for
+// search ranking — see the rationale in searchIGDB), so "most popular N"
+// means the N most-rated real games, not hype/trending. IGDB's query
+// endpoint supports up to 500 rows per request with offset-based paging.
+interface IGDBGameWithGenres extends IGDBGame {
+  genres?: { name: string }[];
+  platforms?: { name: string }[];
+  websites?: { url?: string }[];
+}
+
+// platforms.name and websites.url come back inline on the same request — no
+// extra per-item call needed, unlike TMDB's runtime/watch-providers.
+const CATALOG_FIELDS = `${SEARCH_FIELDS},genres.name,platforms.name,websites.url`;
+const IGDB_PAGE_SIZE = 500;
+
+export async function paginatedIGDBGames(
+  targetCount: number,
+  onPage?: (fetched: number) => void
+): Promise<CatalogRow[]> {
+  const rows: CatalogRow[] = [];
+  for (let offset = 0; rows.length < targetCount; offset += IGDB_PAGE_SIZE) {
+    const games = (await query(
+      `fields ${CATALOG_FIELDS}; where total_rating_count > 0 & cover != null; sort total_rating_count desc; limit ${IGDB_PAGE_SIZE}; offset ${offset};`
+    )) as IGDBGameWithGenres[];
+    if (games.length === 0) break;
+    for (const g of games.filter(isMainGame)) {
+      const mapped = mapGame(g);
+      rows.push({
+        id: mapped.id,
+        type: "game",
+        title: mapped.title,
+        overview: mapped.overview,
+        posterURL: mapped.posterURL,
+        releaseDate: mapped.releaseDate,
+        popularityScore: g.total_rating_count ?? 0,
+        genres: (g.genres ?? []).map((x) => x.name),
+        // Real storefront links only — storeLinks() already returns
+        // undefined rather than falling back to IGDB's own page (that
+        // fallback only happens in detailsIGDB, for the live single-item view).
+        externalLinks: storeLinks(g.websites) ?? [],
+        metadata: { platforms: (g.platforms ?? []).map((p) => p.name) },
+      });
+    }
+    onPage?.(rows.length);
+    if (games.length < IGDB_PAGE_SIZE) break;
+  }
+  return rows.slice(0, targetCount);
 }

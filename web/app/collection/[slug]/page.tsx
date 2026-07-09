@@ -41,47 +41,12 @@ const SECTION_TITLE: Record<keyof CollectionPayload["parts"], string> = {
   manga: "Manga",
 };
 
-function NavLeft({ onEdit }: { onEdit: () => void }) {
-  return (
-    <div className="flex items-center gap-1 shrink-0">
-      <Link
-        href="/"
-        className="inline-flex items-center gap-1 rounded-full px-2.5 py-1.5 text-[13px] font-medium text-subtle transition-colors hover:bg-surface hover:text-ink"
-      >
-        <ArrowLeft size={14} />
-        Back
-      </Link>
-      <button
-        onClick={onEdit}
-        className="inline-flex items-center gap-1 rounded-full px-2.5 py-1.5 text-[13px] font-medium text-subtle transition-colors hover:bg-surface hover:text-ink"
-      >
-        <Pencil size={13} />
-        Edit
-      </button>
-    </div>
-  );
-}
-
-function FollowButton({
-  followed,
-  onToggle,
-}: {
-  followed: boolean;
-  onToggle: () => void;
-}) {
-  return (
-    <button
-      onClick={onToggle}
-      className={`flex shrink-0 items-center gap-1.5 rounded-full px-4 py-1.5 text-[13px] font-semibold transition-all duration-200 active:scale-95 ${
-        followed
-          ? "bg-surface text-ink ring-1 ring-hairline hover:bg-canvas"
-          : "bg-gradient-to-r from-accent to-accent-2 text-on-accent shadow-sm shadow-accent/25 hover:brightness-110"
-      }`}
-    >
-      {followed ? <Check size={14} /> : <Plus size={14} />}
-      {followed ? "Following" : "Follow"}
-    </button>
-  );
+function formatDate(iso: string) {
+  return new Date(iso).toLocaleDateString(undefined, {
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+  });
 }
 
 export default function CollectionPage({ params }: { params: { slug: string } }) {
@@ -155,10 +120,98 @@ export default function CollectionPage({ params }: { params: { slug: string } })
   const hasNextRelease = !!data.nextRelease;
   const hasMostPopular = data.mostPopular.length > 0;
 
-  // The Back/Edit/Follow controls are embedded into the first content block:
-  // the up-next card row if there is one, otherwise the first row's header.
-  const navLeft = <NavLeft onEdit={() => setEditing(true)} />;
-  const navRight = <FollowButton followed={collectionFollowed} onToggle={toggleFollow} />;
+  // Big Back/Edit (left gutter) + Follow (right gutter) buttons — flank
+  // whichever content renders first (the up-next card when there is one,
+  // otherwise the Most Popular row / first type row / empty-state message).
+  // Never inline in a row's own header — see controlsShell below.
+  const navLeftBig = (
+    <div className="flex flex-col items-center justify-center gap-2">
+      <Link
+        href="/"
+        className="inline-flex items-center gap-2 rounded-full px-5 py-2.5 text-[15px] font-medium text-subtle transition-colors hover:bg-surface hover:text-ink"
+      >
+        <ArrowLeft size={16} />
+        Back
+      </Link>
+      <button
+        onClick={() => setEditing(true)}
+        className="inline-flex items-center gap-2 rounded-full px-5 py-2.5 text-[15px] font-medium text-subtle transition-colors hover:bg-surface hover:text-ink"
+      >
+        <Pencil size={15} />
+        Edit
+      </button>
+    </div>
+  );
+
+  const navRightBig = (
+    <button
+      onClick={toggleFollow}
+      className={`flex items-center gap-2 rounded-full px-6 py-2.5 text-[15px] font-semibold transition-all duration-200 active:scale-95 ${
+        collectionFollowed
+          ? "bg-surface text-ink ring-1 ring-hairline hover:bg-canvas"
+          : "bg-gradient-to-r from-accent to-accent-2 text-on-accent shadow-sm shadow-accent/25 hover:brightness-110"
+      }`}
+    >
+      {collectionFollowed ? <Check size={16} /> : <Plus size={16} />}
+      {collectionFollowed ? "Following" : "Follow"}
+    </button>
+  );
+
+  // Small mobile versions of the same controls — the side gutters collapse
+  // away below the xl breakpoint, so these render in a row above the content instead.
+  const navLeftSmall = (
+    <div className="flex items-center gap-1">
+      <Link
+        href="/"
+        className="inline-flex items-center gap-1 rounded-full px-2.5 py-1.5 text-[13px] font-medium text-subtle transition-colors hover:bg-surface hover:text-ink"
+      >
+        <ArrowLeft size={14} />
+        Back
+      </Link>
+      <button
+        onClick={() => setEditing(true)}
+        className="inline-flex items-center gap-1 rounded-full px-2.5 py-1.5 text-[13px] font-medium text-subtle transition-colors hover:bg-surface hover:text-ink"
+      >
+        <Pencil size={13} />
+        Edit
+      </button>
+    </div>
+  );
+
+  const navRightSmall = (
+    <button
+      onClick={toggleFollow}
+      className={`flex shrink-0 items-center gap-1.5 rounded-full px-4 py-1.5 text-[13px] font-semibold transition-all duration-200 active:scale-95 ${
+        collectionFollowed
+          ? "bg-surface text-ink ring-1 ring-hairline hover:bg-canvas"
+          : "bg-gradient-to-r from-accent to-accent-2 text-on-accent shadow-sm shadow-accent/25 hover:brightness-110"
+      }`}
+    >
+      {collectionFollowed ? <Check size={14} /> : <Plus size={14} />}
+      {collectionFollowed ? "Following" : "Follow"}
+    </button>
+  );
+
+  // Wraps whichever block is the page's first piece of content in the same
+  // side-gutter layout the up-next card originally had: buttons flank it in
+  // the margins on desktop, sit in a row above it on mobile. The center
+  // column is capped at 56rem (max-w-4xl) — same width the rest of the
+  // page's content uses below it.
+  function controlsShell(content: React.ReactNode) {
+    return (
+      <div className="py-8">
+        <div className="mb-4 flex items-center justify-between px-6 xl:hidden">
+          {navLeftSmall}
+          {navRightSmall}
+        </div>
+        <div className="xl:grid" style={{ gridTemplateColumns: "1fr minmax(0, 56rem) 1fr" }}>
+          <div className="hidden items-start justify-center xl:flex">{navLeftBig}</div>
+          <div className="px-6 md:px-16">{content}</div>
+          <div className="hidden items-start justify-center xl:flex">{navRightBig}</div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-canvas">
@@ -176,102 +229,63 @@ export default function CollectionPage({ params }: { params: { slug: string } })
           // eslint-disable-next-line @next/next/no-img-element
           <img src={data.resolvedBannerURL} alt="" className="h-full w-full object-cover" />
         )}
-        <div className="absolute inset-0 flex items-center justify-center">
-          {data.logoURL ? (
-            // eslint-disable-next-line @next/next/no-img-element
+        {data.logoURL && (
+          <div className="absolute inset-0 flex items-center justify-center">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
               src={data.logoURL}
               alt={data.name}
               className="max-h-36 max-w-[65%] object-contain drop-shadow-2xl md:max-h-48 md:max-w-[55%]"
             />
-          ) : (
-            <h1 className="px-8 text-center text-4xl font-bold text-white drop-shadow-lg md:text-5xl">
-              {data.name}
-            </h1>
-          )}
-        </div>
+          </div>
+        )}
       </div>
 
-      {/* ── Content ── */}
-      <div className="mx-auto max-w-4xl px-6 py-8 md:px-16">
-
-        {/* Up-next card — controls flank it on either side */}
-        {hasNextRelease && (
-          <div className="mb-10 flex items-center gap-4">
-            {navLeft}
-
-            {/* Card */}
-            <div className="flex flex-1 justify-center">
-              <div className="relative w-44 shrink-0 overflow-hidden rounded-xl2 shadow-lg ring-1 ring-black/[0.05] sm:w-52 dark:ring-white/[0.06]">
-                <div className="aspect-[2/3]">
-                  {data.nextRelease!.posterURL ? (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img
-                      src={data.nextRelease!.posterURL}
-                      alt={data.nextRelease!.title}
-                      className="h-full w-full object-cover"
-                    />
-                  ) : (
-                    <div className="h-full w-full bg-gradient-to-br from-surface to-panel" />
-                  )}
-                </div>
-                {/* Bottom overlay with title + date */}
-                <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/20 to-transparent" />
-                <div className="absolute top-2.5 left-2.5">
-                  <span className="rounded-md bg-accent px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-on-accent">
-                    Up next
-                  </span>
-                </div>
-                <div className="absolute bottom-0 left-0 right-0 p-3">
-                  <p className="line-clamp-2 text-[13px] font-semibold leading-tight text-white">
-                    {data.nextRelease!.title}
-                  </p>
-                  <p className="mt-1 text-[11px] tabular-nums text-white/65">
-                    {new Date(data.nextRelease!.date).toLocaleDateString(undefined, {
-                      month: "short",
-                      day: "numeric",
-                      year: "numeric",
-                    })}
-                  </p>
-                </div>
+      {/* ── First content block — always wrapped in the side-gutter controls
+          shell (Back/Edit/Follow flank it), whichever it turns out to be.
+          nextRelease is currently always null now that collections resolve
+          from the catalog only (no live "upcoming" data) — this branch is
+          kept ready for when that's wired back up. ── */}
+      {hasNextRelease
+        ? controlsShell(
+            <div className="flex overflow-hidden rounded-xl2 border border-hairline bg-panel/70 shadow-sm backdrop-blur-xl">
+              {/* Poster — bleeds to the left card edge */}
+              <div className="relative w-[4.5rem] shrink-0 self-stretch sm:w-24">
+                {data.nextRelease!.posterURL ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={data.nextRelease!.posterURL} alt="" className="h-full w-full object-cover" />
+                ) : (
+                  <div className="h-full w-full bg-gradient-to-b from-surface to-canvas" />
+                )}
+              </div>
+              <div className="w-px shrink-0 bg-hairline" />
+              <div className="flex flex-1 flex-col justify-center px-5 py-5">
+                <span className="mb-2 inline-flex w-fit rounded-md bg-accent/10 px-1.5 py-0.5 text-[10.5px] font-bold uppercase tracking-wider text-accent">
+                  Up next
+                </span>
+                <p className="line-clamp-2 text-[16px] font-semibold leading-snug text-ink">
+                  {data.nextRelease!.title}
+                </p>
+                <p className="mt-2 text-[13px] text-subtle">{formatDate(data.nextRelease!.date)}</p>
               </div>
             </div>
+          )
+        : hasMostPopular
+        ? controlsShell(<CollectionRow title="Most Popular" items={data.mostPopular} onSelect={setSelected} />)
+        : sections.length > 0
+        ? controlsShell(
+            <CollectionRow title={SECTION_TITLE[sections[0]]} items={data.parts[sections[0]]} onSelect={setSelected} />
+          )
+        : controlsShell(<p className="text-[13px] text-subtle">Nothing here yet.</p>)}
 
-            {navRight}
-          </div>
+      {/* ── Remaining content, plain rows, no header buttons ── */}
+      <div className="mx-auto max-w-4xl px-6 py-8 md:px-16">
+        {hasNextRelease && hasMostPopular && (
+          <CollectionRow title="Most Popular" items={data.mostPopular} onSelect={setSelected} />
         )}
-
-        {/* Most Popular — controls in header if no up-next card */}
-        {hasMostPopular && (
-          <CollectionRow
-            title="Most Popular"
-            items={data.mostPopular}
-            onSelect={setSelected}
-            headerLeft={!hasNextRelease ? navLeft : undefined}
-            headerRight={!hasNextRelease ? navRight : undefined}
-          />
-        )}
-
-        {/* Per-type rows — controls in first row's header if no up-next and no most popular */}
-        {sections.map((key, i) => (
-          <CollectionRow
-            key={key}
-            title={SECTION_TITLE[key]}
-            items={data.parts[key]}
-            onSelect={setSelected}
-            headerLeft={!hasNextRelease && !hasMostPopular && i === 0 ? navLeft : undefined}
-            headerRight={!hasNextRelease && !hasMostPopular && i === 0 ? navRight : undefined}
-          />
+        {(!hasNextRelease && !hasMostPopular && sections.length > 0 ? sections.slice(1) : sections).map((key) => (
+          <CollectionRow key={key} title={SECTION_TITLE[key]} items={data.parts[key]} onSelect={setSelected} />
         ))}
-
-        {/* Fallback: empty collection with no rows at all */}
-        {!hasNextRelease && !hasMostPopular && sections.length === 0 && (
-          <div className="flex items-center justify-between">
-            {navLeft}
-            <p className="text-[13px] text-subtle">Nothing here yet.</p>
-            {navRight}
-          </div>
-        )}
       </div>
 
       {selected && (

@@ -1,5 +1,7 @@
 import type { EpisodeInfo, ExternalLink, LinkKind, MediaItem } from "@/lib/types";
+import type { CatalogRow } from "@/lib/catalog";
 import { isExactMatch, RankedItem } from "./textMatch";
+import { mapWithConcurrency, withRetries } from "./concurrency";
 
 // TMDB adapter (TS port). Maps TMDB's JSON into our MediaItem.
 // Runs server-side only (in an API route), so TMDB_API_KEY stays secret.
@@ -322,6 +324,283 @@ export async function discoverTMDBUpcomingTV(limit = 12): Promise<MediaItem[]> {
     }));
 }
 
+// ---------- Bulk catalog ingestion (scripts/ingest-catalog.ts only) ----------
+// Sorted by vote_count (a stable, cumulative signal — see the identical
+// rationale in searchTMDBMovie), NOT TMDB's own trending `popularity` field,
+// so "most popular N" means genuinely most-established, not momentarily
+// hyped. TMDB caps any list endpoint at page 500 (20/page = 10,000 results),
+// which conveniently matches the ~10k target.
+const TMDB_MAX_PAGE = 500;
+
+// Genre id -> name, fetched once per ingestion run and reused across every
+// page (TMDB has no per-item genre-name field, only numeric `genre_ids`).
+export async function tmdbGenreMap(kind: "movie" | "tv"): Promise<Map<number, string>> {
+  const url = `https://api.themoviedb.org/3/genre/${kind}/list?api_key=${key()}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`TMDB genre list failed: ${res.status}`);
+  const data = await res.json();
+  const map = new Map<number, string>();
+  for (const g of data.genres as { id: number; name: string }[]) map.set(g.id, g.name);
+  return map;
+}
+
+interface TMDBDiscoverMovie extends TMDBMovie {
+  genre_ids?: number[];
+}
+
+// TMDB's watch/providers endpoint correctly identifies WHICH real services
+// carry a title, but its only URL (`link`) is always TMDB's own aggregator
+// page (verified live — every provider entry shares one identical
+// themoviedb.org URL, regardless of provider). There is no public API for
+// true per-title deep links (that data belongs to JustWatch's commercial-only
+// API). This maps TMDB's provider name to that service's OWN site and builds
+// a search-by-title URL there instead — a real link to the actual platform,
+// not a guaranteed exact-title deep link. Ordered so a more specific brand
+// (e.g. "Paramount+ Amazon Channel") matches its own rule before falling
+// through to a more generic one that happens to share a word ("Amazon").
+const PROVIDER_SEARCH_RULES: { pattern: string; provider: string; searchURL: (title: string) => string }[] = [
+  { pattern: "paramount", provider: "Paramount+", searchURL: (t) => `https://www.paramountplus.com/search/?query=${encodeURIComponent(t)}` },
+  { pattern: "disney", provider: "Disney+", searchURL: (t) => `https://www.disneyplus.com/search?q=${encodeURIComponent(t)}` },
+  { pattern: "peacock", provider: "Peacock", searchURL: (t) => `https://www.peacocktv.com/search?q=${encodeURIComponent(t)}` },
+  { pattern: "netflix", provider: "Netflix", searchURL: (t) => `https://www.netflix.com/search?q=${encodeURIComponent(t)}` },
+  { pattern: "hulu", provider: "Hulu", searchURL: (t) => `https://www.hulu.com/search?q=${encodeURIComponent(t)}` },
+  { pattern: "apple", provider: "Apple TV", searchURL: (t) => `https://tv.apple.com/search?term=${encodeURIComponent(t)}` },
+  { pattern: "max", provider: "Max", searchURL: (t) => `https://play.max.com/search?q=${encodeURIComponent(t)}` },
+  { pattern: "google play", provider: "Google Play Movies", searchURL: (t) => `https://play.google.com/store/search?q=${encodeURIComponent(t)}&c=movies` },
+  { pattern: "youtube", provider: "YouTube", searchURL: (t) => `https://www.youtube.com/results?search_query=${encodeURIComponent(t)}` },
+  { pattern: "amazon", provider: "Amazon Video", searchURL: (t) => `https://www.amazon.com/s?k=${encodeURIComponent(t)}&i=instant-video` },
+];
+
+function matchesPattern(name: string, pattern: string): boolean {
+  const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`\\b${escaped}\\b`, "i").test(name);
+}
+
+interface TMDBProviderEntry {
+  provider_name: string;
+}
+
+function providerSearchLinks(
+  country: { flatrate?: TMDBProviderEntry[]; rent?: TMDBProviderEntry[]; buy?: TMDBProviderEntry[] } | undefined,
+  title: string
+): ExternalLink[] {
+  if (!country) return [];
+  const seen = new Set<string>();
+  const links: ExternalLink[] = [];
+  const scan = (list: TMDBProviderEntry[] | undefined, kind: LinkKind) => {
+    for (const p of list ?? []) {
+      const rule = PROVIDER_SEARCH_RULES.find((r) => matchesPattern(p.provider_name, r.pattern));
+      if (!rule || seen.has(rule.provider)) continue;
+      seen.add(rule.provider);
+      links.push({ provider: rule.provider, url: rule.searchURL(title), kind });
+    }
+  };
+  scan(country.flatrate, "stream");
+  scan(country.rent, "rent");
+  scan(country.buy, "buy");
+  return links;
+}
+
+// Per-movie enrichment: runtime + provider search links — neither is in the
+// discover response, needs one extra request per movie.
+async function movieExtra(id: number, title: string): Promise<{ runtimeMinutes?: number; externalLinks: ExternalLink[] }> {
+  try {
+    return await withRetries(async () => {
+      const url = `https://api.themoviedb.org/3/movie/${id}?api_key=${key()}&append_to_response=watch/providers`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`TMDB movie details (${id}) failed: ${res.status}`);
+      const d = await res.json();
+      return {
+        runtimeMinutes: typeof d.runtime === "number" ? d.runtime : undefined,
+        externalLinks: providerSearchLinks(d["watch/providers"]?.results?.US, title),
+      };
+    });
+  } catch {
+    return { externalLinks: [] };
+  }
+}
+
+const MOVIE_DETAIL_CONCURRENCY = 15;
+
+export async function paginatedTMDBMovies(
+  targetCount: number,
+  onPage?: (fetched: number) => void,
+  onEnrich?: (done: number, total: number) => void
+): Promise<CatalogRow[]> {
+  const genres = await tmdbGenreMap("movie");
+  const rows: CatalogRow[] = [];
+  for (let page = 1; page <= TMDB_MAX_PAGE && rows.length < targetCount; page++) {
+    const url = `https://api.themoviedb.org/3/discover/movie?api_key=${key()}&sort_by=vote_count.desc&page=${page}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`TMDB discover movies (page ${page}) failed: ${res.status}`);
+    const data = await res.json();
+    const results = data.results as TMDBDiscoverMovie[];
+    if (!results || results.length === 0) break;
+    for (const m of results) {
+      if (!m.poster_path) continue;
+      rows.push({
+        id: `movie:${m.id}`,
+        type: "movie",
+        title: m.title,
+        overview: m.overview || undefined,
+        posterURL: `${IMAGE_BASE}${m.poster_path}`,
+        releaseDate: m.release_date || undefined,
+        popularityScore: m.vote_count ?? 0,
+        genres: (m.genre_ids ?? []).map((id) => genres.get(id)).filter((n): n is string => !!n),
+      });
+    }
+    onPage?.(rows.length);
+  }
+  // Dedupe BEFORE enrichment — TMDB's discover pagination isn't perfectly
+  // stable when many entries tie on vote_count, so the same id can land on
+  // two different pages; enriching it twice would waste a detail request.
+  const capped = [...new Map(rows.map((r) => [r.id, r])).values()].slice(0, targetCount);
+
+  let done = 0;
+  await mapWithConcurrency(capped, MOVIE_DETAIL_CONCURRENCY, async (row) => {
+    const tmdbId = Number(row.id.split(":")[1]);
+    const extra = await movieExtra(tmdbId, row.title);
+    row.metadata = { runtimeMinutes: extra.runtimeMinutes };
+    row.externalLinks = extra.externalLinks;
+    done++;
+    onEnrich?.(done, capped.length);
+  });
+  return capped;
+}
+
+interface TMDBDiscoverShow extends TMDBShow {
+  genre_ids?: number[];
+}
+
+interface TMDBSeasonSummary {
+  season_number: number;
+  name?: string;
+  air_date?: string;
+  episode_count?: number;
+}
+
+interface TMDBShowDetails extends Omit<TMDBShow, "seasons"> {
+  seasons?: TMDBSeasonSummary[];
+  number_of_seasons?: number;
+}
+
+interface TMDBSeasonEpisode {
+  episode_number: number;
+  name?: string;
+  air_date?: string;
+  runtime?: number;
+}
+
+interface CatalogSeason {
+  seasonNumber: number;
+  name?: string;
+  episodes: { episode: number; title?: string; airDate?: string; runtimeMinutes?: number }[];
+}
+
+// Per-show enrichment: status + full per-season/per-episode breakdown +
+// provider search links. One request for the show itself, plus one more PER
+// SEASON — far more expensive than the movie case, since a show's episode
+// data isn't on the show-level response at all.
+const SEASON_CONCURRENCY = 5;
+
+async function tvExtra(
+  id: number,
+  title: string
+): Promise<{ status?: string; numberOfSeasons?: number; numberOfEpisodes?: number; seasons: CatalogSeason[]; externalLinks: ExternalLink[] }> {
+  try {
+    return await withRetries(async () => {
+      const url = `https://api.themoviedb.org/3/tv/${id}?api_key=${key()}&append_to_response=watch/providers`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`TMDB show details (${id}) failed: ${res.status}`);
+      const d = (await res.json()) as TMDBShowDetails & { "watch/providers"?: { results?: Record<string, unknown> } };
+
+      const seasonSummaries = d.seasons ?? [];
+      const seasons = await mapWithConcurrency(seasonSummaries, SEASON_CONCURRENCY, async (s) => {
+        try {
+          const seasonRes = await fetch(
+            `https://api.themoviedb.org/3/tv/${id}/season/${s.season_number}?api_key=${key()}`
+          );
+          if (!seasonRes.ok) return { seasonNumber: s.season_number, name: s.name, episodes: [] };
+          const seasonData = await seasonRes.json();
+          const episodes = (seasonData.episodes as TMDBSeasonEpisode[] | undefined ?? []).map((e) => ({
+            episode: e.episode_number,
+            title: e.name || undefined,
+            airDate: e.air_date || undefined,
+            runtimeMinutes: e.runtime ?? undefined,
+          }));
+          return { seasonNumber: s.season_number, name: s.name, episodes };
+        } catch {
+          return { seasonNumber: s.season_number, name: s.name, episodes: [] };
+        }
+      });
+
+      return {
+        status: d.status || undefined,
+        numberOfSeasons: d.number_of_seasons,
+        numberOfEpisodes: d.number_of_episodes,
+        seasons,
+        externalLinks: providerSearchLinks(
+          d["watch/providers"]?.results?.US as Parameters<typeof providerSearchLinks>[0],
+          title
+        ),
+      };
+    });
+  } catch {
+    return { seasons: [], externalLinks: [] };
+  }
+}
+
+const SHOW_DETAIL_CONCURRENCY = 8;
+
+export async function paginatedTMDBTV(
+  targetCount: number,
+  onPage?: (fetched: number) => void,
+  onEnrich?: (done: number, total: number) => void
+): Promise<CatalogRow[]> {
+  const genres = await tmdbGenreMap("tv");
+  const rows: CatalogRow[] = [];
+  for (let page = 1; page <= TMDB_MAX_PAGE && rows.length < targetCount; page++) {
+    const url = `https://api.themoviedb.org/3/discover/tv?api_key=${key()}&sort_by=vote_count.desc&page=${page}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`TMDB discover TV (page ${page}) failed: ${res.status}`);
+    const data = await res.json();
+    const results = data.results as TMDBDiscoverShow[];
+    if (!results || results.length === 0) break;
+    for (const s of results) {
+      if (!s.poster_path) continue;
+      rows.push({
+        id: `tvShow:${s.id}`,
+        type: "tvShow",
+        title: s.name,
+        overview: s.overview || undefined,
+        posterURL: `${IMAGE_BASE}${s.poster_path}`,
+        releaseDate: s.first_air_date || undefined,
+        popularityScore: s.vote_count ?? 0,
+        genres: (s.genre_ids ?? []).map((id) => genres.get(id)).filter((n): n is string => !!n),
+      });
+    }
+    onPage?.(rows.length);
+  }
+  // Dedupe BEFORE enrichment — see the identical comment in paginatedTMDBMovies.
+  const capped = [...new Map(rows.map((r) => [r.id, r])).values()].slice(0, targetCount);
+
+  let done = 0;
+  await mapWithConcurrency(capped, SHOW_DETAIL_CONCURRENCY, async (row) => {
+    const tmdbId = Number(row.id.split(":")[1]);
+    const extra = await tvExtra(tmdbId, row.title);
+    row.metadata = {
+      status: extra.status,
+      numberOfSeasons: extra.numberOfSeasons,
+      numberOfEpisodes: extra.numberOfEpisodes,
+      seasons: extra.seasons,
+    };
+    row.externalLinks = extra.externalLinks;
+    done++;
+    onEnrich?.(done, capped.length);
+  });
+  return capped;
+}
+
 // ---------- Franchise movie parts (TMDB "collections") ----------
 // TMDB's Collection API is a curated, authoritative list of a franchise's
 // films — internal-only now, consumed by lib/sources/franchise.ts for the
@@ -377,7 +656,7 @@ export async function tmdbCollectionParts(id: number): Promise<RankedItem[]> {
 // ---------- Shared: watch providers ----------
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function watchLinks(country: any): ExternalLink[] | undefined {
+export function watchLinks(country: any): ExternalLink[] | undefined {
   if (!country?.link) return undefined;
   const links: ExternalLink[] = [];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
