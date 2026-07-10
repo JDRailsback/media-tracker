@@ -60,6 +60,7 @@ interface MDManga {
     links?: Record<string, string>;
     tags?: MDTag[];
     status?: string; // "ongoing" | "completed" | "hiatus" | "cancelled"
+    createdAt?: string; // when the entry was added to MangaDex
   };
   relationships: MDRelationship[];
 }
@@ -126,16 +127,20 @@ function mapManga(m: MDManga, releaseDate?: string, subtitle?: string): MediaIte
   };
 }
 
-// Batch-fetch follow counts for a set of manga ids in ONE request.
+// Batch-fetch follow counts — one request per 100 ids (MangaDex's page
+// size; also keeps the query string a sane length when a caller merges two
+// result pages, e.g. discoverMangaDexRecent).
 async function fetchFollows(ids: string[]): Promise<Record<string, number>> {
-  if (ids.length === 0) return {};
-  const params = ids.map((id) => `manga[]=${id}`).join("&");
-  const res = await fetch(`https://api.mangadex.org/statistics/manga?${params}`);
-  if (!res.ok) return {};
-  const data = await res.json();
   const out: Record<string, number> = {};
-  for (const id of ids) {
-    out[id] = data.statistics?.[id]?.follows ?? 0;
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100);
+    const params = chunk.map((id) => `manga[]=${id}`).join("&");
+    const res = await fetch(`https://api.mangadex.org/statistics/manga?${params}`);
+    if (!res.ok) continue;
+    const data = await res.json();
+    for (const id of chunk) {
+      out[id] = data.statistics?.[id]?.follows ?? 0;
+    }
   }
   return out;
 }
@@ -212,6 +217,28 @@ export async function discoverMangaDex(limit = 20): Promise<MediaItem[]> {
 // MangaDex caps `limit` at 100 per request; offset-paginated beyond that.
 const MANGADEX_PAGE_SIZE = 100;
 
+// One API entry + its follow count → CatalogRow, shared by the bulk ingest
+// and the daily recent fetch below. `releaseDate` defaults to year-01-01
+// (MangaDex has no real serialization date, only a year); the recent fetch
+// passes the entry's createdAt instead so new series carry a usable date.
+function mangaToCatalogRow(m: MDManga, follows: number, releaseDate?: string): CatalogRow {
+  const tags = (m.attributes.tags ?? [])
+    .map((t) => t.attributes.name.en)
+    .filter((n): n is string => !!n);
+  return {
+    id: `manga:${m.id}`,
+    type: "manga",
+    title: titleOf(m),
+    overview: m.attributes.description?.en,
+    posterURL: coverURL(m),
+    releaseDate: releaseDate ?? (m.attributes.year ? `${m.attributes.year}-01-01` : undefined),
+    popularityScore: follows,
+    genres: tags,
+    externalLinks: realBuyLinks(m.attributes.links),
+    metadata: { status: m.attributes.status },
+  };
+}
+
 export async function paginatedMangaDex(
   targetCount: number,
   onPage?: (fetched: number) => void
@@ -227,26 +254,56 @@ export async function paginatedMangaDex(
 
     const follows = await fetchFollows(page.map((m) => m.id));
     for (const m of page) {
-      const tags = (m.attributes.tags ?? [])
-        .map((t) => t.attributes.name.en)
-        .filter((n): n is string => !!n);
-      rows.push({
-        id: `manga:${m.id}`,
-        type: "manga",
-        title: titleOf(m),
-        overview: m.attributes.description?.en,
-        posterURL: coverURL(m),
-        releaseDate: m.attributes.year ? `${m.attributes.year}-01-01` : undefined,
-        popularityScore: follows[m.id] ?? 0,
-        genres: tags,
-        externalLinks: realBuyLinks(m.attributes.links),
-        metadata: { status: m.attributes.status },
-      });
+      rows.push(mangaToCatalogRow(m, follows[m.id] ?? 0));
     }
     onPage?.(rows.length);
     if (page.length < MANGADEX_PAGE_SIZE) break;
   }
   return rows.slice(0, targetCount);
+}
+
+// ---------- Daily recent refresh (app/api/cron/daily/route.ts) ----------
+// MangaDex has no "announced but unpublished" concept — a title exists once
+// it's actually serializing — so "recent" here means newly-ADDED series:
+// (a) the most-followed series added in the last 90 days (new AND already
+// rising), (b) the newest additions outright (brand-new, before follows have
+// had time to accumulate). The follows floor keeps the endless stream of
+// low-signal uploads out of the catalog — a genuinely rising new series
+// clears a few hundred follows within days, so quality-over-immediacy: it
+// enters on a later cron run instead of never. releaseDate is the entry's
+// createdAt (the only day-precision date MangaDex has — the year-01-01
+// fallback used by the bulk ingest would never land in a recency window).
+const RECENT_MIN_FOLLOWS = 500;
+const RECENT_MANGA_WINDOW_DAYS = 90;
+
+export async function discoverMangaDexRecent(limit = 60): Promise<CatalogRow[]> {
+  // MangaDex requires this param formatted as YYYY-MM-DDTHH:mm:ss — no
+  // milliseconds, no timezone suffix.
+  const since = new Date(Date.now() - RECENT_MANGA_WINDOW_DAYS * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 19);
+  const common = `limit=${MANGADEX_PAGE_SIZE}&includes[]=cover_art&hasAvailableChapters=true&${CONTENT_RATING}`;
+  const [risingRes, newestRes] = await Promise.all([
+    fetch(`https://api.mangadex.org/manga?order[followedCount]=desc&createdAtSince=${since}&${common}`),
+    fetch(`https://api.mangadex.org/manga?order[createdAt]=desc&${common}`),
+  ]);
+  if (!risingRes.ok) throw new Error(`MangaDex recent (rising) failed: ${risingRes.status}`);
+  if (!newestRes.ok) throw new Error(`MangaDex recent (newest) failed: ${newestRes.status}`);
+  const rising = (await risingRes.json()).data as MDManga[];
+  const newest = (await newestRes.json()).data as MDManga[];
+
+  const seen = new Map<string, MDManga>();
+  for (const m of [...rising, ...newest]) {
+    if (coverURL(m) && !seen.has(m.id)) seen.set(m.id, m);
+  }
+  const candidates = [...seen.values()];
+  const follows = await fetchFollows(candidates.map((m) => m.id));
+
+  return candidates
+    .filter((m) => (follows[m.id] ?? 0) >= RECENT_MIN_FOLLOWS)
+    .sort((a, b) => (follows[b.id] ?? 0) - (follows[a.id] ?? 0))
+    .slice(0, limit)
+    .map((m) => mangaToCatalogRow(m, follows[m.id] ?? 0, m.attributes.createdAt?.slice(0, 10)));
 }
 
 async function nextOfficialChapter(

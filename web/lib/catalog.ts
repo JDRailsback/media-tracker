@@ -27,6 +27,52 @@ export interface CatalogRow {
   tags?: string[];
 }
 
+// ---------- Write path: shared by the manual ingest script and the daily cron ----------
+
+// Batched via UNNEST so a 10,000-row fetch is a handful of round trips to
+// Neon, not one per row. Used by scripts/ingest-catalog.ts (manual bulk
+// ingest) and app/api/cron/daily/route.ts (daily recent-releases refresh) —
+// the catalog is append-only, so both paths only ever insert/update, never
+// prune.
+const UPSERT_BATCH_SIZE = 200;
+
+export async function upsertCatalog(rows: CatalogRow[], onBatch?: (done: number, total: number) => void): Promise<void> {
+  await ensureSchema();
+  const sql = db();
+  for (let i = 0; i < rows.length; i += UPSERT_BATCH_SIZE) {
+    const batch = rows.slice(i, i + UPSERT_BATCH_SIZE);
+    if (batch.length === 0) continue;
+    await sql`
+      INSERT INTO catalog_items (id, type, title, overview, poster_url, release_date, popularity_score, genres, external_links, metadata, tags)
+      SELECT * FROM UNNEST(
+        ${batch.map((r) => r.id)}::text[],
+        ${batch.map((r) => r.type)}::text[],
+        ${batch.map((r) => r.title)}::text[],
+        ${batch.map((r) => r.overview ?? null)}::text[],
+        ${batch.map((r) => r.posterURL ?? null)}::text[],
+        ${batch.map((r) => r.releaseDate ?? null)}::date[],
+        ${batch.map((r) => r.popularityScore)}::int[],
+        ${batch.map((r) => JSON.stringify(r.genres))}::jsonb[],
+        ${batch.map((r) => JSON.stringify(r.externalLinks ?? []))}::jsonb[],
+        ${batch.map((r) => JSON.stringify(r.metadata ?? {}))}::jsonb[],
+        ${batch.map((r) => JSON.stringify(r.tags ?? []))}::jsonb[]
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        title = excluded.title,
+        overview = excluded.overview,
+        poster_url = excluded.poster_url,
+        release_date = excluded.release_date,
+        popularity_score = excluded.popularity_score,
+        genres = excluded.genres,
+        external_links = excluded.external_links,
+        metadata = excluded.metadata,
+        tags = excluded.tags,
+        updated_at = now()
+    `;
+    onBatch?.(Math.min(i + UPSERT_BATCH_SIZE, rows.length), rows.length);
+  }
+}
+
 // ---------- Read path: the app's ONLY source of search/discover/details data ----------
 // No live TMDB/IGDB/MangaDex calls anywhere in the app right now — every read
 // here degrades to empty/null on a DB error rather than throwing, so a
@@ -185,6 +231,31 @@ export async function catalogTop(type: string, limit = 20): Promise<MediaItem[]>
     const sql = db();
     const rows = await sql`
       SELECT * FROM catalog_items WHERE type = ${type} ORDER BY popularity_score DESC LIMIT ${limit}
+    `;
+    return (rows as unknown as CatalogDBRow[]).map(catalogRowToMediaItem);
+  } catch {
+    return [];
+  }
+}
+
+// Titles released within the last `windowDays` — the "New releases" Discover
+// shelf. Fed by the daily cron's recent-releases ingest (see
+// app/api/cron/daily/route.ts), so this window is exactly the slice of the
+// catalog that refreshes every day. Ordered by recency rather than raw
+// popularity_score because the score scales differ wildly across types
+// (vote_count vs total_rating_count vs follows) — mixing types on raw score
+// would just rank whole media types against each other.
+export async function recentReleases(types: string[], limit = 16, windowDays = 30): Promise<MediaItem[]> {
+  try {
+    await ensureSchema();
+    const sql = db();
+    const rows = await sql`
+      SELECT * FROM catalog_items
+      WHERE type = ANY(${types})
+        AND release_date <= now()::date
+        AND release_date >= now()::date - ${windowDays}::int
+      ORDER BY release_date DESC, popularity_score DESC
+      LIMIT ${limit}
     `;
     return (rows as unknown as CatalogDBRow[]).map(catalogRowToMediaItem);
   } catch {

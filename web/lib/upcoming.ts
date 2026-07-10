@@ -3,7 +3,7 @@ import { db, ensureSchema } from "@/lib/db";
 
 // Row shape produced by the upcoming-releases fetchers (tmdb.ts/igdb.ts) and
 // stored in upcoming_items (see lib/db.ts's ensureSchema). Distinct from
-// CatalogRow — this is refreshed daily by /api/cron/upcoming, not a one-time
+// CatalogRow — this is refreshed daily by /api/cron/daily, not a one-time
 // manual ingestion, and releaseDate is meaningfully optional here (an
 // announced-but-undated title is exactly what this table exists to capture).
 export interface UpcomingRow {
@@ -77,8 +77,31 @@ export async function upcomingTop(types: string[], limit = 16): Promise<MediaIte
   }
 }
 
-// Batched UNNEST upsert (same pattern as scripts/ingest-catalog.ts) — used
-// only by app/api/cron/upcoming/route.ts, never a user request path.
+// Newest announcements first — the "Just announced" Discover shelf.
+// first_seen_at is set once and preserved across refreshes (see
+// upsertUpcoming), so it genuinely means "when this title first appeared in
+// any source feed." Caveat: every row present when the table was first
+// seeded shares that seed timestamp, so for the first few days this is
+// effectively popularity-ordered; it becomes a real announcement timeline
+// as daily runs discover new titles. Degrades to [] on a DB error.
+export async function upcomingNewest(types: string[], limit = 16): Promise<MediaItem[]> {
+  try {
+    await ensureSchema();
+    const sql = db();
+    const rows = (await sql`
+      SELECT * FROM upcoming_items
+      WHERE type = ANY(${types})
+      ORDER BY first_seen_at DESC, popularity_score DESC
+      LIMIT ${limit}
+    `) as unknown as UpcomingDBRow[];
+    return rows.map(rowToMediaItem);
+  } catch {
+    return [];
+  }
+}
+
+// Batched UNNEST upsert (same pattern as lib/catalog.ts's upsertCatalog) —
+// used only by app/api/cron/daily/route.ts, never a user request path.
 // first_seen_at is preserved across refreshes (excluded from the UPDATE SET)
 // so it keeps meaning "when we first saw this title," not "when it was last
 // refreshed" — that's what lets a future "newest announcements" view exist.

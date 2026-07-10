@@ -26,6 +26,8 @@ const CATEGORY_TITLE: Record<string, string> = {
   games: "Popular games",
   manga: "Popular manga",
   upcoming: "Popular upcoming",
+  "just-announced": "Just announced",
+  "new-releases": "New releases",
   collections: "Explore collections",
 };
 
@@ -264,6 +266,18 @@ async function runSearch(q: string, type: string) {
                   items={discoverData.popularUpcoming}
                   onSelect={handleSelect}
                   onSeeAll={() => openCategory("upcoming")}
+                />
+                <Shelf
+                  title={CATEGORY_TITLE["just-announced"]}
+                  items={discoverData.justAnnounced}
+                  onSelect={handleSelect}
+                  onSeeAll={() => openCategory("just-announced")}
+                />
+                <Shelf
+                  title={CATEGORY_TITLE["new-releases"]}
+                  items={discoverData.newReleases}
+                  onSelect={handleSelect}
+                  onSeeAll={() => openCategory("new-releases")}
                 />
                 <div className="mb-2 flex items-center justify-end">
                   <button

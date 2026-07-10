@@ -173,6 +173,16 @@ export async function discoverTMDBMovies(limit = 20): Promise<MediaItem[]> {
 //      the moment a big UNDATED sequel gets announced.
 // Both filtered to release_date empty OR in the future — never something
 // already out.
+//
+// Quality floor: an UNRELEASED title has near-zero vote_count by definition,
+// so the only meaningful signal is TMDB's live `popularity` metric (search/
+// view activity). Anything below the floor is direct-to-video filler that
+// merely has a future date — being "upcoming" alone doesn't earn a slot.
+// The same metric is stored as popularityScore (vote_count, used by the
+// catalog, would make every unreleased row score ~0 and turn the
+// undated-slot ordering in lib/upcoming.ts into a coin flip).
+const UPCOMING_MIN_POPULARITY = 15;
+
 export async function discoverTMDBUpcomingMovies(limit = 60): Promise<UpcomingRow[]> {
   const today = new Date().toISOString().slice(0, 10);
   const [datedRes, trendingRes] = await Promise.all([
@@ -187,6 +197,7 @@ export async function discoverTMDBUpcomingMovies(limit = 60): Promise<UpcomingRo
   const rows = new Map<string, UpcomingRow>();
   for (const m of dated) {
     if (!m.poster_path || !m.release_date) continue;
+    if ((m.popularity ?? 0) < UPCOMING_MIN_POPULARITY) continue;
     rows.set(`movie:${m.id}`, {
       id: `movie:${m.id}`,
       type: "movie",
@@ -195,13 +206,14 @@ export async function discoverTMDBUpcomingMovies(limit = 60): Promise<UpcomingRo
       posterURL: `${IMAGE_BASE}${m.poster_path}`,
       releaseDate: m.release_date,
       dateConfirmed: true,
-      popularityScore: m.vote_count ?? 0,
+      popularityScore: Math.round(m.popularity ?? 0),
     });
   }
   for (const m of trending) {
     const id = `movie:${m.id}`;
     const unreleased = !m.release_date || m.release_date > today;
     if (!m.poster_path || !unreleased || rows.has(id)) continue;
+    if ((m.popularity ?? 0) < UPCOMING_MIN_POPULARITY) continue;
     rows.set(id, {
       id,
       type: "movie",
@@ -210,7 +222,7 @@ export async function discoverTMDBUpcomingMovies(limit = 60): Promise<UpcomingRo
       posterURL: `${IMAGE_BASE}${m.poster_path}`,
       releaseDate: m.release_date && m.release_date > today ? m.release_date : undefined,
       dateConfirmed: !!(m.release_date && m.release_date > today),
-      popularityScore: m.vote_count ?? 0,
+      popularityScore: Math.round(m.popularity ?? 0),
     });
   }
   return [...rows.values()].slice(0, limit);
@@ -346,12 +358,21 @@ export async function discoverTMDBTV(limit = 20): Promise<MediaItem[]> {
   }));
 }
 
+// TMDB's TV popularity ranking is dominated by daily programming — soaps,
+// talk shows, news, reality — which is "popular" in the metric but slop in
+// an upcoming/new-releases feed (a soap gets a new "season" constantly).
+// Excluded by genre id at the API level wherever we discover TV:
+// News 10763, Reality 10764, Soap 10766, Talk 10767.
+const TV_JUNK_GENRES = "10763,10764,10766,10767";
+
 // Big and/or brand-new upcoming shows, DATED OR NOT — same merged
-// dated+trending strategy as discoverTMDBUpcomingMovies above.
+// dated+trending strategy and popularity floor as discoverTMDBUpcomingMovies
+// above (an unaired show has no vote_count, so `popularity` is the signal
+// and the stored score).
 export async function discoverTMDBUpcomingTV(limit = 60): Promise<UpcomingRow[]> {
   const today = new Date().toISOString().slice(0, 10);
   const [datedRes, trendingRes] = await Promise.all([
-    fetch(`https://api.themoviedb.org/3/discover/tv?api_key=${key()}&sort_by=popularity.desc&first_air_date.gte=${today}`),
+    fetch(`https://api.themoviedb.org/3/discover/tv?api_key=${key()}&sort_by=popularity.desc&first_air_date.gte=${today}&without_genres=${TV_JUNK_GENRES}`),
     fetch(`https://api.themoviedb.org/3/trending/tv/week?api_key=${key()}`),
   ]);
   if (!datedRes.ok) throw new Error(`TMDB discover upcoming TV failed: ${datedRes.status}`);
@@ -362,6 +383,7 @@ export async function discoverTMDBUpcomingTV(limit = 60): Promise<UpcomingRow[]>
   const rows = new Map<string, UpcomingRow>();
   for (const s of dated) {
     if (!s.poster_path || !s.first_air_date) continue;
+    if ((s.popularity ?? 0) < UPCOMING_MIN_POPULARITY) continue;
     rows.set(`tvShow:${s.id}`, {
       id: `tvShow:${s.id}`,
       type: "tvShow",
@@ -370,13 +392,14 @@ export async function discoverTMDBUpcomingTV(limit = 60): Promise<UpcomingRow[]>
       posterURL: `${IMAGE_BASE}${s.poster_path}`,
       releaseDate: s.first_air_date,
       dateConfirmed: true,
-      popularityScore: s.vote_count ?? 0,
+      popularityScore: Math.round(s.popularity ?? 0),
     });
   }
   for (const s of trending) {
     const id = `tvShow:${s.id}`;
     const unreleased = !s.first_air_date || s.first_air_date > today;
     if (!s.poster_path || !unreleased || rows.has(id)) continue;
+    if ((s.popularity ?? 0) < UPCOMING_MIN_POPULARITY) continue;
     rows.set(id, {
       id,
       type: "tvShow",
@@ -385,7 +408,7 @@ export async function discoverTMDBUpcomingTV(limit = 60): Promise<UpcomingRow[]>
       posterURL: `${IMAGE_BASE}${s.poster_path}`,
       releaseDate: s.first_air_date && s.first_air_date > today ? s.first_air_date : undefined,
       dateConfirmed: !!(s.first_air_date && s.first_air_date > today),
-      popularityScore: s.vote_count ?? 0,
+      popularityScore: Math.round(s.popularity ?? 0),
     });
   }
   return [...rows.values()].slice(0, limit);
@@ -543,18 +566,24 @@ export async function paginatedTMDBMovies(
   // stable when many entries tie on vote_count, so the same id can land on
   // two different pages; enriching it twice would waste a detail request.
   const capped = [...new Map(rows.map((r) => [r.id, r])).values()].slice(0, targetCount);
+  await enrichMovieRows(capped, onEnrich);
+  return capped;
+}
 
+// The per-movie enrichment pass (runtime, provider links, collection/studio/
+// keyword tags), shared by the bulk ingest above and the daily
+// recent-releases fetch below. Mutates the rows in place.
+async function enrichMovieRows(rows: CatalogRow[], onEnrich?: (done: number, total: number) => void): Promise<void> {
   let done = 0;
-  await mapWithConcurrency(capped, MOVIE_DETAIL_CONCURRENCY, async (row) => {
+  await mapWithConcurrency(rows, MOVIE_DETAIL_CONCURRENCY, async (row) => {
     const tmdbId = Number(row.id.split(":")[1]);
     const extra = await movieExtra(tmdbId, row.title);
     row.metadata = { runtimeMinutes: extra.runtimeMinutes };
     row.externalLinks = extra.externalLinks;
     row.tags = extra.tags;
     done++;
-    onEnrich?.(done, capped.length);
+    onEnrich?.(done, rows.length);
   });
-  return capped;
 }
 
 interface TMDBDiscoverShow extends TMDBShow {
@@ -701,9 +730,15 @@ export async function paginatedTMDBTV(
   }
   // Dedupe BEFORE enrichment — see the identical comment in paginatedTMDBMovies.
   const capped = [...new Map(rows.map((r) => [r.id, r])).values()].slice(0, targetCount);
+  await enrichTVRows(capped, onEnrich);
+  return capped;
+}
 
+// Per-show enrichment pass — shared by the bulk ingest above and the daily
+// recent-releases fetch below, same as enrichMovieRows. Mutates in place.
+async function enrichTVRows(rows: CatalogRow[], onEnrich?: (done: number, total: number) => void): Promise<void> {
   let done = 0;
-  await mapWithConcurrency(capped, SHOW_DETAIL_CONCURRENCY, async (row) => {
+  await mapWithConcurrency(rows, SHOW_DETAIL_CONCURRENCY, async (row) => {
     const tmdbId = Number(row.id.split(":")[1]);
     const extra = await tvExtra(tmdbId, row.title);
     row.metadata = {
@@ -715,8 +750,97 @@ export async function paginatedTMDBTV(
     row.externalLinks = extra.externalLinks;
     row.tags = extra.tags;
     done++;
-    onEnrich?.(done, capped.length);
+    onEnrich?.(done, rows.length);
   });
+}
+
+// ---------- Daily recent-releases refresh (app/api/cron/daily/route.ts) ----------
+// The bulk ingest above sorts by all-time vote_count, where a title released
+// last week ranks near the very bottom — a full 10k crawl would be needed to
+// pick it up. These instead ask TMDB directly for "the biggest things
+// released in the last N days" and return full CatalogRow[]s (same
+// enrichment as the bulk path), so the daily cron can upsert them straight
+// into catalog_items. Re-running daily over the whole window means a fresh
+// title's score/poster/metadata self-correct every day for a month.
+//
+// Quality floor: same TMDB `popularity` floor as the upcoming fetchers — a
+// month of releases is mostly direct-to-video/regional filler, and "released
+// recently" alone doesn't earn a catalog slot. The floor is checked
+// client-side (discover can only sort by popularity, not filter on it).
+const RECENT_WINDOW_DAYS = 30;
+const RECENT_MIN_POPULARITY = 15;
+
+function daysAgoISO(days: number): string {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+export async function discoverTMDBRecentMovies(limit = 60): Promise<CatalogRow[]> {
+  const genres = await tmdbGenreMap("movie");
+  const today = new Date().toISOString().slice(0, 10);
+  const since = daysAgoISO(RECENT_WINDOW_DAYS);
+  const rows: CatalogRow[] = [];
+  const pages = Math.ceil(limit / 20);
+  for (let page = 1; page <= pages; page++) {
+    const url = `https://api.themoviedb.org/3/discover/movie?api_key=${key()}&sort_by=popularity.desc&primary_release_date.gte=${since}&primary_release_date.lte=${today}&page=${page}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`TMDB discover recent movies (page ${page}) failed: ${res.status}`);
+    const results = (await res.json()).results as TMDBDiscoverMovie[];
+    if (!results || results.length === 0) break;
+    for (const m of results) {
+      if (!m.poster_path) continue;
+      if ((m.popularity ?? 0) < RECENT_MIN_POPULARITY) continue;
+      rows.push({
+        id: `movie:${m.id}`,
+        type: "movie",
+        title: m.title,
+        overview: m.overview || undefined,
+        posterURL: `${IMAGE_BASE}${m.poster_path}`,
+        releaseDate: m.release_date || undefined,
+        popularityScore: m.vote_count ?? 0,
+        genres: (m.genre_ids ?? []).map((id) => genres.get(id)).filter((n): n is string => !!n),
+      });
+    }
+  }
+  const capped = [...new Map(rows.map((r) => [r.id, r])).values()].slice(0, limit);
+  await enrichMovieRows(capped);
+  return capped;
+}
+
+// air_date (any episode aired in the window), NOT first_air_date — so a
+// returning season of an existing show refreshes that show's episode data
+// too, not just brand-new series. Capped low relative to movies because
+// tvExtra costs one request per season. Junk genres (soap/talk/reality/news
+// — see TV_JUNK_GENRES) excluded at the API level, popularity floor on top:
+// daily programming otherwise owns the "aired recently" window outright.
+export async function discoverTMDBRecentTV(limit = 30): Promise<CatalogRow[]> {
+  const genres = await tmdbGenreMap("tv");
+  const today = new Date().toISOString().slice(0, 10);
+  const since = daysAgoISO(RECENT_WINDOW_DAYS);
+  const rows: CatalogRow[] = [];
+  const pages = Math.ceil(limit / 20);
+  for (let page = 1; page <= pages; page++) {
+    const url = `https://api.themoviedb.org/3/discover/tv?api_key=${key()}&sort_by=popularity.desc&air_date.gte=${since}&air_date.lte=${today}&without_genres=${TV_JUNK_GENRES}&page=${page}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`TMDB discover recent TV (page ${page}) failed: ${res.status}`);
+    const results = (await res.json()).results as TMDBDiscoverShow[];
+    if (!results || results.length === 0) break;
+    for (const s of results) {
+      if (!s.poster_path) continue;
+      if ((s.popularity ?? 0) < RECENT_MIN_POPULARITY) continue;
+      rows.push({
+        id: `tvShow:${s.id}`,
+        type: "tvShow",
+        title: s.name,
+        overview: s.overview || undefined,
+        posterURL: `${IMAGE_BASE}${s.poster_path}`,
+        releaseDate: s.first_air_date || undefined,
+        popularityScore: s.vote_count ?? 0,
+        genres: (s.genre_ids ?? []).map((id) => genres.get(id)).filter((n): n is string => !!n),
+      });
+    }
+  }
+  const capped = [...new Map(rows.map((r) => [r.id, r])).values()].slice(0, limit);
+  await enrichTVRows(capped);
   return capped;
 }
 

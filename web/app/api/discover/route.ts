@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { discover, discoverCategory } from "@/lib/sources";
 
-// GET /api/discover                 -> { trendingMovies, trendingTV, popularGames, popularManga, popularUpcoming }
+// GET /api/discover                 -> DiscoverPayload (trending/popular shelves + popularUpcoming, newReleases, justAnnounced, featuredCollections)
 // GET /api/discover?category=movies -> MediaItem[] (expanded single category)
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);

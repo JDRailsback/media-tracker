@@ -50,12 +50,20 @@ Add them for Production (and Preview if you want previews to work).
 Click **Deploy**. You get a `https://<project>.vercel.app` URL. Search works
 immediately; follow/push work once the DB + VAPID vars are set.
 
-## 7. The scheduled poller
-- `vercel.json` already declares the cron: `GET /api/poll` daily at 08:00 UTC.
+## 7. The scheduled jobs
+- `vercel.json` declares two crons:
+  - `GET /api/poll` daily at 08:00 UTC — release-date-change push
+    notifications for followed items.
+  - `GET /api/cron/daily` daily at 09:00 UTC — the data-refresh job:
+    refreshes `upcoming_items` (biggest unreleased/announced titles), ingests
+    the last ~30 days of new releases into `catalog_items` (movies, TV,
+    games, manga), and re-resolves the hand-curated collection lists so
+    titles that just entered the catalog self-heal into their collections.
 - Vercel automatically sends `Authorization: Bearer <CRON_SECRET>` to cron
-  invocations, which `/api/poll` checks — so set `CRON_SECRET` in step 5.
-- **Hobby (free) plan:** cron runs at most **once per day**, which our daily
-  schedule fits. (Release dates don't change hourly, so daily is fine.)
+  invocations, which both routes check — so set `CRON_SECRET` in step 5.
+- **Hobby (free) plan:** at most **two cron jobs**, each running at most
+  **once per day** — exactly what we declare, so don't add a third without
+  consolidating. (Release dates don't change hourly, so daily is fine.)
 
 ## Notes / gotchas
 - The poll + push routes need the **Node.js runtime** (they use `web-push`); we

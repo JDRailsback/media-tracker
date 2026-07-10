@@ -302,9 +302,15 @@ export async function discoverIGDBPopular(limit = 20): Promise<MediaItem[]> {
 // already out. Two sorts merged: hypes desc (IGDB's own "anticipation"
 // counter, built for exactly "big, no date yet") and created_at desc
 // (catches a brand-new announcement before hype has had time to accumulate).
+// Quality floor: `hypes > 0` — at least one person has marked the game as
+// anticipated. Without it, the hypes-desc query backfills past the genuinely
+// hyped titles with null-hype rows in arbitrary order, and the created_at
+// query is pure shovelware (dozens of zero-signal entries are added to IGDB
+// daily). A real announcement picks up hypes within hours, so this delays a
+// big title by at most one cron cycle.
 export async function discoverIGDBUpcoming(limit = 60): Promise<UpcomingRow[]> {
   const nowSeconds = Math.floor(Date.now() / 1000);
-  const condition = `(first_release_date = null | first_release_date > ${nowSeconds}) & cover != null`;
+  const condition = `(first_release_date = null | first_release_date > ${nowSeconds}) & cover != null & hypes > 0`;
   const [byHype, byNew] = await Promise.all([
     query(`fields ${SEARCH_FIELDS}; where ${condition}; sort hypes desc; limit ${limit};`),
     query(`fields ${SEARCH_FIELDS}; where ${condition}; sort created_at desc; limit ${limit};`),
@@ -350,6 +356,34 @@ interface IGDBGameWithGenres extends IGDBGame {
 const CATALOG_FIELDS = `${SEARCH_FIELDS},genres.name,platforms.name,websites.url,franchises.name,keywords.name,themes.name`;
 const IGDB_PAGE_SIZE = 500;
 
+// One CATALOG_FIELDS response → CatalogRow, shared by the bulk ingest and
+// the daily recent-releases fetch below.
+function gameToCatalogRow(g: IGDBGameWithGenres): CatalogRow {
+  const mapped = mapGame(g);
+  return {
+    id: mapped.id,
+    type: "game",
+    title: mapped.title,
+    overview: mapped.overview,
+    posterURL: mapped.posterURL,
+    releaseDate: mapped.releaseDate,
+    popularityScore: g.total_rating_count ?? 0,
+    genres: (g.genres ?? []).map((x) => x.name),
+    // Real storefront links only — storeLinks() already returns
+    // undefined rather than falling back to IGDB's own page (that
+    // fallback only happens in detailsIGDB, for the live single-item view).
+    externalLinks: storeLinks(g.websites) ?? [],
+    metadata: { platforms: (g.platforms ?? []).map((p) => p.name) },
+    tags: [
+      ...new Set(
+        [...(g.franchises ?? []), ...(g.keywords ?? []), ...(g.themes ?? [])]
+          .map((t) => t.name?.toLowerCase().trim())
+          .filter((n): n is string => !!n)
+      ),
+    ],
+  };
+}
+
 export async function paginatedIGDBGames(
   targetCount: number,
   onPage?: (fetched: number) => void
@@ -361,32 +395,42 @@ export async function paginatedIGDBGames(
     )) as IGDBGameWithGenres[];
     if (games.length === 0) break;
     for (const g of games.filter(isMainGame)) {
-      const mapped = mapGame(g);
-      rows.push({
-        id: mapped.id,
-        type: "game",
-        title: mapped.title,
-        overview: mapped.overview,
-        posterURL: mapped.posterURL,
-        releaseDate: mapped.releaseDate,
-        popularityScore: g.total_rating_count ?? 0,
-        genres: (g.genres ?? []).map((x) => x.name),
-        // Real storefront links only — storeLinks() already returns
-        // undefined rather than falling back to IGDB's own page (that
-        // fallback only happens in detailsIGDB, for the live single-item view).
-        externalLinks: storeLinks(g.websites) ?? [],
-        metadata: { platforms: (g.platforms ?? []).map((p) => p.name) },
-        tags: [
-          ...new Set(
-            [...(g.franchises ?? []), ...(g.keywords ?? []), ...(g.themes ?? [])]
-              .map((t) => t.name?.toLowerCase().trim())
-              .filter((n): n is string => !!n)
-          ),
-        ],
-      });
+      rows.push(gameToCatalogRow(g));
     }
     onPage?.(rows.length);
     if (games.length < IGDB_PAGE_SIZE) break;
   }
   return rows.slice(0, targetCount);
+}
+
+// ---------- Daily recent-releases refresh (app/api/cron/daily/route.ts) ----------
+// Games released in the last 30 days, biggest first. Two sorts merged, same
+// spirit as discoverIGDBUpcoming: total_rating_count desc (established
+// signal) and hypes desc (a game out for three days often still has its
+// pre-release hype but almost no ratings yet — rating-count alone would miss
+// it). Everything comes back inline via CATALOG_FIELDS — no per-item
+// enrichment pass, unlike the TMDB side.
+export async function discoverIGDBRecent(limit = 100): Promise<CatalogRow[]> {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const sinceSeconds = nowSeconds - 30 * 24 * 60 * 60;
+  // The ratings/hypes floor matters: a single month of IGDB releases is
+  // mostly zero-signal shovelware, and without it the merged queries just
+  // backfill the limit with whatever released most recently (verified on a
+  // real run — "Cool Game Pack", "Bike Food Delivery Simulator"...). A
+  // single rating/hype turned out to still let plenty of noise through
+  // ("Meowstery Wisp", "Cat Mail Co."), so the bar is a handful of people
+  // having rated OR anticipated the game — real releases clear it within a
+  // day or two of launch and get picked up on a later cron run.
+  const condition = `first_release_date >= ${sinceSeconds} & first_release_date <= ${nowSeconds} & cover != null & (total_rating_count >= 5 | hypes >= 5)`;
+  const [byRatings, byHype] = (await Promise.all([
+    query(`fields ${CATALOG_FIELDS}; where ${condition}; sort total_rating_count desc; limit ${limit};`),
+    query(`fields ${CATALOG_FIELDS}; where ${condition}; sort hypes desc; limit ${limit};`),
+  ])) as [IGDBGameWithGenres[], IGDBGameWithGenres[]];
+
+  const rows = new Map<string, CatalogRow>();
+  for (const g of [...byRatings, ...byHype].filter(isMainGame)) {
+    const row = gameToCatalogRow(g);
+    if (!rows.has(row.id)) rows.set(row.id, row);
+  }
+  return [...rows.values()].slice(0, limit);
 }

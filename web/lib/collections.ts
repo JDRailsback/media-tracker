@@ -126,7 +126,7 @@ export const COLLECTIONS: CollectionDef[] = [
     queries: {},
     curated: {
       tvShow: ["SpongeBob SquarePants", "Avatar: The Last Airbender", "The Legend of Korra", "Rugrats", "Hey Arnold!", "The Fairly OddParents", "Danny Phantom", "The Adventures of Jimmy Neutron: Boy Genius", "iCarly", "Drake & Josh", "Victorious", "Zoey 101", "The Loud House", "Invader Zim", "The Ren & Stimpy Show", "CatDog", "Rocket Power", "The Wild Thornberrys", "Big Time Rush", "Ned's Declassified School Survival Guide", "Are You Afraid of the Dark?", "Kamp Koral: SpongeBob's Under Years", "Teenage Mutant Ninja Turtles"],
-      movie: ["The SpongeBob SquarePants Movie", "The SpongeBob Movie: Sponge Out of Water", "The SpongeBob Movie: Sponge on the Run", "Jimmy Neutron: Boy Genius", "The Rugrats Movie", "Rango", "Teenage Mutant Ninja Turtles: Mutant Mayhem", "The Last Airbender", "The Adventures of Tintin", "Good Burger", "Harriet the Spy"],
+      movie: ["The SpongeBob SquarePants Movie", "The SpongeBob Movie: Sponge Out of Water", "The SpongeBob Movie: Sponge on the Run", "Jimmy Neutron: Boy Genius", "The Rugrats Movie", "Rango", "Teenage Mutant Ninja Turtles: Mutant Mayhem", "The Last Airbender", "The Adventures of Tintin", "Good Burger", "Harriet"],
       game: ["SpongeBob SquarePants: Battle for Bikini Bottom", "SpongeBob SquarePants: Battle for Bikini Bottom - Rehydrated", "SpongeBob SquarePants: The Cosmic Shake", "Nickelodeon All-Star Brawl", "Teenage Mutant Ninja Turtles: Shredder's Revenge", "SpongeBob SquarePants: Creature From the Krusty Krab"],
     },
     featured: true,
@@ -177,8 +177,8 @@ export const COLLECTIONS: CollectionDef[] = [
     queries: {},
     curated: {
       game: ["Pokémon Red Version", "Pokémon Blue Version", "Pokémon Yellow Version", "Pokémon Gold Version", "Pokémon Silver Version", "Pokémon Crystal Version", "Pokémon Ruby Version", "Pokémon Sapphire Version", "Pokémon Emerald Version", "Pokémon FireRed Version", "Pokémon LeafGreen Version", "Pokémon Diamond Version", "Pokémon Pearl Version", "Pokémon Platinum Version", "Pokémon HeartGold Version", "Pokémon SoulSilver Version", "Pokémon Black Version", "Pokémon White Version", "Pokémon X", "Pokémon Y", "Pokémon Omega Ruby", "Pokémon Alpha Sapphire", "Pokémon Sun", "Pokémon Moon", "Pokémon: Let's Go, Pikachu!", "Pokémon Sword", "Pokémon Shield", "Pokémon Brilliant Diamond", "Pokémon Legends: Arceus", "Pokémon Scarlet", "Pokémon Violet", "Pokémon Go", "Pokémon Colosseum", "Pokkén Tournament", "New Pokémon Snap", "Pokémon Mystery Dungeon: Explorers of Time"],
-      tvShow: ["Pokémon", "Pokémon Concierge", "Pokémon Horizons: The Series"],
-      movie: ["Pokémon Detective Pikachu", "Pokémon: The First Movie", "Pokémon: The Movie 2000"],
+      tvShow: ["Pokémon", "Pokémon Concierge", "Pokémon Horizons"],
+      movie: ["Pokémon Detective Pikachu", "Pokémon: The First Movie", "Pokémon the Movie 2000"],
     },
     featured: true,
   },
@@ -318,7 +318,7 @@ export const COLLECTIONS: CollectionDef[] = [
     theme: { primary: "16 16 16", secondary: "150 20 20" },
     queries: {},
     curated: {
-      game: ["Resident Evil", "Resident Evil 2", "Resident Evil 3", "Resident Evil 4", "Resident Evil 5", "Resident Evil 6", "Resident Evil 7: Biohazard", "Resident Evil Village", "Resident Evil 0", "Resident Evil Code: Veronica", "Resident Evil: Revelations", "Resident Evil: Revelations 2"],
+      game: ["Resident Evil", "Resident Evil 2", "Resident Evil 3", "Resident Evil 4", "Resident Evil 5", "Resident Evil 6", "Resident Evil 7: Biohazard", "Resident Evil Village", "Resident Evil Zero", "Resident Evil Code: Veronica", "Resident Evil: Revelations", "Resident Evil: Revelations 2"],
       movie: ["Resident Evil", "Resident Evil: Apocalypse", "Resident Evil: Extinction", "Resident Evil: Afterlife", "Resident Evil: Retribution", "Resident Evil: The Final Chapter", "Resident Evil: Welcome to Raccoon City", "Resident Evil: Degeneration", "Resident Evil: Vendetta", "Resident Evil: Death Island"],
       tvShow: ["Resident Evil", "Resident Evil: Infinite Darkness"],
     },
@@ -592,7 +592,7 @@ export const COLLECTIONS: CollectionDef[] = [
     curated: {
       movie: ["Rocky", "Rocky II", "Rocky IV", "Rocky Balboa", "Creed", "Creed II", "Creed III", "Remember the Titans", "Miracle", "Moneyball", "The Blind Side", "Rudy", "Million Dollar Baby", "Raging Bull", "Field of Dreams", "A League of Their Own", "Space Jam", "Coach Carter", "The Sandlot", "Ford v Ferrari", "Rush", "King Richard", "Challengers", "Air"],
       tvShow: ["Ted Lasso", "Friday Night Lights", "Blue Lock", "Haikyu!!"],
-      game: ["Rocket League", "Tony Hawk's Pro Skater 1+2"],
+      game: ["Rocket League", "Tony Hawk's Pro Skater 2"],
       manga: ["Haikyu", "Blue Lock", "Slam Dunk"],
     },
   },
@@ -631,7 +631,7 @@ export const COLLECTIONS: CollectionDef[] = [
     queries: {},
     collectionType: "thematic",
     curated: {
-      movie: ["There Will Be Blood", "No Country for Old Men", "Drive", "Prisoners", "Zodiac", "The Green Knight", "The Lighthouse", "First Reformed", "Nightcrawler", "Sicario", "Blade Runner 2049", "Once Upon a Time in Hollywood", "The Master", "A Ghost Story"],
+      movie: ["There Will Be Blood", "No Country for Old Men", "Drive", "Prisoners", "Zodiac", "The Green Knight", "The Lighthouse", "First Reformed", "Nightcrawler", "Sicario", "Blade Runner 2049", "Once Upon a Time... in Hollywood", "The Master", "A Ghost Story"],
       tvShow: ["True Detective", "Better Call Saul", "Mare of Easttown", "The Night Of", "Sharp Objects", "Severance", "Mindhunter"],
       game: ["Firewatch", "Death Stranding", "What Remains of Edith Finch"],
     },
@@ -660,7 +660,7 @@ export const COLLECTIONS: CollectionDef[] = [
       movie: ["Ratatouille", "Chef", "The Menu", "Julie & Julia", "Burnt", "Chocolat", "The Hundred-Foot Journey", "Jiro Dreams of Sushi", "Pig", "The Taste of Things", "No Reservations"],
       tvShow: ["The Bear", "Chef's Table", "The Great British Bake Off", "Hell's Kitchen", "MasterChef", "Food Wars! Shokugeki no Soma", "Delicious in Dungeon"],
       game: ["Overcooked! 2", "Cooking Mama", "Venba"],
-      manga: ["Shokugeki no", "Dungeon Meshi"],
+      manga: ["Shokugeki no Souma", "Dungeon Meshi"],
     },
   },
 ];

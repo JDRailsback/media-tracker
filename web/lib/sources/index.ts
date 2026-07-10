@@ -1,6 +1,6 @@
 import type { MediaItem } from "@/lib/types";
-import { catalogTop, getCatalogItem, searchCatalog } from "@/lib/catalog";
-import { upcomingTop } from "@/lib/upcoming";
+import { catalogTop, getCatalogItem, recentReleases, searchCatalog } from "@/lib/catalog";
+import { upcomingNewest, upcomingTop } from "@/lib/upcoming";
 import { searchCollections, detailsCollection, discoverCollections } from "./collection";
 
 // Search dispatch — catalog-only right now, no live TMDB/IGDB/MangaDex calls
@@ -45,23 +45,29 @@ export interface DiscoverPayload {
   popularGames: MediaItem[];
   popularManga: MediaItem[];
   popularUpcoming: MediaItem[];
+  newReleases: MediaItem[];
+  justAnnounced: MediaItem[];
   featuredCollections: MediaItem[];
 }
 
 // Curated groupings for the Discover page — reads catalog_items/upcoming_items
-// only. popularUpcoming reads upcoming_items, refreshed daily by
-// /api/cron/upcoming — never a live call from this request path.
+// only, all of it refreshed by the daily cron (/api/cron/daily) — never a
+// live TMDB/IGDB/MangaDex call from this request path. newReleases is the
+// last-30-days slice of catalog_items; justAnnounced is upcoming_items by
+// first-seen time.
 export async function discover(): Promise<DiscoverPayload> {
-  const [trendingMovies, trendingTV, popularGames, popularManga, popularUpcoming, featuredCollections] =
+  const [trendingMovies, trendingTV, popularGames, popularManga, popularUpcoming, newReleases, justAnnounced, featuredCollections] =
     await Promise.all([
       catalogTop("movie"),
       catalogTop("tvShow"),
       catalogTop("game"),
       catalogTop("manga"),
       upcomingTop(["movie", "tvShow", "game"], 16),
+      recentReleases(["movie", "tvShow", "game", "manga"], 16),
+      upcomingNewest(["movie", "tvShow", "game"], 16),
       discoverCollections(true),
     ]);
-  return { trendingMovies, trendingTV, popularGames, popularManga, popularUpcoming, featuredCollections };
+  return { trendingMovies, trendingTV, popularGames, popularManga, popularUpcoming, newReleases, justAnnounced, featuredCollections };
 }
 
 // A single category, expanded (for "see all" drill-down on the Discover page).
@@ -81,6 +87,10 @@ export async function discoverCategory(category: string): Promise<MediaItem[]> {
       return await discoverCollections(false);
     case "upcoming":
       return upcomingTop(["movie", "tvShow", "game"], 40);
+    case "new-releases":
+      return recentReleases(["movie", "tvShow", "game", "manga"], 40);
+    case "just-announced":
+      return upcomingNewest(["movie", "tvShow", "game"], 40);
     default:
       throw new Error(`Unknown category: ${category}`);
   }
