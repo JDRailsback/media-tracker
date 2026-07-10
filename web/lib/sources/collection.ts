@@ -1,7 +1,7 @@
 import type { MediaItem, MediaType } from "@/lib/types";
 import { COLLECTIONS, CollectionDef, CollectionQueries, getCollection } from "@/lib/collections";
 import { db, ensureSchema } from "@/lib/db";
-import { searchCatalogRanked } from "@/lib/catalog";
+import { getCollectionItems } from "@/lib/catalog";
 import { matchTier, fuzzyMatches, normalizedScores, RankedItem, stripRanking } from "./textMatch";
 
 // Deliberately does NOT import from ./index.ts — index.ts imports FROM this
@@ -204,38 +204,6 @@ export async function discoverCollections(featuredOnly = false): Promise<MediaIt
   return (featuredOnly ? list.filter((f) => f.featured) : list).map(toSummary);
 }
 
-// Kept as RankedItem[] (not stripped down to MediaItem[] yet) — `popularity`
-// is needed a bit longer, to build the "Most Popular" row and the
-// chronological sort below. Stripped only at the very end of
-// resolveFranchise, right before the response is assembled.
-async function resolveQuery(
-  queries: string | string[] | undefined,
-  searchFn: (q: string, opts?: { lenient?: boolean }) => Promise<RankedItem[]>
-): Promise<RankedItem[]> {
-  if (!queries) return [];
-  const list = Array.isArray(queries) ? queries : [queries];
-  const settled = await Promise.allSettled(
-    list.map(async (q) => {
-      const results = await searchFn(q, { lenient: true });
-      // `lenient` only relaxes the POPULARITY bar — a result still has to
-      // actually relate to the query text. Verified live this matters even
-      // for a precise-looking curated query: TMDB's TV search for "One
-      // Piece" includes "A Piece of Your Mind" and "Aqua Teen Hunger
-      // Force," neither containing "One Piece" anywhere in the title —
-      // TMDB's own relevance ranking is looser than a substring match. This
-      // is the same relevantOnly()/matchTier gate general search applies
-      // (lib/sources/index.ts), scoped here to the SPECIFIC query string
-      // that produced each result (a franchise can have several query
-      // strings — e.g. Star Wars' TV list — and a result must relate to
-      // the one that actually found it, not just any of them).
-      return results.filter((r) => matchTier(r.title, q) < 3 || fuzzyMatches(r.title, q));
-    })
-  );
-  const out: RankedItem[] = [];
-  for (const r of settled) if (r.status === "fulfilled") out.push(...r.value);
-  return out;
-}
-
 function dedupeById<T extends MediaItem>(items: T[]): T[] {
   const seen = new Set<string>();
   const out: T[] = [];
@@ -285,31 +253,26 @@ export interface ResolvedCollection {
 
 const MOST_POPULAR_LIMIT = 12;
 
-// Resolves each collection's curated query strings against catalog_items —
-// no live TMDB/IGDB/MangaDex calls anywhere in the app right now (see
-// lib/catalog.ts's searchCatalogRanked). `movieCollectionId` (TMDB's own
-// live "Collection" endpoint) is disabled for the same reason — a collection
-// configured with one just falls through to its `queries.movie` text search
-// against the catalog like every other type. A franchise's deep-cut entries
-// that aren't popular enough to be in the top-N catalog simply won't appear
-// here; that's an accepted tradeoff of running catalog-only.
+// Reads each collection's PRECOMPUTED contents from collection_items — a
+// static, hand-curated grouping resolved once by scripts/rebuild-collections.ts
+// from the `curated` title lists in lib/collections.ts. No live search, no
+// TMDB/IGDB/MangaDex calls, no query/tag auto-matching, on this or any other
+// request path. A curated title that isn't in the catalog's top-N simply
+// won't appear until a larger ingest includes it; that's an accepted
+// tradeoff of running catalog-only. Membership changes by editing the
+// curated lists and rerunning `npm run rebuild-collections`, or per-item
+// through the editor (includeOverrides/excludeIds, applied below).
 export async function resolveCollection(slug: string): Promise<ResolvedCollection | null> {
   const def = await getEffectiveCollection(slug);
   if (!def) return null;
 
-  const [movie, tvShow, game, manga] = await Promise.all([
-    resolveQuery(def.queries.movie, (q) => searchCatalogRanked(q, "movie")),
-    resolveQuery(def.queries.tvShow, (q) => searchCatalogRanked(q, "tvShow")),
-    resolveQuery(def.queries.game, (q) => searchCatalogRanked(q, "game")),
-    resolveQuery(def.queries.manga, (q) => searchCatalogRanked(q, "manga")),
-  ]);
-
+  const members = await getCollectionItems(slug);
   const excluded = new Set(def.excludeIds);
   const ranked: Record<keyof CollectionPartsByType, RankedItem[]> = {
-    movie: dedupeById(movie).filter((i) => !excluded.has(i.id)),
-    tvShow: dedupeById(tvShow).filter((i) => !excluded.has(i.id)),
-    game: dedupeById(game).filter((i) => !excluded.has(i.id)),
-    manga: dedupeById(manga).filter((i) => !excluded.has(i.id)),
+    movie: dedupeById(members.filter((i) => i.type === "movie")).filter((i) => !excluded.has(i.id)),
+    tvShow: dedupeById(members.filter((i) => i.type === "tvShow")).filter((i) => !excluded.has(i.id)),
+    game: dedupeById(members.filter((i) => i.type === "game")).filter((i) => !excluded.has(i.id)),
+    manga: dedupeById(members.filter((i) => i.type === "manga")).filter((i) => !excluded.has(i.id)),
   };
 
   // Popularity-based "Most Popular" row is computed from auto-resolved

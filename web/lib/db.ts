@@ -101,6 +101,44 @@ export function ensureSchema(): Promise<void> {
       await sql`CREATE INDEX IF NOT EXISTS catalog_items_type_idx ON catalog_items (type)`;
       // Added after the table's initial rollout — ALTER for anyone who already ran it.
       await sql`ALTER TABLE catalog_items ADD COLUMN IF NOT EXISTS external_links JSONB NOT NULL DEFAULT '[]'`;
+      // Not-yet-released movies/TV/games — refreshed daily by the
+      // /api/cron/upcoming job (see lib/upcoming.ts), NOT by any user
+      // request path. Separate from catalog_items because this data churns
+      // constantly (dates get confirmed, items release and drop out) while
+      // the bulk catalog is a manually-refreshed snapshot.
+      await sql`CREATE TABLE IF NOT EXISTS upcoming_items (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        overview TEXT,
+        poster_url TEXT,
+        release_date DATE,
+        date_confirmed BOOLEAN NOT NULL DEFAULT false,
+        popularity_score INTEGER NOT NULL DEFAULT 0,
+        metadata JSONB NOT NULL DEFAULT '{}',
+        search_vector TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', title)) STORED,
+        first_seen_at TIMESTAMPTZ DEFAULT now(),
+        updated_at TIMESTAMPTZ DEFAULT now()
+      )`;
+      await sql`CREATE INDEX IF NOT EXISTS upcoming_items_type_idx ON upcoming_items (type)`;
+      // Franchise/studio/keyword identifiers (e.g. "star wars collection",
+      // "walt disney pictures", "marvel cinematic universe (mcu)") — a
+      // superset of genres, used ONLY for collection matching (see
+      // scripts/rebuild-collections.ts), not shown in the UI the way genres
+      // are. Existing rows get this backfilled by re-running `npm run ingest`.
+      await sql`ALTER TABLE catalog_items ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'`;
+      // Precomputed collection membership — replaces resolving a
+      // collection's contents via a live search on every page load (see
+      // resolveCollection in lib/sources/collection.ts). Populated by
+      // scripts/rebuild-collections.ts, not any user request path. Full
+      // per-slug replace on rebuild, not an incremental upsert — membership
+      // sets are small, so this avoids stale-row bookkeeping.
+      await sql`CREATE TABLE IF NOT EXISTS collection_items (
+        collection_slug TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        PRIMARY KEY (collection_slug, item_id)
+      )`;
+      await sql`CREATE INDEX IF NOT EXISTS collection_items_slug_idx ON collection_items (collection_slug)`;
     })();
   }
   return schema;

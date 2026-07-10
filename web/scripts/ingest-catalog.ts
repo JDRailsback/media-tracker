@@ -35,7 +35,7 @@ async function upsertBatch(rows: CatalogRow[]): Promise<void> {
   if (rows.length === 0) return;
   const sql = db();
   await sql`
-    INSERT INTO catalog_items (id, type, title, overview, poster_url, release_date, popularity_score, genres, external_links, metadata)
+    INSERT INTO catalog_items (id, type, title, overview, poster_url, release_date, popularity_score, genres, external_links, metadata, tags)
     SELECT * FROM UNNEST(
       ${rows.map((r) => r.id)}::text[],
       ${rows.map((r) => r.type)}::text[],
@@ -46,7 +46,8 @@ async function upsertBatch(rows: CatalogRow[]): Promise<void> {
       ${rows.map((r) => r.popularityScore)}::int[],
       ${rows.map((r) => JSON.stringify(r.genres))}::jsonb[],
       ${rows.map((r) => JSON.stringify(r.externalLinks ?? []))}::jsonb[],
-      ${rows.map((r) => JSON.stringify(r.metadata ?? {}))}::jsonb[]
+      ${rows.map((r) => JSON.stringify(r.metadata ?? {}))}::jsonb[],
+      ${rows.map((r) => JSON.stringify(r.tags ?? []))}::jsonb[]
     )
     ON CONFLICT (id) DO UPDATE SET
       title = excluded.title,
@@ -57,6 +58,7 @@ async function upsertBatch(rows: CatalogRow[]): Promise<void> {
       genres = excluded.genres,
       external_links = excluded.external_links,
       metadata = excluded.metadata,
+      tags = excluded.tags,
       updated_at = now()
   `;
 }

@@ -1,5 +1,6 @@
 import type { ExternalLink, MediaItem } from "@/lib/types";
 import type { CatalogRow } from "@/lib/catalog";
+import type { UpcomingRow } from "@/lib/upcoming";
 import { isExactMatch, RankedItem } from "./textMatch";
 
 // IGDB adapter (TS port). OAuth token + POST query body.
@@ -295,12 +296,36 @@ export async function discoverIGDBPopular(limit = 20): Promise<MediaItem[]> {
 }
 
 // Anticipated, not-yet-released games (for "Popular upcoming").
-export async function discoverIGDBUpcoming(limit = 12): Promise<MediaItem[]> {
+// Big and/or brand-new upcoming games, DATED OR NOT (for "Popular
+// upcoming" — see /api/cron/upcoming, lib/upcoming.ts). Filtered to NOT YET
+// RELEASED (no first_release_date, or a future one) — never something
+// already out. Two sorts merged: hypes desc (IGDB's own "anticipation"
+// counter, built for exactly "big, no date yet") and created_at desc
+// (catches a brand-new announcement before hype has had time to accumulate).
+export async function discoverIGDBUpcoming(limit = 60): Promise<UpcomingRow[]> {
   const nowSeconds = Math.floor(Date.now() / 1000);
-  const games = await query(
-    `fields ${SEARCH_FIELDS}; where first_release_date > ${nowSeconds} & cover != null & hypes != null; sort hypes desc; limit ${limit * 2};`
-  );
-  return games.filter(isMainGame).slice(0, limit).map(mapGame);
+  const condition = `(first_release_date = null | first_release_date > ${nowSeconds}) & cover != null`;
+  const [byHype, byNew] = await Promise.all([
+    query(`fields ${SEARCH_FIELDS}; where ${condition}; sort hypes desc; limit ${limit};`),
+    query(`fields ${SEARCH_FIELDS}; where ${condition}; sort created_at desc; limit ${limit};`),
+  ]);
+
+  const rows = new Map<string, UpcomingRow>();
+  for (const g of [...byHype, ...byNew].filter(isMainGame)) {
+    const mapped = mapGame(g);
+    if (rows.has(mapped.id)) continue;
+    rows.set(mapped.id, {
+      id: mapped.id,
+      type: "game",
+      title: mapped.title,
+      overview: mapped.overview,
+      posterURL: mapped.posterURL,
+      releaseDate: g.first_release_date ? new Date(g.first_release_date * 1000).toISOString() : undefined,
+      dateConfirmed: !!g.first_release_date,
+      popularityScore: g.hypes ?? 0,
+    });
+  }
+  return [...rows.values()].slice(0, limit);
 }
 
 // ---------- Bulk catalog ingestion (scripts/ingest-catalog.ts only) ----------
@@ -312,11 +337,17 @@ interface IGDBGameWithGenres extends IGDBGame {
   genres?: { name: string }[];
   platforms?: { name: string }[];
   websites?: { url?: string }[];
+  franchises?: { name: string }[];
+  keywords?: { name: string }[];
+  themes?: { name: string }[];
 }
 
-// platforms.name and websites.url come back inline on the same request — no
-// extra per-item call needed, unlike TMDB's runtime/watch-providers.
-const CATALOG_FIELDS = `${SEARCH_FIELDS},genres.name,platforms.name,websites.url`;
+// platforms.name, websites.url, and franchises/keywords/themes all come back
+// inline on the same request — no extra per-item call needed, unlike TMDB's
+// runtime/watch-providers. franchises/keywords/themes feed `tags`, a superset
+// of genres used ONLY for collection matching (see
+// scripts/rebuild-collections.ts), never shown in the UI the way genres are.
+const CATALOG_FIELDS = `${SEARCH_FIELDS},genres.name,platforms.name,websites.url,franchises.name,keywords.name,themes.name`;
 const IGDB_PAGE_SIZE = 500;
 
 export async function paginatedIGDBGames(
@@ -345,6 +376,13 @@ export async function paginatedIGDBGames(
         // fallback only happens in detailsIGDB, for the live single-item view).
         externalLinks: storeLinks(g.websites) ?? [],
         metadata: { platforms: (g.platforms ?? []).map((p) => p.name) },
+        tags: [
+          ...new Set(
+            [...(g.franchises ?? []), ...(g.keywords ?? []), ...(g.themes ?? [])]
+              .map((t) => t.name?.toLowerCase().trim())
+              .filter((n): n is string => !!n)
+          ),
+        ],
       });
     }
     onPage?.(rows.length);

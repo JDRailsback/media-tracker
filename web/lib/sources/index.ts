@@ -1,5 +1,6 @@
 import type { MediaItem } from "@/lib/types";
 import { catalogTop, getCatalogItem, searchCatalog } from "@/lib/catalog";
+import { upcomingTop } from "@/lib/upcoming";
 import { searchCollections, detailsCollection, discoverCollections } from "./collection";
 
 // Search dispatch — catalog-only right now, no live TMDB/IGDB/MangaDex calls
@@ -47,18 +48,20 @@ export interface DiscoverPayload {
   featuredCollections: MediaItem[];
 }
 
-// Curated groupings for the Discover page — reads catalog_items only.
-// popularUpcoming is always empty: the catalog deliberately excludes
-// unreleased titles, and there's no live call left to fill it.
+// Curated groupings for the Discover page — reads catalog_items/upcoming_items
+// only. popularUpcoming reads upcoming_items, refreshed daily by
+// /api/cron/upcoming — never a live call from this request path.
 export async function discover(): Promise<DiscoverPayload> {
-  const [trendingMovies, trendingTV, popularGames, popularManga, featuredCollections] = await Promise.all([
-    catalogTop("movie"),
-    catalogTop("tvShow"),
-    catalogTop("game"),
-    catalogTop("manga"),
-    discoverCollections(true),
-  ]);
-  return { trendingMovies, trendingTV, popularGames, popularManga, popularUpcoming: [], featuredCollections };
+  const [trendingMovies, trendingTV, popularGames, popularManga, popularUpcoming, featuredCollections] =
+    await Promise.all([
+      catalogTop("movie"),
+      catalogTop("tvShow"),
+      catalogTop("game"),
+      catalogTop("manga"),
+      upcomingTop(["movie", "tvShow", "game"], 16),
+      discoverCollections(true),
+    ]);
+  return { trendingMovies, trendingTV, popularGames, popularManga, popularUpcoming, featuredCollections };
 }
 
 // A single category, expanded (for "see all" drill-down on the Discover page).
@@ -77,7 +80,7 @@ export async function discoverCategory(category: string): Promise<MediaItem[]> {
       // same as before.
       return await discoverCollections(false);
     case "upcoming":
-      return [];
+      return upcomingTop(["movie", "tvShow", "game"], 40);
     default:
       throw new Error(`Unknown category: ${category}`);
   }

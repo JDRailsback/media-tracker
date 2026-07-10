@@ -21,6 +21,10 @@ export interface CatalogRow {
   // array means no direct platform link is known, not "link to the source instead."
   externalLinks?: ExternalLink[];
   metadata?: Record<string, unknown>;
+  // Franchise/studio/keyword identifiers (e.g. "star wars collection",
+  // "walt disney pictures") — a superset of genres, used ONLY for collection
+  // matching (see scripts/rebuild-collections.ts), never shown in the UI.
+  tags?: string[];
 }
 
 // ---------- Read path: the app's ONLY source of search/discover/details data ----------
@@ -197,5 +201,30 @@ export async function getCatalogItem(id: string): Promise<MediaItem | null> {
     return row ? catalogRowToMediaItem(row) : null;
   } catch {
     return null;
+  }
+}
+
+// A collection's precomputed members (see scripts/rebuild-collections.ts) —
+// used by lib/sources/collection.ts's resolveCollection, which replaced its
+// old live per-request search with a read of collection_items. Kept as
+// RankedItem (not MediaItem) for the same reason searchCatalogRanked is —
+// resolveCollection still needs a real popularity signal to build a
+// collection's cross-type "Most Popular" row.
+export async function getCollectionItems(slug: string): Promise<RankedItem[]> {
+  try {
+    await ensureSchema();
+    const sql = db();
+    const rows = await sql`
+      SELECT catalog_items.* FROM collection_items
+      JOIN catalog_items ON catalog_items.id = collection_items.item_id
+      WHERE collection_items.collection_slug = ${slug}
+    `;
+    return (rows as unknown as CatalogDBRow[]).map((row) => ({
+      ...catalogRowToMediaItem(row),
+      significant: true,
+      popularity: row.popularity_score,
+    }));
+  } catch {
+    return [];
   }
 }

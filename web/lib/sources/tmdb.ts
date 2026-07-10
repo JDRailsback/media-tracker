@@ -1,5 +1,6 @@
 import type { EpisodeInfo, ExternalLink, LinkKind, MediaItem } from "@/lib/types";
 import type { CatalogRow } from "@/lib/catalog";
+import type { UpcomingRow } from "@/lib/upcoming";
 import { isExactMatch, RankedItem } from "./textMatch";
 import { mapWithConcurrency, withRetries } from "./concurrency";
 
@@ -161,17 +162,58 @@ export async function discoverTMDBMovies(limit = 20): Promise<MediaItem[]> {
   return (data.results as TMDBMovie[]).slice(0, limit).map(mapMovie);
 }
 
-// Popular, not-yet-released movies (for "Popular upcoming").
-export async function discoverTMDBUpcomingMovies(limit = 12): Promise<MediaItem[]> {
+// Big and/or brand-new upcoming movies, DATED OR NOT (for "Popular
+// upcoming" — see /api/cron/upcoming, lib/upcoming.ts). Two merged
+// strategies:
+//  (a) discover with a confirmed future date, sorted by popularity — catches
+//      "years away but dated."
+//  (b) trending/movie/week, filtered to unreleased — TMDB's discover
+//      endpoint has no "no date yet" filter to query directly, but trending
+//      reacts to real search/view activity, which is exactly what spikes
+//      the moment a big UNDATED sequel gets announced.
+// Both filtered to release_date empty OR in the future — never something
+// already out.
+export async function discoverTMDBUpcomingMovies(limit = 60): Promise<UpcomingRow[]> {
   const today = new Date().toISOString().slice(0, 10);
-  const url = `https://api.themoviedb.org/3/discover/movie?api_key=${key()}&sort_by=popularity.desc&primary_release_date.gte=${today}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`TMDB discover upcoming movies failed: ${res.status}`);
-  const data = await res.json();
-  return (data.results as TMDBMovie[])
-    .filter((m) => m.poster_path)
-    .slice(0, limit)
-    .map(mapMovie);
+  const [datedRes, trendingRes] = await Promise.all([
+    fetch(`https://api.themoviedb.org/3/discover/movie?api_key=${key()}&sort_by=popularity.desc&primary_release_date.gte=${today}`),
+    fetch(`https://api.themoviedb.org/3/trending/movie/week?api_key=${key()}`),
+  ]);
+  if (!datedRes.ok) throw new Error(`TMDB discover upcoming movies failed: ${datedRes.status}`);
+  if (!trendingRes.ok) throw new Error(`TMDB trending movies failed: ${trendingRes.status}`);
+  const dated = (await datedRes.json()).results as TMDBMovie[];
+  const trending = (await trendingRes.json()).results as TMDBMovie[];
+
+  const rows = new Map<string, UpcomingRow>();
+  for (const m of dated) {
+    if (!m.poster_path || !m.release_date) continue;
+    rows.set(`movie:${m.id}`, {
+      id: `movie:${m.id}`,
+      type: "movie",
+      title: m.title,
+      overview: m.overview || undefined,
+      posterURL: `${IMAGE_BASE}${m.poster_path}`,
+      releaseDate: m.release_date,
+      dateConfirmed: true,
+      popularityScore: m.vote_count ?? 0,
+    });
+  }
+  for (const m of trending) {
+    const id = `movie:${m.id}`;
+    const unreleased = !m.release_date || m.release_date > today;
+    if (!m.poster_path || !unreleased || rows.has(id)) continue;
+    rows.set(id, {
+      id,
+      type: "movie",
+      title: m.title,
+      overview: m.overview || undefined,
+      posterURL: `${IMAGE_BASE}${m.poster_path}`,
+      releaseDate: m.release_date && m.release_date > today ? m.release_date : undefined,
+      dateConfirmed: !!(m.release_date && m.release_date > today),
+      popularityScore: m.vote_count ?? 0,
+    });
+  }
+  return [...rows.values()].slice(0, limit);
 }
 
 // ---------- TV shows ----------
@@ -304,24 +346,49 @@ export async function discoverTMDBTV(limit = 20): Promise<MediaItem[]> {
   }));
 }
 
-// Popular, soon-to-premiere shows (for "Popular upcoming").
-export async function discoverTMDBUpcomingTV(limit = 12): Promise<MediaItem[]> {
+// Big and/or brand-new upcoming shows, DATED OR NOT — same merged
+// dated+trending strategy as discoverTMDBUpcomingMovies above.
+export async function discoverTMDBUpcomingTV(limit = 60): Promise<UpcomingRow[]> {
   const today = new Date().toISOString().slice(0, 10);
-  const url = `https://api.themoviedb.org/3/discover/tv?api_key=${key()}&sort_by=popularity.desc&first_air_date.gte=${today}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`TMDB discover upcoming TV failed: ${res.status}`);
-  const data = await res.json();
-  return (data.results as TMDBShow[])
-    .filter((s) => s.poster_path)
-    .slice(0, limit)
-    .map((s) => ({
+  const [datedRes, trendingRes] = await Promise.all([
+    fetch(`https://api.themoviedb.org/3/discover/tv?api_key=${key()}&sort_by=popularity.desc&first_air_date.gte=${today}`),
+    fetch(`https://api.themoviedb.org/3/trending/tv/week?api_key=${key()}`),
+  ]);
+  if (!datedRes.ok) throw new Error(`TMDB discover upcoming TV failed: ${datedRes.status}`);
+  if (!trendingRes.ok) throw new Error(`TMDB trending TV failed: ${trendingRes.status}`);
+  const dated = (await datedRes.json()).results as TMDBShow[];
+  const trending = (await trendingRes.json()).results as TMDBShow[];
+
+  const rows = new Map<string, UpcomingRow>();
+  for (const s of dated) {
+    if (!s.poster_path || !s.first_air_date) continue;
+    rows.set(`tvShow:${s.id}`, {
       id: `tvShow:${s.id}`,
-      type: "tvShow" as const,
+      type: "tvShow",
       title: s.name,
       overview: s.overview || undefined,
-      posterURL: s.poster_path ? `${IMAGE_BASE}${s.poster_path}` : undefined,
+      posterURL: `${IMAGE_BASE}${s.poster_path}`,
       releaseDate: s.first_air_date,
-    }));
+      dateConfirmed: true,
+      popularityScore: s.vote_count ?? 0,
+    });
+  }
+  for (const s of trending) {
+    const id = `tvShow:${s.id}`;
+    const unreleased = !s.first_air_date || s.first_air_date > today;
+    if (!s.poster_path || !unreleased || rows.has(id)) continue;
+    rows.set(id, {
+      id,
+      type: "tvShow",
+      title: s.name,
+      overview: s.overview || undefined,
+      posterURL: `${IMAGE_BASE}${s.poster_path}`,
+      releaseDate: s.first_air_date && s.first_air_date > today ? s.first_air_date : undefined,
+      dateConfirmed: !!(s.first_air_date && s.first_air_date > today),
+      popularityScore: s.vote_count ?? 0,
+    });
+  }
+  return [...rows.values()].slice(0, limit);
 }
 
 // ---------- Bulk catalog ingestion (scripts/ingest-catalog.ts only) ----------
@@ -401,22 +468,43 @@ function providerSearchLinks(
   return links;
 }
 
-// Per-movie enrichment: runtime + provider search links — neither is in the
-// discover response, needs one extra request per movie.
-async function movieExtra(id: number, title: string): Promise<{ runtimeMinutes?: number; externalLinks: ExternalLink[] }> {
+// Franchise/studio/keyword identifiers for collection matching (see
+// scripts/rebuild-collections.ts) — NOT the same as `genres`, which is
+// purely for UI badges. belongs_to_collection/production_companies/keywords
+// are all in this same movie-details response already, no extra request.
+function movieTags(d: {
+  belongs_to_collection?: { name?: string } | null;
+  production_companies?: { name?: string }[];
+  keywords?: { keywords?: { name?: string }[] };
+}): string[] {
+  const tags: string[] = [];
+  if (d.belongs_to_collection?.name) tags.push(d.belongs_to_collection.name);
+  for (const c of d.production_companies ?? []) if (c.name) tags.push(c.name);
+  for (const k of d.keywords?.keywords ?? []) if (k.name) tags.push(k.name);
+  return [...new Set(tags.map((t) => t.toLowerCase().trim()))];
+}
+
+// Per-movie enrichment: runtime + provider search links + collection/studio/
+// keyword tags — none of this is in the discover response, needs one extra
+// request per movie.
+async function movieExtra(
+  id: number,
+  title: string
+): Promise<{ runtimeMinutes?: number; externalLinks: ExternalLink[]; tags: string[] }> {
   try {
     return await withRetries(async () => {
-      const url = `https://api.themoviedb.org/3/movie/${id}?api_key=${key()}&append_to_response=watch/providers`;
+      const url = `https://api.themoviedb.org/3/movie/${id}?api_key=${key()}&append_to_response=watch/providers,keywords`;
       const res = await fetch(url);
       if (!res.ok) throw new Error(`TMDB movie details (${id}) failed: ${res.status}`);
       const d = await res.json();
       return {
         runtimeMinutes: typeof d.runtime === "number" ? d.runtime : undefined,
         externalLinks: providerSearchLinks(d["watch/providers"]?.results?.US, title),
+        tags: movieTags(d),
       };
     });
   } catch {
-    return { externalLinks: [] };
+    return { externalLinks: [], tags: [] };
   }
 }
 
@@ -462,6 +550,7 @@ export async function paginatedTMDBMovies(
     const extra = await movieExtra(tmdbId, row.title);
     row.metadata = { runtimeMinutes: extra.runtimeMinutes };
     row.externalLinks = extra.externalLinks;
+    row.tags = extra.tags;
     done++;
     onEnrich?.(done, capped.length);
   });
@@ -497,22 +586,50 @@ interface CatalogSeason {
   episodes: { episode: number; title?: string; airDate?: string; runtimeMinutes?: number }[];
 }
 
+// TV has no belongs_to_collection equivalent (that field is movie-only), so
+// this stays weaker than movieTags — networks/production_companies + the
+// TV keywords endpoint (which uses a "results" key, unlike movies' "keywords"
+// key — a real TMDB API inconsistency, not a typo).
+function tvTags(d: {
+  networks?: { name?: string }[];
+  production_companies?: { name?: string }[];
+  keywords?: { results?: { name?: string }[] };
+}): string[] {
+  const tags: string[] = [];
+  for (const n of d.networks ?? []) if (n.name) tags.push(n.name);
+  for (const c of d.production_companies ?? []) if (c.name) tags.push(c.name);
+  for (const k of d.keywords?.results ?? []) if (k.name) tags.push(k.name);
+  return [...new Set(tags.map((t) => t.toLowerCase().trim()))];
+}
+
 // Per-show enrichment: status + full per-season/per-episode breakdown +
-// provider search links. One request for the show itself, plus one more PER
-// SEASON — far more expensive than the movie case, since a show's episode
-// data isn't on the show-level response at all.
+// provider search links + network/studio/keyword tags. One request for the
+// show itself, plus one more PER SEASON — far more expensive than the movie
+// case, since a show's episode data isn't on the show-level response at all.
 const SEASON_CONCURRENCY = 5;
 
 async function tvExtra(
   id: number,
   title: string
-): Promise<{ status?: string; numberOfSeasons?: number; numberOfEpisodes?: number; seasons: CatalogSeason[]; externalLinks: ExternalLink[] }> {
+): Promise<{
+  status?: string;
+  numberOfSeasons?: number;
+  numberOfEpisodes?: number;
+  seasons: CatalogSeason[];
+  externalLinks: ExternalLink[];
+  tags: string[];
+}> {
   try {
     return await withRetries(async () => {
-      const url = `https://api.themoviedb.org/3/tv/${id}?api_key=${key()}&append_to_response=watch/providers`;
+      const url = `https://api.themoviedb.org/3/tv/${id}?api_key=${key()}&append_to_response=watch/providers,keywords`;
       const res = await fetch(url);
       if (!res.ok) throw new Error(`TMDB show details (${id}) failed: ${res.status}`);
-      const d = (await res.json()) as TMDBShowDetails & { "watch/providers"?: { results?: Record<string, unknown> } };
+      const d = (await res.json()) as TMDBShowDetails & {
+        "watch/providers"?: { results?: Record<string, unknown> };
+        networks?: { name?: string }[];
+        production_companies?: { name?: string }[];
+        keywords?: { results?: { name?: string }[] };
+      };
 
       const seasonSummaries = d.seasons ?? [];
       const seasons = await mapWithConcurrency(seasonSummaries, SEASON_CONCURRENCY, async (s) => {
@@ -543,10 +660,11 @@ async function tvExtra(
           d["watch/providers"]?.results?.US as Parameters<typeof providerSearchLinks>[0],
           title
         ),
+        tags: tvTags(d),
       };
     });
   } catch {
-    return { seasons: [], externalLinks: [] };
+    return { seasons: [], externalLinks: [], tags: [] };
   }
 }
 
@@ -595,6 +713,7 @@ export async function paginatedTMDBTV(
       seasons: extra.seasons,
     };
     row.externalLinks = extra.externalLinks;
+    row.tags = extra.tags;
     done++;
     onEnrich?.(done, capped.length);
   });
