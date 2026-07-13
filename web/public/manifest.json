@@ -1,6 +1,6 @@
 {
-  "name": "Media Tracker",
-  "short_name": "Media Tracker",
+  "name": "Trackr",
+  "short_name": "Trackr",
   "description": "Track releases across movies, games, and manga.",
   "start_url": "/",
   "display": "standalone",

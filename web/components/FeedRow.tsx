@@ -1,16 +1,13 @@
 import type { MediaItem } from "@/lib/types";
 import TypeTag from "./TypeTag";
 
-// "Today" gets the loud, gradient-glow treatment — that's the whole point of
-// the app. Everything further out is progressively quieter.
-function badgeClass(diffDays: number): string {
-  if (diffDays === 0)
-    return "bg-gradient-to-r from-accent to-accent-2 text-on-accent shadow-md shadow-accent/30";
-  if (diffDays < 0) return "bg-surface text-subtle";
-  if (diffDays <= 6) return "bg-accent/12 text-accent";
-  return "bg-surface text-ink/70";
-}
-
+// A row in the Home/Following schedule list. Rows are designed to sit
+// inside a divide-y container (see page.tsx), so they carry no rounding or
+// border of their own — the list reads as one continuous schedule, not a
+// stack of floating pills. The right side is a two-line "date leaf": the
+// verb as a small overline, the day as the strong line. "Today" keeps the
+// loud gradient badge — that moment is the whole point of the app, and it
+// should interrupt the calm of everything around it.
 export default function FeedRow({
   item,
   badge,
@@ -18,16 +15,18 @@ export default function FeedRow({
   index = 0,
 }: {
   item: MediaItem;
-  badge?: { label: string; diffDays: number };
+  badge?: { label: string; verb?: string; when?: string; diffDays: number };
   onSelect: (i: MediaItem) => void;
   index?: number;
 }) {
   const isToday = badge?.diffDays === 0;
+  const isPast = (badge?.diffDays ?? 0) < 0;
+  const isSoon = !isToday && !isPast && (badge?.diffDays ?? 99) <= 6;
 
   return (
     <button
       onClick={() => onSelect(item)}
-      className="flex w-full animate-fade-up items-center gap-4 rounded-xl2 px-3 py-3 text-left transition-colors duration-200 hover:bg-surface"
+      className="flex w-full animate-fade-up items-center gap-4 px-4 py-3 text-left transition-colors duration-200 hover:bg-surface"
       style={{ animationDelay: `${Math.min(index, 12) * 40}ms` }}
     >
       {item.posterURL ? (
@@ -35,29 +34,39 @@ export default function FeedRow({
         <img
           src={item.posterURL}
           alt=""
-          className="h-20 w-14 shrink-0 rounded-lg object-cover shadow-sm transition-transform duration-300 hover:scale-105"
+          className="h-[72px] w-[50px] shrink-0 rounded-[8px] object-cover shadow-sm"
         />
       ) : (
-        <div className="h-20 w-14 shrink-0 rounded-lg bg-gradient-to-br from-surface to-canvas" />
+        <div className="h-[72px] w-[50px] shrink-0 rounded-[8px] bg-gradient-to-br from-surface to-canvas" />
       )}
 
       <div className="min-w-0 flex-1">
-        <div className="truncate text-[15.5px] font-semibold text-ink">{item.title}</div>
+        <div className="truncate text-[15px] font-semibold text-ink">{item.title}</div>
         <div className="mt-1.5 flex items-center gap-2">
           <TypeTag type={item.type} />
           {item.subtitle && <span className="text-[13px] text-subtle">{item.subtitle}</span>}
         </div>
       </div>
 
-      {badge && (
-        <span
-          className={`shrink-0 rounded-full px-3 py-1.5 text-[12.5px] font-semibold transition-all duration-300 ${badgeClass(
-            badge.diffDays
-          )} ${isToday ? "animate-glow" : ""}`}
-        >
-          {badge.label}
-        </span>
-      )}
+      {badge &&
+        (isToday ? (
+          <span className="shrink-0 animate-glow rounded-full bg-gradient-to-r from-accent to-accent-2 px-3 py-1.5 text-[12.5px] font-semibold text-on-accent shadow-md shadow-accent/30">
+            {badge.label}
+          </span>
+        ) : (
+          <div className="shrink-0 text-right">
+            <div className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-subtle">
+              {badge.verb ?? ""}
+            </div>
+            <div
+              className={`mt-0.5 text-[13.5px] font-semibold ${
+                isSoon ? "text-accent" : isPast ? "text-subtle" : "text-ink/75"
+              }`}
+            >
+              {badge.when ?? badge.label}
+            </div>
+          </div>
+        ))}
     </button>
   );
 }

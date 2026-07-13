@@ -139,6 +139,31 @@ export function ensureSchema(): Promise<void> {
         PRIMARY KEY (collection_slug, item_id)
       )`;
       await sql`CREATE INDEX IF NOT EXISTS collection_items_slug_idx ON collection_items (collection_slug)`;
+      // A collection's single nearest not-yet-released entry, precomputed by
+      // matching its curated title list against upcoming_items (see
+      // rebuildAllCollections in lib/collections-rebuild.ts) — same
+      // table-only-read principle as collection_items, so resolveCollection
+      // never joins upcoming_items live. One row per collection (the
+      // earliest confirmed date wins); a collection with nothing dated
+      // upcoming simply has no row.
+      await sql`CREATE TABLE IF NOT EXISTS collection_next_release (
+        collection_slug TEXT PRIMARY KEY,
+        item_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        poster_url TEXT,
+        release_date DATE NOT NULL
+      )`;
+      // Content-filter signals (see lib/contentFilters.ts, Settings' "Content
+      // filters" section) — original_language is TMDB's ISO 639-1 code
+      // ("ja", "ko", "en", ...), free on every movie/TV response already
+      // being fetched (no extra request). genres already existed on
+      // catalog_items; upcoming_items needs its own copy since "Popular
+      // upcoming" is filtered the same way. Games/manga have no language
+      // concept — original_language stays NULL for them, which the filter
+      // predicates account for.
+      await sql`ALTER TABLE catalog_items ADD COLUMN IF NOT EXISTS original_language TEXT`;
+      await sql`ALTER TABLE upcoming_items ADD COLUMN IF NOT EXISTS original_language TEXT`;
+      await sql`ALTER TABLE upcoming_items ADD COLUMN IF NOT EXISTS genres JSONB NOT NULL DEFAULT '[]'`;
     })();
   }
   return schema;

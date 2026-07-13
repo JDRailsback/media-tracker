@@ -126,7 +126,7 @@ async function getToken(): Promise<string> {
 
     const res = await fetch(
       `https://id.twitch.tv/oauth2/token?client_id=${id}&client_secret=${secret}&grant_type=client_credentials`,
-      { method: "POST" }
+      { method: "POST", cache: "no-store" }
     );
     if (!res.ok) throw new Error(`IGDB auth failed: ${res.status}`);
     const data = await res.json();
@@ -185,6 +185,7 @@ async function query(body: string): Promise<IGDBGame[]> {
     method: "POST",
     headers: { "Client-ID": clientID, Authorization: `Bearer ${token}` },
     body,
+    cache: "no-store",
   });
   if (!res.ok) throw new Error(`IGDB request failed: ${res.status}`);
   return (await res.json()) as IGDBGame[];
@@ -295,6 +296,22 @@ export async function discoverIGDBPopular(limit = 20): Promise<MediaItem[]> {
   return games.filter(isMainGame).slice(0, limit).map(mapGame);
 }
 
+interface IGDBGameWithCompanies extends IGDBGame {
+  involved_companies?: { company?: { name?: string } }[];
+  created_at?: number; // Unix seconds — when IGDB's own entry was created, a real "announced" signal
+  genres?: { name: string }[]; // for lib/contentFilters.ts (e.g. "indie games")
+}
+
+const UPCOMING_GAME_FIELDS = `${SEARCH_FIELDS},involved_companies.company.name,created_at,genres.name`;
+
+// Has a real credited developer/publisher — the "official announcement, not
+// speculative" gate for games. Checked in JS after the fetch: IGDB's
+// Apicalypse `where` clause doesn't reliably support "this array/reference
+// field is non-empty" the way `cover != null` works for a plain field.
+function hasCreditedStudio(g: IGDBGameWithCompanies): boolean {
+  return (g.involved_companies ?? []).some((c) => c.company?.name);
+}
+
 // Anticipated, not-yet-released games (for "Popular upcoming").
 // Big and/or brand-new upcoming games, DATED OR NOT (for "Popular
 // upcoming" — see /api/cron/upcoming, lib/upcoming.ts). Filtered to NOT YET
@@ -302,22 +319,22 @@ export async function discoverIGDBPopular(limit = 20): Promise<MediaItem[]> {
 // already out. Two sorts merged: hypes desc (IGDB's own "anticipation"
 // counter, built for exactly "big, no date yet") and created_at desc
 // (catches a brand-new announcement before hype has had time to accumulate).
-// Quality floor: `hypes > 0` — at least one person has marked the game as
-// anticipated. Without it, the hypes-desc query backfills past the genuinely
-// hyped titles with null-hype rows in arbitrary order, and the created_at
-// query is pure shovelware (dozens of zero-signal entries are added to IGDB
-// daily). A real announcement picks up hypes within hours, so this delays a
-// big title by at most one cron cycle.
-export async function discoverIGDBUpcoming(limit = 60): Promise<UpcomingRow[]> {
+// Quality gate: a real credited developer/publisher (hasCreditedStudio), NOT
+// a hype/rating floor — an unannounced/placeholder/fan entry has no company
+// credited regardless of how much hype it happened to accumulate, and a
+// small legitimate indie announcement can have real company credits with
+// zero hype yet. hypes/created_at stay as the two sort/discovery strategies,
+// just not as the quality gate itself.
+export async function discoverIGDBUpcoming(limit = 500): Promise<UpcomingRow[]> {
   const nowSeconds = Math.floor(Date.now() / 1000);
-  const condition = `(first_release_date = null | first_release_date > ${nowSeconds}) & cover != null & hypes > 0`;
-  const [byHype, byNew] = await Promise.all([
-    query(`fields ${SEARCH_FIELDS}; where ${condition}; sort hypes desc; limit ${limit};`),
-    query(`fields ${SEARCH_FIELDS}; where ${condition}; sort created_at desc; limit ${limit};`),
-  ]);
+  const condition = `(first_release_date = null | first_release_date > ${nowSeconds}) & cover != null`;
+  const [byHype, byNew] = (await Promise.all([
+    query(`fields ${UPCOMING_GAME_FIELDS}; where ${condition}; sort hypes desc; limit ${limit};`),
+    query(`fields ${UPCOMING_GAME_FIELDS}; where ${condition}; sort created_at desc; limit ${limit};`),
+  ])) as [IGDBGameWithCompanies[], IGDBGameWithCompanies[]];
 
   const rows = new Map<string, UpcomingRow>();
-  for (const g of [...byHype, ...byNew].filter(isMainGame)) {
+  for (const g of [...byHype, ...byNew].filter(isMainGame).filter(hasCreditedStudio)) {
     const mapped = mapGame(g);
     if (rows.has(mapped.id)) continue;
     rows.set(mapped.id, {
@@ -329,6 +346,8 @@ export async function discoverIGDBUpcoming(limit = 60): Promise<UpcomingRow[]> {
       releaseDate: g.first_release_date ? new Date(g.first_release_date * 1000).toISOString() : undefined,
       dateConfirmed: !!g.first_release_date,
       popularityScore: g.hypes ?? 0,
+      announcedAt: g.created_at ? new Date(g.created_at * 1000).toISOString() : undefined,
+      genres: (g.genres ?? []).map((x) => x.name),
     });
   }
   return [...rows.values()].slice(0, limit);

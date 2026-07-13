@@ -1,6 +1,7 @@
 import type { EpisodeInfo, ExternalLink, MediaItem, MediaType } from "@/lib/types";
 import { db, ensureSchema } from "@/lib/db";
 import type { RankedItem } from "@/lib/sources/textMatch";
+import { excludeHiddenSQL, type ContentCategory } from "@/lib/contentFilters";
 
 // Shared row shape for the bulk-populated catalog_items table (see
 // scripts/ingest-catalog.ts and lib/db.ts's ensureSchema). Distinct from
@@ -25,6 +26,11 @@ export interface CatalogRow {
   // "walt disney pictures") — a superset of genres, used ONLY for collection
   // matching (see scripts/rebuild-collections.ts), never shown in the UI.
   tags?: string[];
+  // TMDB's ISO 639-1 original-language code ("ja", "ko", "en", ...) — movies
+  // and TV only, never set for game/manga rows. Used ONLY by
+  // lib/contentFilters.ts (e.g. "anime" = Animation genre + "ja"), never
+  // shown in the UI.
+  originalLanguage?: string;
 }
 
 // ---------- Write path: shared by the manual ingest script and the daily cron ----------
@@ -43,7 +49,7 @@ export async function upsertCatalog(rows: CatalogRow[], onBatch?: (done: number,
     const batch = rows.slice(i, i + UPSERT_BATCH_SIZE);
     if (batch.length === 0) continue;
     await sql`
-      INSERT INTO catalog_items (id, type, title, overview, poster_url, release_date, popularity_score, genres, external_links, metadata, tags)
+      INSERT INTO catalog_items (id, type, title, overview, poster_url, release_date, popularity_score, genres, external_links, metadata, tags, original_language)
       SELECT * FROM UNNEST(
         ${batch.map((r) => r.id)}::text[],
         ${batch.map((r) => r.type)}::text[],
@@ -55,7 +61,8 @@ export async function upsertCatalog(rows: CatalogRow[], onBatch?: (done: number,
         ${batch.map((r) => JSON.stringify(r.genres))}::jsonb[],
         ${batch.map((r) => JSON.stringify(r.externalLinks ?? []))}::jsonb[],
         ${batch.map((r) => JSON.stringify(r.metadata ?? {}))}::jsonb[],
-        ${batch.map((r) => JSON.stringify(r.tags ?? []))}::jsonb[]
+        ${batch.map((r) => JSON.stringify(r.tags ?? []))}::jsonb[],
+        ${batch.map((r) => r.originalLanguage ?? null)}::text[]
       )
       ON CONFLICT (id) DO UPDATE SET
         title = excluded.title,
@@ -67,6 +74,7 @@ export async function upsertCatalog(rows: CatalogRow[], onBatch?: (done: number,
         external_links = excluded.external_links,
         metadata = excluded.metadata,
         tags = excluded.tags,
+        original_language = excluded.original_language,
         updated_at = now()
     `;
     onBatch?.(Math.min(i + UPSERT_BATCH_SIZE, rows.length), rows.length);
@@ -122,6 +130,7 @@ export function catalogRowToMediaItem(row: CatalogDBRow): MediaItem {
   let subtitle: string | undefined;
   let episodes: EpisodeInfo[] | undefined;
   let episodeCount: number | undefined;
+  let releaseDate: string | undefined = toISODate(row.release_date);
 
   if (type === "tvShow") {
     const seasons = (metadata.seasons as CatalogSeasonMeta[] | undefined) ?? [];
@@ -130,10 +139,40 @@ export function catalogRowToMediaItem(row: CatalogDBRow): MediaItem {
     );
     episodes = flattened.length > 0 ? flattened : undefined;
     episodeCount = (metadata.numberOfEpisodes as number | undefined) ?? (flattened.length || undefined);
-    // Matches the live adapter's own fallback (mapShow in tmdb.ts) for a show
-    // with no known next episode — the catalog is a point-in-time snapshot,
-    // so it can't know about episodes airing after ingestion.
-    subtitle = (metadata.status as string | undefined) ?? undefined;
+
+    // releaseDate means "next episode airing" for a TV show everywhere else
+    // in the app (matches the old live mapShow in tmdb.ts) — never the
+    // show's ORIGINAL first-air-date, which isn't the same thing and would
+    // misread as an upcoming release. The catalog only knows about episodes
+    // as of its last ingest/refresh touch, so this can lag a show on a long
+    // hiatus — same self-healing tradeoff accepted for collection membership.
+    const todayISO = new Date().toISOString().slice(0, 10);
+    const next = flattened
+      .filter((e) => e.airDate && e.airDate >= todayISO)
+      .sort((a, b) => (a.airDate! < b.airDate! ? -1 : 1))[0];
+
+    // Fallback to TMDB's own next_episode_to_air (see tvExtra in tmdb.ts) —
+    // occasionally populated even when the full season/episode list scan
+    // above finds nothing (e.g. a season's episode-level dates aren't fully
+    // announced yet, but TMDB still knows the premiere date). Verified
+    // live this is frequently null too for a show genuinely between
+    // seasons — that's a real TMDB data gap neither signal can fill, not a
+    // bug in either extraction path.
+    const rawNext = metadata.nextEpisodeToAir as
+      | { season: number; episode: number; airDate: string }
+      | undefined;
+    const fallbackNext = rawNext && rawNext.airDate >= todayISO ? rawNext : undefined;
+
+    const chosen = next ?? fallbackNext;
+    if (chosen) {
+      subtitle = `S${chosen.season} E${chosen.episode}`;
+      releaseDate = chosen.airDate;
+    } else {
+      // No known next episode — fall back to the show's status (matches the
+      // old live adapter's fallback), and no releaseDate: nothing upcoming.
+      subtitle = (metadata.status as string | undefined) ?? undefined;
+      releaseDate = undefined;
+    }
   }
 
   return {
@@ -143,12 +182,7 @@ export function catalogRowToMediaItem(row: CatalogDBRow): MediaItem {
     subtitle,
     overview: row.overview ?? undefined,
     posterURL: row.poster_url ?? undefined,
-    // For a TV show, releaseDate means "next episode airing" everywhere
-    // else in the app (see mapShow in tmdb.ts) — the catalog only has the
-    // show's ORIGINAL first-air-date, which isn't the same thing and would
-    // misread as an upcoming release. Left undefined for tvShow; every
-    // other type's release_date is the real release date.
-    releaseDate: type === "tvShow" ? undefined : toISODate(row.release_date),
+    releaseDate,
     externalLinks: externalLinks.length > 0 ? externalLinks : undefined,
     episodes,
     episodeCount,
@@ -160,7 +194,7 @@ export function catalogRowToMediaItem(row: CatalogDBRow): MediaItem {
 // (see lib/db.ts). Stripped to plain alphanumeric tokens so arbitrary input
 // can never produce an invalid tsquery. Returns null for an empty/unsafe
 // query so callers can treat that as "no catalog results" uniformly.
-function buildPrefixQuery(query: string): string | null {
+export function buildPrefixQuery(query: string): string | null {
   const tokens = query
     .toLowerCase()
     .split(/[^a-z0-9]+/i)
@@ -171,25 +205,48 @@ function buildPrefixQuery(query: string): string | null {
   return tokens.map((t) => `${t}:*`).join(" & ");
 }
 
-export async function searchCatalog(query: string, type?: string, limit = 40): Promise<MediaItem[]> {
+export async function searchCatalog(
+  query: string,
+  type?: string,
+  limit = 40,
+  hidden: ContentCategory[] = []
+): Promise<MediaItem[]> {
   const tsq = buildPrefixQuery(query);
   if (!tsq) return [];
   try {
     await ensureSchema();
     const sql = db();
-    const rows = type
-      ? await sql`
-          SELECT * FROM catalog_items
-          WHERE type = ${type} AND search_vector @@ to_tsquery('english', ${tsq})
-          ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsq})) DESC, popularity_score DESC
-          LIMIT ${limit}
-        `
-      : await sql`
-          SELECT * FROM catalog_items
-          WHERE search_vector @@ to_tsquery('english', ${tsq})
-          ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsq})) DESC, popularity_score DESC
-          LIMIT ${limit}
-        `;
+    const filterSQL = excludeHiddenSQL(hidden);
+    // The common case (no filter) keeps the plain tagged-template form;
+    // filtering switches to the raw string+params form since filterSQL is a
+    // raw SQL fragment (see lib/contentFilters.ts) that a tagged template
+    // can't interpolate as syntax, only as a parameter value.
+    const rows =
+      hidden.length === 0
+        ? type
+          ? await sql`
+              SELECT * FROM catalog_items
+              WHERE type = ${type} AND search_vector @@ to_tsquery('english', ${tsq})
+              ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsq})) DESC, popularity_score DESC
+              LIMIT ${limit}
+            `
+          : await sql`
+              SELECT * FROM catalog_items
+              WHERE search_vector @@ to_tsquery('english', ${tsq})
+              ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsq})) DESC, popularity_score DESC
+              LIMIT ${limit}
+            `
+        : type
+        ? await sql(
+            `SELECT * FROM catalog_items WHERE type = $1 AND search_vector @@ to_tsquery('english', $2) ${filterSQL}
+             ORDER BY ts_rank(search_vector, to_tsquery('english', $2)) DESC, popularity_score DESC LIMIT $3`,
+            [type, tsq, limit]
+          )
+        : await sql(
+            `SELECT * FROM catalog_items WHERE search_vector @@ to_tsquery('english', $1) ${filterSQL}
+             ORDER BY ts_rank(search_vector, to_tsquery('english', $1)) DESC, popularity_score DESC LIMIT $2`,
+            [tsq, limit]
+          );
     return (rows as unknown as CatalogDBRow[]).map(catalogRowToMediaItem);
   } catch {
     return [];
@@ -225,13 +282,20 @@ export async function searchCatalogRanked(query: string, type: string, limit = 1
   }
 }
 
-export async function catalogTop(type: string, limit = 20): Promise<MediaItem[]> {
+export async function catalogTop(type: string, limit = 20, hidden: ContentCategory[] = []): Promise<MediaItem[]> {
   try {
     await ensureSchema();
     const sql = db();
-    const rows = await sql`
-      SELECT * FROM catalog_items WHERE type = ${type} ORDER BY popularity_score DESC LIMIT ${limit}
-    `;
+    const filterSQL = excludeHiddenSQL(hidden);
+    const rows =
+      hidden.length === 0
+        ? await sql`
+            SELECT * FROM catalog_items WHERE type = ${type} ORDER BY popularity_score DESC LIMIT ${limit}
+          `
+        : await sql(
+            `SELECT * FROM catalog_items WHERE type = $1 ${filterSQL} ORDER BY popularity_score DESC LIMIT $2`,
+            [type, limit]
+          );
     return (rows as unknown as CatalogDBRow[]).map(catalogRowToMediaItem);
   } catch {
     return [];
@@ -245,18 +309,33 @@ export async function catalogTop(type: string, limit = 20): Promise<MediaItem[]>
 // popularity_score because the score scales differ wildly across types
 // (vote_count vs total_rating_count vs follows) — mixing types on raw score
 // would just rank whole media types against each other.
-export async function recentReleases(types: string[], limit = 16, windowDays = 30): Promise<MediaItem[]> {
+export async function recentReleases(
+  types: string[],
+  limit = 16,
+  windowDays = 30,
+  hidden: ContentCategory[] = []
+): Promise<MediaItem[]> {
   try {
     await ensureSchema();
     const sql = db();
-    const rows = await sql`
-      SELECT * FROM catalog_items
-      WHERE type = ANY(${types})
-        AND release_date <= now()::date
-        AND release_date >= now()::date - ${windowDays}::int
-      ORDER BY release_date DESC, popularity_score DESC
-      LIMIT ${limit}
-    `;
+    const filterSQL = excludeHiddenSQL(hidden);
+    const rows =
+      hidden.length === 0
+        ? await sql`
+            SELECT * FROM catalog_items
+            WHERE type = ANY(${types})
+              AND release_date <= now()::date
+              AND release_date >= now()::date - ${windowDays}::int
+            ORDER BY release_date DESC, popularity_score DESC
+            LIMIT ${limit}
+          `
+        : await sql(
+            `SELECT * FROM catalog_items
+             WHERE type = ANY($1) AND release_date <= now()::date AND release_date >= now()::date - $2::int
+             ${filterSQL}
+             ORDER BY release_date DESC, popularity_score DESC LIMIT $3`,
+            [types, windowDays, limit]
+          );
     return (rows as unknown as CatalogDBRow[]).map(catalogRowToMediaItem);
   } catch {
     return [];
@@ -270,7 +349,8 @@ export async function getCatalogItem(id: string): Promise<MediaItem | null> {
     const rows = await sql`SELECT * FROM catalog_items WHERE id = ${id}`;
     const row = (rows as unknown as CatalogDBRow[])[0];
     return row ? catalogRowToMediaItem(row) : null;
-  } catch {
+  } catch (err) {
+    console.error(`getCatalogItem(${id}) failed:`, err);
     return null;
   }
 }

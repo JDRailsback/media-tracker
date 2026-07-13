@@ -87,6 +87,7 @@ interface TMDBMovie {
   release_date?: string;
   popularity?: number;
   vote_count?: number;
+  original_language?: string; // ISO 639-1 ("ja", "ko", "en", ...) — free on every response
 }
 
 // `lenient` (used only by franchise resolution — lib/sources/franchise.ts)
@@ -101,7 +102,7 @@ export async function searchTMDBMovie(
   opts?: { lenient?: boolean }
 ): Promise<RankedItem[]> {
   const url = `https://api.themoviedb.org/3/search/movie?api_key=${key()}&query=${encodeURIComponent(query)}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`TMDB movie search failed: ${res.status}`);
   const data = await res.json();
   return (data.results as TMDBMovie[])
@@ -144,7 +145,7 @@ function mapMovie(m: TMDBMovie): MediaItem {
 
 export async function detailsTMDBMovie(id: string): Promise<MediaItem> {
   const url = `https://api.themoviedb.org/3/movie/${id}?api_key=${key()}&append_to_response=watch/providers`;
-  const res = await fetch(url);
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`TMDB movie details failed: ${res.status}`);
   const d = await res.json();
   const base = mapMovie(d as TMDBMovie);
@@ -156,7 +157,7 @@ export async function detailsTMDBMovie(id: string): Promise<MediaItem> {
 // Popular movies (for the Discover page's "Trending movies" shelf).
 export async function discoverTMDBMovies(limit = 20): Promise<MediaItem[]> {
   const url = `https://api.themoviedb.org/3/discover/movie?api_key=${key()}&sort_by=popularity.desc&vote_count.gte=100`;
-  const res = await fetch(url);
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`TMDB discover movies failed: ${res.status}`);
   const data = await res.json();
   return (data.results as TMDBMovie[]).slice(0, limit).map(mapMovie);
@@ -174,30 +175,114 @@ export async function discoverTMDBMovies(limit = 20): Promise<MediaItem[]> {
 // Both filtered to release_date empty OR in the future — never something
 // already out.
 //
-// Quality floor: an UNRELEASED title has near-zero vote_count by definition,
-// so the only meaningful signal is TMDB's live `popularity` metric (search/
-// view activity). Anything below the floor is direct-to-video filler that
-// merely has a future date — being "upcoming" alone doesn't earn a slot.
-// The same metric is stored as popularityScore (vote_count, used by the
-// catalog, would make every unreleased row score ~0 and turn the
-// undated-slot ordering in lib/upcoming.ts into a coin flip).
-const UPCOMING_MIN_POPULARITY = 15;
+// popularity is deliberately NOT an admission gate here anymore — a real,
+// officially-confirmed title years out with low current buzz (that's
+// exactly what "low current buzz" means for something not releasing soon)
+// was being excluded by a popularity floor, which is backwards: popularity
+// is a snapshot of CURRENT attention, not a measure of whether a project is
+// real. Admission is gated entirely on the official-status check below;
+// popularity is stored (popularityScore) purely so read-time consumers that
+// specifically want "the popular ones" (the Discover shelf, via
+// upcomingTop's pool-then-sort — see lib/upcoming.ts) can select for it,
+// without the underlying pool itself being popularity-filtered. This is
+// also what makes "just announced" (upcomingNewest) meaningful: a real
+// title no longer drops in and out of the table as its day-to-day
+// popularity crosses a threshold, so first_seen_at stops churning.
 
-export async function discoverTMDBUpcomingMovies(limit = 60): Promise<UpcomingRow[]> {
+// Real gate on "officially confirmed, not speculative": TMDB tags every
+// movie/show with a status. "Rumored" is exactly the fan-leak/speculation
+// case a popularity signal can't catch (a rumored sequel can easily be
+// plenty "popular"); "Canceled" is dead regardless of popularity. Every
+// other status (Planned, In Production, Post Production, Returning Series,
+// ...) counts as a real studio project. Not present on discover/trending
+// list responses — only the full details endpoint has it, so this costs one
+// extra lightweight request per candidate (deliberately NOT the expensive
+// movieExtra/tvExtra enrichment — no watch-providers/keywords/per-season
+// fetch, just the bare status field). Concurrency raised from the earlier
+// popularity-gated version — the candidate pool is much bigger now that
+// popularity no longer thins it out before this step.
+// A live run against the full (no-longer-popularity-gated) candidate pool
+// measured 57.8s total cron time at concurrency 30 — uncomfortably close to
+// Vercel's 60s function limit, one slow TMDB response from timing out in
+// production. TMDB's documented rate ceiling is ~50 req/s per key; raised
+// toward that instead of shrinking the candidate pool back down.
+const OFFICIAL_STATUS_CONCURRENCY = 50;
+const NON_OFFICIAL_STATUS = new Set(["Rumored", "Canceled"]);
+
+async function fetchStatus(kind: "movie" | "tv", id: number): Promise<string | undefined> {
+  try {
+    return await withRetries(async () => {
+      const res = await fetch(`https://api.themoviedb.org/3/${kind}/${id}?api_key=${key()}`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`TMDB ${kind} status (${id}) failed: ${res.status}`);
+      const d = await res.json();
+      return d.status as string | undefined;
+    });
+  } catch {
+    // Unknown status on a persistent failure — don't let one flaky request
+    // silently exclude an otherwise-legitimate title.
+    return undefined;
+  }
+}
+
+async function filterOfficialOnly<T extends { id: string }>(
+  kind: "movie" | "tv",
+  rows: T[]
+): Promise<T[]> {
+  const statuses = await mapWithConcurrency(rows, OFFICIAL_STATUS_CONCURRENCY, (row) =>
+    fetchStatus(kind, Number(row.id.split(":")[1]))
+  );
+  return rows.filter((_, i) => !NON_OFFICIAL_STATUS.has(statuses[i] ?? ""));
+}
+
+// TMDB discover pagination — 20 results/page. Fetches page 1 first to learn
+// the REAL total_pages (TMDB's own count), then fetches the rest
+// concurrently up to `maxPages` — covers the actual full result set without
+// either guessing a fixed depth (wasting requests on pages past the real
+// end) or under-fetching (missing real candidates because a limit was tied
+// to the display count rather than what's actually out there). "Vast" means
+// this should cover TMDB's whole dated-upcoming catalog, not a slice of it —
+// verified live, TMDB's own totals for confirmed-future titles are modest
+// (low thousands for movies, low hundreds for TV), well within reach.
+const DISCOVER_PAGE_CONCURRENCY = 15;
+
+async function discoverPages<T>(url: (page: number) => string, maxPages: number): Promise<T[]> {
+  const firstRes = await fetch(url(1), { cache: "no-store" });
+  if (!firstRes.ok) throw new Error(`TMDB discover (page 1) failed: ${firstRes.status}`);
+  const firstData = await firstRes.json();
+  const results: T[] = (firstData.results ?? []) as T[];
+  const totalPages = Math.min(firstData.total_pages ?? 1, maxPages);
+  if (totalPages <= 1) return results;
+
+  const remainingPages = Array.from({ length: totalPages - 1 }, (_, i) => i + 2);
+  const rest = await mapWithConcurrency(remainingPages, DISCOVER_PAGE_CONCURRENCY, async (page) => {
+    const res = await fetch(url(page), { cache: "no-store" });
+    if (!res.ok) throw new Error(`TMDB discover (page ${page}) failed: ${res.status}`);
+    const data = await res.json();
+    return (data.results ?? []) as T[];
+  });
+  return [...results, ...rest.flat()];
+}
+
+// Deliberately high — TMDB's real total for confirmed-future movies is a
+// couple thousand; this covers all of it rather than an arbitrary slice.
+const UPCOMING_MOVIE_MAX_PAGES = 200;
+
+export async function discoverTMDBUpcomingMovies(limit = 4000): Promise<UpcomingRow[]> {
   const today = new Date().toISOString().slice(0, 10);
-  const [datedRes, trendingRes] = await Promise.all([
-    fetch(`https://api.themoviedb.org/3/discover/movie?api_key=${key()}&sort_by=popularity.desc&primary_release_date.gte=${today}`),
-    fetch(`https://api.themoviedb.org/3/trending/movie/week?api_key=${key()}`),
+  const genreMap = await tmdbGenreMap("movie");
+  const [dated, trending] = await Promise.all([
+    discoverPages<TMDBDiscoverMovie>(
+      (page) =>
+        `https://api.themoviedb.org/3/discover/movie?api_key=${key()}&sort_by=popularity.desc&primary_release_date.gte=${today}&page=${page}`,
+      UPCOMING_MOVIE_MAX_PAGES
+    ),
+    discoverPages<TMDBDiscoverMovie>((page) => `https://api.themoviedb.org/3/trending/movie/week?api_key=${key()}&page=${page}`, 5),
   ]);
-  if (!datedRes.ok) throw new Error(`TMDB discover upcoming movies failed: ${datedRes.status}`);
-  if (!trendingRes.ok) throw new Error(`TMDB trending movies failed: ${trendingRes.status}`);
-  const dated = (await datedRes.json()).results as TMDBMovie[];
-  const trending = (await trendingRes.json()).results as TMDBMovie[];
+  const genresOf = (m: TMDBDiscoverMovie) => (m.genre_ids ?? []).map((id) => genreMap.get(id)).filter((n): n is string => !!n);
 
   const rows = new Map<string, UpcomingRow>();
   for (const m of dated) {
     if (!m.poster_path || !m.release_date) continue;
-    if ((m.popularity ?? 0) < UPCOMING_MIN_POPULARITY) continue;
     rows.set(`movie:${m.id}`, {
       id: `movie:${m.id}`,
       type: "movie",
@@ -207,13 +292,14 @@ export async function discoverTMDBUpcomingMovies(limit = 60): Promise<UpcomingRo
       releaseDate: m.release_date,
       dateConfirmed: true,
       popularityScore: Math.round(m.popularity ?? 0),
+      genres: genresOf(m),
+      originalLanguage: m.original_language,
     });
   }
   for (const m of trending) {
     const id = `movie:${m.id}`;
     const unreleased = !m.release_date || m.release_date > today;
     if (!m.poster_path || !unreleased || rows.has(id)) continue;
-    if ((m.popularity ?? 0) < UPCOMING_MIN_POPULARITY) continue;
     rows.set(id, {
       id,
       type: "movie",
@@ -223,9 +309,12 @@ export async function discoverTMDBUpcomingMovies(limit = 60): Promise<UpcomingRo
       releaseDate: m.release_date && m.release_date > today ? m.release_date : undefined,
       dateConfirmed: !!(m.release_date && m.release_date > today),
       popularityScore: Math.round(m.popularity ?? 0),
+      genres: genresOf(m),
+      originalLanguage: m.original_language,
     });
   }
-  return [...rows.values()].slice(0, limit);
+  const official = await filterOfficialOnly("movie", [...rows.values()]);
+  return official.slice(0, limit);
 }
 
 // ---------- TV shows ----------
@@ -239,6 +328,7 @@ interface TMDBShow {
   status?: string; // "Returning Series", "Ended", "Canceled", ...
   popularity?: number;
   vote_count?: number;
+  original_language?: string; // ISO 639-1 ("ja", "ko", "en", ...) — free on every response
   number_of_episodes?: number;
   seasons?: { season_number: number; episode_count: number }[];
   next_episode_to_air?: {
@@ -254,7 +344,7 @@ export async function searchTMDBTV(
   opts?: { lenient?: boolean }
 ): Promise<RankedItem[]> {
   const url = `https://api.themoviedb.org/3/search/tv?api_key=${key()}&query=${encodeURIComponent(query)}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`TMDB TV search failed: ${res.status}`);
   const data = await res.json();
   return (data.results as TMDBShow[])
@@ -309,7 +399,8 @@ async function allEpisodes(
   const results = await Promise.allSettled(
     seasons.map((s) =>
       fetch(
-        `https://api.themoviedb.org/3/tv/${id}/season/${s.season_number}?api_key=${key()}`
+        `https://api.themoviedb.org/3/tv/${id}/season/${s.season_number}?api_key=${key()}`,
+        { cache: "no-store" }
       ).then((r) => (r.ok ? r.json() : null))
     )
   );
@@ -332,7 +423,7 @@ async function allEpisodes(
 
 export async function detailsTMDBTV(id: string): Promise<MediaItem> {
   const url = `https://api.themoviedb.org/3/tv/${id}?api_key=${key()}&append_to_response=watch/providers`;
-  const res = await fetch(url);
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`TMDB TV details failed: ${res.status}`);
   const d = await res.json();
   const base = mapShow(d as TMDBShow);
@@ -345,7 +436,7 @@ export async function detailsTMDBTV(id: string): Promise<MediaItem> {
 // Popular TV shows (for the Discover page's "Trending TV" shelf).
 export async function discoverTMDBTV(limit = 20): Promise<MediaItem[]> {
   const url = `https://api.themoviedb.org/3/discover/tv?api_key=${key()}&sort_by=popularity.desc&vote_count.gte=100`;
-  const res = await fetch(url);
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`TMDB discover TV failed: ${res.status}`);
   const data = await res.json();
   return (data.results as TMDBShow[]).slice(0, limit).map((s) => ({
@@ -365,25 +456,31 @@ export async function discoverTMDBTV(limit = 20): Promise<MediaItem[]> {
 // News 10763, Reality 10764, Soap 10766, Talk 10767.
 const TV_JUNK_GENRES = "10763,10764,10766,10767";
 
+// Deliberately high — TMDB's real total for confirmed-future TV is only a
+// few hundred (verified live), so this comfortably covers all of it.
+const UPCOMING_TV_MAX_PAGES = 50;
+
 // Big and/or brand-new upcoming shows, DATED OR NOT — same merged
-// dated+trending strategy and popularity floor as discoverTMDBUpcomingMovies
-// above (an unaired show has no vote_count, so `popularity` is the signal
-// and the stored score).
-export async function discoverTMDBUpcomingTV(limit = 60): Promise<UpcomingRow[]> {
+// dated+trending strategy as discoverTMDBUpcomingMovies above. No popularity
+// admission gate (see the comment on that removal above filterOfficialOnly)
+// — junk-genre exclusion (TV_JUNK_GENRES) plus the official-status check are
+// what keep this clean now, not a popularity threshold.
+export async function discoverTMDBUpcomingTV(limit = 1000): Promise<UpcomingRow[]> {
   const today = new Date().toISOString().slice(0, 10);
-  const [datedRes, trendingRes] = await Promise.all([
-    fetch(`https://api.themoviedb.org/3/discover/tv?api_key=${key()}&sort_by=popularity.desc&first_air_date.gte=${today}&without_genres=${TV_JUNK_GENRES}`),
-    fetch(`https://api.themoviedb.org/3/trending/tv/week?api_key=${key()}`),
+  const genreMap = await tmdbGenreMap("tv");
+  const [dated, trending] = await Promise.all([
+    discoverPages<TMDBDiscoverShow>(
+      (page) =>
+        `https://api.themoviedb.org/3/discover/tv?api_key=${key()}&sort_by=popularity.desc&first_air_date.gte=${today}&without_genres=${TV_JUNK_GENRES}&page=${page}`,
+      UPCOMING_TV_MAX_PAGES
+    ),
+    discoverPages<TMDBDiscoverShow>((page) => `https://api.themoviedb.org/3/trending/tv/week?api_key=${key()}&page=${page}`, 5),
   ]);
-  if (!datedRes.ok) throw new Error(`TMDB discover upcoming TV failed: ${datedRes.status}`);
-  if (!trendingRes.ok) throw new Error(`TMDB trending TV failed: ${trendingRes.status}`);
-  const dated = (await datedRes.json()).results as TMDBShow[];
-  const trending = (await trendingRes.json()).results as TMDBShow[];
+  const genresOf = (s: TMDBDiscoverShow) => (s.genre_ids ?? []).map((id) => genreMap.get(id)).filter((n): n is string => !!n);
 
   const rows = new Map<string, UpcomingRow>();
   for (const s of dated) {
     if (!s.poster_path || !s.first_air_date) continue;
-    if ((s.popularity ?? 0) < UPCOMING_MIN_POPULARITY) continue;
     rows.set(`tvShow:${s.id}`, {
       id: `tvShow:${s.id}`,
       type: "tvShow",
@@ -393,13 +490,14 @@ export async function discoverTMDBUpcomingTV(limit = 60): Promise<UpcomingRow[]>
       releaseDate: s.first_air_date,
       dateConfirmed: true,
       popularityScore: Math.round(s.popularity ?? 0),
+      genres: genresOf(s),
+      originalLanguage: s.original_language,
     });
   }
   for (const s of trending) {
     const id = `tvShow:${s.id}`;
     const unreleased = !s.first_air_date || s.first_air_date > today;
     if (!s.poster_path || !unreleased || rows.has(id)) continue;
-    if ((s.popularity ?? 0) < UPCOMING_MIN_POPULARITY) continue;
     rows.set(id, {
       id,
       type: "tvShow",
@@ -409,9 +507,12 @@ export async function discoverTMDBUpcomingTV(limit = 60): Promise<UpcomingRow[]>
       releaseDate: s.first_air_date && s.first_air_date > today ? s.first_air_date : undefined,
       dateConfirmed: !!(s.first_air_date && s.first_air_date > today),
       popularityScore: Math.round(s.popularity ?? 0),
+      genres: genresOf(s),
+      originalLanguage: s.original_language,
     });
   }
-  return [...rows.values()].slice(0, limit);
+  const official = await filterOfficialOnly("tv", [...rows.values()]);
+  return official.slice(0, limit);
 }
 
 // ---------- Bulk catalog ingestion (scripts/ingest-catalog.ts only) ----------
@@ -426,7 +527,7 @@ const TMDB_MAX_PAGE = 500;
 // page (TMDB has no per-item genre-name field, only numeric `genre_ids`).
 export async function tmdbGenreMap(kind: "movie" | "tv"): Promise<Map<number, string>> {
   const url = `https://api.themoviedb.org/3/genre/${kind}/list?api_key=${key()}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`TMDB genre list failed: ${res.status}`);
   const data = await res.json();
   const map = new Map<number, string>();
@@ -517,7 +618,7 @@ async function movieExtra(
   try {
     return await withRetries(async () => {
       const url = `https://api.themoviedb.org/3/movie/${id}?api_key=${key()}&append_to_response=watch/providers,keywords`;
-      const res = await fetch(url);
+      const res = await fetch(url, { cache: "no-store" });
       if (!res.ok) throw new Error(`TMDB movie details (${id}) failed: ${res.status}`);
       const d = await res.json();
       return {
@@ -542,7 +643,7 @@ export async function paginatedTMDBMovies(
   const rows: CatalogRow[] = [];
   for (let page = 1; page <= TMDB_MAX_PAGE && rows.length < targetCount; page++) {
     const url = `https://api.themoviedb.org/3/discover/movie?api_key=${key()}&sort_by=vote_count.desc&page=${page}`;
-    const res = await fetch(url);
+    const res = await fetch(url, { cache: "no-store" });
     if (!res.ok) throw new Error(`TMDB discover movies (page ${page}) failed: ${res.status}`);
     const data = await res.json();
     const results = data.results as TMDBDiscoverMovie[];
@@ -558,6 +659,7 @@ export async function paginatedTMDBMovies(
         releaseDate: m.release_date || undefined,
         popularityScore: m.vote_count ?? 0,
         genres: (m.genre_ids ?? []).map((id) => genres.get(id)).filter((n): n is string => !!n),
+        originalLanguage: m.original_language,
       });
     }
     onPage?.(rows.length);
@@ -647,11 +749,19 @@ async function tvExtra(
   seasons: CatalogSeason[];
   externalLinks: ExternalLink[];
   tags: string[];
+  // TMDB's OWN "the next episode scheduled to air" field — a direct signal,
+  // separate from (and sometimes populated when) the full per-season
+  // episode list isn't. Verified live it's frequently null for a show
+  // between seasons (a genuine TMDB data gap, not something either signal
+  // can recover), but when TMDB does know a next episode, this is the more
+  // authoritative source — used as a fallback in catalogRowToMediaItem
+  // when scanning the season list doesn't turn one up.
+  nextEpisodeToAir?: { season: number; episode: number; airDate: string };
 }> {
   try {
     return await withRetries(async () => {
       const url = `https://api.themoviedb.org/3/tv/${id}?api_key=${key()}&append_to_response=watch/providers,keywords`;
-      const res = await fetch(url);
+      const res = await fetch(url, { cache: "no-store" });
       if (!res.ok) throw new Error(`TMDB show details (${id}) failed: ${res.status}`);
       const d = (await res.json()) as TMDBShowDetails & {
         "watch/providers"?: { results?: Record<string, unknown> };
@@ -664,7 +774,8 @@ async function tvExtra(
       const seasons = await mapWithConcurrency(seasonSummaries, SEASON_CONCURRENCY, async (s) => {
         try {
           const seasonRes = await fetch(
-            `https://api.themoviedb.org/3/tv/${id}/season/${s.season_number}?api_key=${key()}`
+            `https://api.themoviedb.org/3/tv/${id}/season/${s.season_number}?api_key=${key()}`,
+            { cache: "no-store" }
           );
           if (!seasonRes.ok) return { seasonNumber: s.season_number, name: s.name, episodes: [] };
           const seasonData = await seasonRes.json();
@@ -690,6 +801,13 @@ async function tvExtra(
           title
         ),
         tags: tvTags(d),
+        nextEpisodeToAir: d.next_episode_to_air
+          ? {
+              season: d.next_episode_to_air.season_number,
+              episode: d.next_episode_to_air.episode_number,
+              airDate: d.next_episode_to_air.air_date,
+            }
+          : undefined,
       };
     });
   } catch {
@@ -708,7 +826,7 @@ export async function paginatedTMDBTV(
   const rows: CatalogRow[] = [];
   for (let page = 1; page <= TMDB_MAX_PAGE && rows.length < targetCount; page++) {
     const url = `https://api.themoviedb.org/3/discover/tv?api_key=${key()}&sort_by=vote_count.desc&page=${page}`;
-    const res = await fetch(url);
+    const res = await fetch(url, { cache: "no-store" });
     if (!res.ok) throw new Error(`TMDB discover TV (page ${page}) failed: ${res.status}`);
     const data = await res.json();
     const results = data.results as TMDBDiscoverShow[];
@@ -724,6 +842,7 @@ export async function paginatedTMDBTV(
         releaseDate: s.first_air_date || undefined,
         popularityScore: s.vote_count ?? 0,
         genres: (s.genre_ids ?? []).map((id) => genres.get(id)).filter((n): n is string => !!n),
+        originalLanguage: s.original_language,
       });
     }
     onPage?.(rows.length);
@@ -746,6 +865,7 @@ async function enrichTVRows(rows: CatalogRow[], onEnrich?: (done: number, total:
       numberOfSeasons: extra.numberOfSeasons,
       numberOfEpisodes: extra.numberOfEpisodes,
       seasons: extra.seasons,
+      nextEpisodeToAir: extra.nextEpisodeToAir,
     };
     row.externalLinks = extra.externalLinks;
     row.tags = extra.tags;
@@ -763,85 +883,121 @@ async function enrichTVRows(rows: CatalogRow[], onEnrich?: (done: number, total:
 // into catalog_items. Re-running daily over the whole window means a fresh
 // title's score/poster/metadata self-correct every day for a month.
 //
-// Quality floor: same TMDB `popularity` floor as the upcoming fetchers — a
-// month of releases is mostly direct-to-video/regional filler, and "released
-// recently" alone doesn't earn a catalog slot. The floor is checked
+// Quality floors, per-medium scale (see the TV-popularity-scale lesson at
+// discoverTMDBUpcomingTV — TMDB's `popularity` runs far lower for TV than
+// movies): a month of releases is mostly direct-to-video/regional filler,
+// and "released recently" alone doesn't earn a catalog slot. Checked
 // client-side (discover can only sort by popularity, not filter on it).
 const RECENT_WINDOW_DAYS = 30;
-const RECENT_MIN_POPULARITY = 15;
+const RECENT_MOVIE_MIN_POPULARITY = 8; // aligned with the upcoming-movie floor the user approved
+const RECENT_TV_MIN_POPULARITY = 3;
+
+// How far back a show's PREMIERE can be and still get swept into the
+// catalog by the daily premieres slice below (wider than the airing window
+// so a niche show that premiered ~6 weeks ago isn't stranded forever).
+const PREMIERE_WINDOW_DAYS = 45;
 
 function daysAgoISO(days: number): string {
   return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }
 
-export async function discoverTMDBRecentMovies(limit = 60): Promise<CatalogRow[]> {
+export async function discoverTMDBRecentMovies(limit = 100): Promise<CatalogRow[]> {
   const genres = await tmdbGenreMap("movie");
   const today = new Date().toISOString().slice(0, 10);
   const since = daysAgoISO(RECENT_WINDOW_DAYS);
+  const results = await discoverPages<TMDBDiscoverMovie>(
+    (page) =>
+      `https://api.themoviedb.org/3/discover/movie?api_key=${key()}&sort_by=popularity.desc&primary_release_date.gte=${since}&primary_release_date.lte=${today}&page=${page}`,
+    Math.ceil(limit / 20) + 2 // small margin: floor/poster culls below eat into raw pages
+  );
   const rows: CatalogRow[] = [];
-  const pages = Math.ceil(limit / 20);
-  for (let page = 1; page <= pages; page++) {
-    const url = `https://api.themoviedb.org/3/discover/movie?api_key=${key()}&sort_by=popularity.desc&primary_release_date.gte=${since}&primary_release_date.lte=${today}&page=${page}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`TMDB discover recent movies (page ${page}) failed: ${res.status}`);
-    const results = (await res.json()).results as TMDBDiscoverMovie[];
-    if (!results || results.length === 0) break;
-    for (const m of results) {
-      if (!m.poster_path) continue;
-      if ((m.popularity ?? 0) < RECENT_MIN_POPULARITY) continue;
-      rows.push({
-        id: `movie:${m.id}`,
-        type: "movie",
-        title: m.title,
-        overview: m.overview || undefined,
-        posterURL: `${IMAGE_BASE}${m.poster_path}`,
-        releaseDate: m.release_date || undefined,
-        popularityScore: m.vote_count ?? 0,
-        genres: (m.genre_ids ?? []).map((id) => genres.get(id)).filter((n): n is string => !!n),
-      });
-    }
+  for (const m of results) {
+    if (!m.poster_path) continue;
+    if ((m.popularity ?? 0) < RECENT_MOVIE_MIN_POPULARITY) continue;
+    rows.push({
+      id: `movie:${m.id}`,
+      type: "movie",
+      title: m.title,
+      overview: m.overview || undefined,
+      posterURL: `${IMAGE_BASE}${m.poster_path}`,
+      releaseDate: m.release_date || undefined,
+      popularityScore: m.vote_count ?? 0,
+      genres: (m.genre_ids ?? []).map((id) => genres.get(id)).filter((n): n is string => !!n),
+      originalLanguage: m.original_language,
+    });
   }
   const capped = [...new Map(rows.map((r) => [r.id, r])).values()].slice(0, limit);
   await enrichMovieRows(capped);
   return capped;
 }
 
-// air_date (any episode aired in the window), NOT first_air_date — so a
-// returning season of an existing show refreshes that show's episode data
-// too, not just brand-new series. Capped low relative to movies because
-// tvExtra costs one request per season. Junk genres (soap/talk/reality/news
-// — see TV_JUNK_GENRES) excluded at the API level, popularity floor on top:
-// daily programming otherwise owns the "aired recently" window outright.
-export async function discoverTMDBRecentTV(limit = 30): Promise<CatalogRow[]> {
+// Two merged slices, different jobs:
+//  (a) AIRING — air_date (any episode aired in the window), NOT
+//      first_air_date: keeps episode data fresh for ongoing/returning shows
+//      already worth carrying, top-N by popularity. This is what updates
+//      House of the Dragon's next-episode date every week.
+//  (b) PREMIERES — first_air_date in the last PREMIERE_WINDOW_DAYS, ALL
+//      pages: a brand-new show is by definition absent from the vote_count-
+//      sorted bulk catalog AND from upcoming_items (it already premiered),
+//      so this slice is its ONLY route into the system. Verified live: "THE
+//      GHOST IN THE SHELL" (premiered 2026-07-07, next episode already
+//      scheduled) sat outside the old top-30-by-popularity fetch among
+//      1,874 shows airing that month, and was therefore findable nowhere in
+//      the app. Popularity decides slice (a)'s ranking, but for (b) it's
+//      only a junk floor — being NEW is the admission criterion.
+// Junk genres (soap/talk/reality/news — see TV_JUNK_GENRES) excluded at the
+// API level in both slices; daily programming otherwise owns the "aired
+// recently" window outright. tvExtra is one request PER SEASON, so slice
+// sizes are the cron's main TV cost — premieres are cheap (a new show has
+// one season), the airing slice carries the multi-season heavyweights.
+const RECENT_TV_AIRING_LIMIT = 80;
+const RECENT_TV_PREMIERE_LIMIT = 150;
+
+export async function discoverTMDBRecentTV(): Promise<CatalogRow[]> {
   const genres = await tmdbGenreMap("tv");
   const today = new Date().toISOString().slice(0, 10);
-  const since = daysAgoISO(RECENT_WINDOW_DAYS);
-  const rows: CatalogRow[] = [];
-  const pages = Math.ceil(limit / 20);
-  for (let page = 1; page <= pages; page++) {
-    const url = `https://api.themoviedb.org/3/discover/tv?api_key=${key()}&sort_by=popularity.desc&air_date.gte=${since}&air_date.lte=${today}&without_genres=${TV_JUNK_GENRES}&page=${page}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`TMDB discover recent TV (page ${page}) failed: ${res.status}`);
-    const results = (await res.json()).results as TMDBDiscoverShow[];
-    if (!results || results.length === 0) break;
-    for (const s of results) {
-      if (!s.poster_path) continue;
-      if ((s.popularity ?? 0) < RECENT_MIN_POPULARITY) continue;
-      rows.push({
-        id: `tvShow:${s.id}`,
-        type: "tvShow",
-        title: s.name,
-        overview: s.overview || undefined,
-        posterURL: `${IMAGE_BASE}${s.poster_path}`,
-        releaseDate: s.first_air_date || undefined,
-        popularityScore: s.vote_count ?? 0,
-        genres: (s.genre_ids ?? []).map((id) => genres.get(id)).filter((n): n is string => !!n),
-      });
-    }
+  const airingSince = daysAgoISO(RECENT_WINDOW_DAYS);
+  const premiereSince = daysAgoISO(PREMIERE_WINDOW_DAYS);
+
+  const [airing, premieres] = await Promise.all([
+    discoverPages<TMDBDiscoverShow>(
+      (page) =>
+        `https://api.themoviedb.org/3/discover/tv?api_key=${key()}&sort_by=popularity.desc&air_date.gte=${airingSince}&air_date.lte=${today}&without_genres=${TV_JUNK_GENRES}&page=${page}`,
+      Math.ceil(RECENT_TV_AIRING_LIMIT / 20) + 2
+    ),
+    discoverPages<TMDBDiscoverShow>(
+      (page) =>
+        `https://api.themoviedb.org/3/discover/tv?api_key=${key()}&sort_by=popularity.desc&first_air_date.gte=${premiereSince}&first_air_date.lte=${today}&without_genres=${TV_JUNK_GENRES}&page=${page}`,
+      50 // effectively "all pages" — real premiere counts are a few hundred, discoverPages stops at TMDB's actual total
+    ),
+  ]);
+
+  const toRow = (s: TMDBDiscoverShow): CatalogRow => ({
+    id: `tvShow:${s.id}`,
+    type: "tvShow",
+    title: s.name,
+    overview: s.overview || undefined,
+    posterURL: `${IMAGE_BASE}${s.poster_path}`,
+    releaseDate: s.first_air_date || undefined,
+    popularityScore: s.vote_count ?? 0,
+    genres: (s.genre_ids ?? []).map((id) => genres.get(id)).filter((n): n is string => !!n),
+    originalLanguage: s.original_language,
+  });
+
+  const qualifies = (s: TMDBDiscoverShow) =>
+    !!s.poster_path && (s.popularity ?? 0) >= RECENT_TV_MIN_POPULARITY;
+
+  const rows = new Map<string, CatalogRow>();
+  for (const s of airing.filter(qualifies).slice(0, RECENT_TV_AIRING_LIMIT)) {
+    rows.set(`tvShow:${s.id}`, toRow(s));
   }
-  const capped = [...new Map(rows.map((r) => [r.id, r])).values()].slice(0, limit);
-  await enrichTVRows(capped);
-  return capped;
+  for (const s of premieres.filter(qualifies).slice(0, RECENT_TV_PREMIERE_LIMIT)) {
+    if (!rows.has(`tvShow:${s.id}`)) rows.set(`tvShow:${s.id}`, toRow(s));
+  }
+
+  const all = [...rows.values()];
+  await enrichTVRows(all);
+  return all;
 }
 
 // ---------- Franchise movie parts (TMDB "collections") ----------
@@ -878,7 +1034,7 @@ interface TMDBCollectionPart {
 // would otherwise cut.
 export async function tmdbCollectionParts(id: number): Promise<RankedItem[]> {
   const url = `https://api.themoviedb.org/3/collection/${id}?api_key=${key()}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`TMDB collection details failed: ${res.status}`);
   const data = await res.json();
   const parts = (data.parts ?? []) as TMDBCollectionPart[];

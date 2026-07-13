@@ -1,5 +1,7 @@
 import type { MediaItem, MediaType } from "@/lib/types";
 import { db, ensureSchema } from "@/lib/db";
+import { excludeHiddenSQL, type ContentCategory } from "@/lib/contentFilters";
+import { buildPrefixQuery } from "@/lib/catalog";
 
 // Row shape produced by the upcoming-releases fetchers (tmdb.ts/igdb.ts) and
 // stored in upcoming_items (see lib/db.ts's ensureSchema). Distinct from
@@ -15,6 +17,17 @@ export interface UpcomingRow {
   releaseDate?: string; // ISO date — only ever set when dateConfirmed is true
   dateConfirmed: boolean;
   popularityScore: number;
+  // A REAL "when was this actually announced" signal, when the source
+  // exposes one — currently only IGDB's own `created_at` for games (see
+  // discoverIGDBUpcoming). When omitted, first_seen_at falls back to "the
+  // first time OUR tracker saw this row" (see upsertUpcoming), which is a
+  // weaker proxy — TMDB's discover/trending responses don't expose a real
+  // announcement timestamp at all.
+  announcedAt?: string;
+  // Content-filter signals (see lib/contentFilters.ts) — same fields as
+  // CatalogRow's, movie/TV/game only (manga never appears in upcoming_items).
+  genres?: string[];
+  originalLanguage?: string;
 }
 
 interface UpcomingDBRow {
@@ -25,6 +38,7 @@ interface UpcomingDBRow {
   poster_url: string | null;
   release_date: string | Date | null;
   date_confirmed: boolean;
+  popularity_score: number;
 }
 
 function toISODate(value: string | Date | null): string | undefined {
@@ -43,34 +57,122 @@ function rowToMediaItem(row: UpcomingDBRow): MediaItem {
   };
 }
 
-// Confirmed-dated items first (soonest first — matches the old live shelf's
-// ordering), but with a RESERVED quarter of the slots for undated-but-big
-// titles (sorted by popularity/hype) — a plain "dated first, undated only if
-// room's left" ordering starves them out entirely in practice: there are
-// consistently more confirmed-dated entries than any reasonable limit, so
-// undated blockbusters (a sequel with no date yet, years out) would never
-// actually surface. Two queries unioned rather than one, so the undated
-// slice is guaranteed rather than incidental. Degrades to [] on a DB error.
-export async function upcomingTop(types: string[], limit = 16): Promise<MediaItem[]> {
+// Single-row lookup, the upcoming_items counterpart of getCatalogItem —
+// used by details() (lib/sources/index.ts) as a fallback when an id isn't
+// in catalog_items. A followed UPCOMING title (GTA VI, an unreleased movie)
+// lives only in this table until it releases and graduates to the catalog;
+// without this lookup, following one worked but every later resolution of
+// it (Home feed refresh, detail modal, poll notifications) 404'd — verified
+// live, exactly why followed movies/games vanished from the Home page.
+export async function getUpcomingItem(id: string): Promise<MediaItem | null> {
   try {
     await ensureSchema();
     const sql = db();
+    const rows = (await sql`SELECT * FROM upcoming_items WHERE id = ${id}`) as unknown as UpcomingDBRow[];
+    return rows[0] ? rowToMediaItem(rows[0]) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Search previously only covered catalog_items (already-released titles) —
+// an upcoming/announced title (Avengers: Doomsday, GTA VI, ...) was
+// unfindable through the search bar no matter how big it was, only
+// reachable via the Discover shelves. upcoming_items already has its own
+// generated search_vector (see lib/db.ts), so this is the same word-prefix
+// full-text pattern searchCatalog uses, just against the other table.
+// Deliberately no popularity gate — "vast" per the user's directive; a
+// search should find a real, officially-confirmed title regardless of how
+// much current buzz it has.
+export async function searchUpcoming(
+  query: string,
+  types: string[] = ["movie", "tvShow", "game"],
+  limit = 20,
+  hidden: ContentCategory[] = []
+): Promise<MediaItem[]> {
+  const tsq = buildPrefixQuery(query);
+  if (!tsq) return [];
+  try {
+    await ensureSchema();
+    const sql = db();
+    const filterSQL = excludeHiddenSQL(hidden);
+    const rows = (
+      hidden.length === 0
+        ? await sql`
+            SELECT * FROM upcoming_items
+            WHERE type = ANY(${types}) AND search_vector @@ to_tsquery('english', ${tsq})
+            ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsq})) DESC, popularity_score DESC
+            LIMIT ${limit}
+          `
+        : await sql(
+            `SELECT * FROM upcoming_items WHERE type = ANY($1) AND search_vector @@ to_tsquery('english', $2) ${filterSQL}
+             ORDER BY ts_rank(search_vector, to_tsquery('english', $2)) DESC, popularity_score DESC LIMIT $3`,
+            [types, tsq, limit]
+          )
+    ) as unknown as UpcomingDBRow[];
+    return rows.map(rowToMediaItem);
+  } catch {
+    return [];
+  }
+}
+
+// "Popular upcoming" — popularity decides WHICH titles qualify, release date
+// decides the ORDER they're shown in. Two different jobs: selection and
+// display. Earlier versions conflated them (either sorted the whole list by
+// popularity — GTA VI first regardless of it releasing months out — or
+// sorted the whole list by date — a low-buzz title releasing next week
+// buried GTA VI). Neither is what "Popular upcoming" should mean: it's a
+// radar of the BIG stuff, in the order it's actually arriving. So: pull a
+// pool of the most popular dated titles (POOL_MULTIPLIER larger than the
+// display limit, so the date-sort has real candidates to work with, not
+// just the single most-popular item), then sort THAT pool chronologically.
+// Undated-but-big titles get a reserved slice (no date to sort by, so they
+// stay popularity-ordered) appended after the dated ones — guaranteed
+// visibility without disrupting the calendar ordering of what has a date.
+const POOL_MULTIPLIER = 5;
+const MIN_POOL_SIZE = 60;
+
+export async function upcomingTop(types: string[], limit = 16, hidden: ContentCategory[] = []): Promise<MediaItem[]> {
+  try {
+    await ensureSchema();
+    const sql = db();
+    const filterSQL = excludeHiddenSQL(hidden);
     const undatedSlots = Math.max(1, Math.round(limit / 4));
     const datedSlots = limit - undatedSlots;
-    const [dated, undated] = await Promise.all([
-      sql`
-        SELECT * FROM upcoming_items
-        WHERE type = ANY(${types}) AND date_confirmed = true
-        ORDER BY release_date ASC
-        LIMIT ${datedSlots}
-      ` as unknown as Promise<UpcomingDBRow[]>,
-      sql`
-        SELECT * FROM upcoming_items
-        WHERE type = ANY(${types}) AND date_confirmed = false
-        ORDER BY popularity_score DESC
-        LIMIT ${undatedSlots}
-      ` as unknown as Promise<UpcomingDBRow[]>,
-    ]);
+    const poolSize = Math.max(datedSlots * POOL_MULTIPLIER, MIN_POOL_SIZE);
+    const [dated, undated] =
+      hidden.length === 0
+        ? await Promise.all([
+            sql`
+              SELECT * FROM (
+                SELECT * FROM upcoming_items WHERE type = ANY(${types}) AND date_confirmed = true
+                ORDER BY popularity_score DESC LIMIT ${poolSize}
+              ) pool
+              ORDER BY release_date ASC LIMIT ${datedSlots}
+            ` as unknown as Promise<UpcomingDBRow[]>,
+            sql`
+              SELECT * FROM upcoming_items
+              WHERE type = ANY(${types}) AND date_confirmed = false
+              ORDER BY popularity_score DESC
+              LIMIT ${undatedSlots}
+            ` as unknown as Promise<UpcomingDBRow[]>,
+          ])
+        : await Promise.all([
+            sql(
+              `SELECT * FROM (
+                 SELECT * FROM upcoming_items WHERE type = ANY($1) AND date_confirmed = true ${filterSQL}
+                 ORDER BY popularity_score DESC LIMIT $2
+               ) pool ORDER BY release_date ASC LIMIT $3`,
+              [types, poolSize, datedSlots]
+            ) as unknown as Promise<UpcomingDBRow[]>,
+            sql(
+              `SELECT * FROM upcoming_items WHERE type = ANY($1) AND date_confirmed = false ${filterSQL}
+               ORDER BY popularity_score DESC LIMIT $2`,
+              [types, undatedSlots]
+            ) as unknown as Promise<UpcomingDBRow[]>,
+          ]);
+    // Dated (chronological) first, undated (popularity) after — NOT
+    // re-sorted together, that would undo the chronological ordering.
     return [...dated, ...undated].map(rowToMediaItem);
   } catch {
     return [];
@@ -84,16 +186,38 @@ export async function upcomingTop(types: string[], limit = 16): Promise<MediaIte
 // seeded shares that seed timestamp, so for the first few days this is
 // effectively popularity-ordered; it becomes a real announcement timeline
 // as daily runs discover new titles. Degrades to [] on a DB error.
-export async function upcomingNewest(types: string[], limit = 16): Promise<MediaItem[]> {
+//
+// popularity_score >= 5 here specifically — verified live against the real
+// distribution: the underlying table is deliberately NOT popularity-gated
+// at admission (see tmdb.ts), and a `> 0` floor still let through a flood of
+// score-1-to-4 noise (1,274 titles clustered at the same first_seen_at from
+// a single admission-criteria change) ahead of anything recognizable. 5 is
+// the real breakpoint where genuine titles start appearing (e.g. "Sonic the
+// Hedgehog 4", an Elden Ring adaptation) — chosen from the actual data, not
+// guessed. This Discover shelf is exactly the kind of surface the user said
+// a popularity filter belongs on — the table itself, and search, stay
+// unfiltered.
+const JUST_ANNOUNCED_MIN_POPULARITY = 5;
+
+export async function upcomingNewest(types: string[], limit = 16, hidden: ContentCategory[] = []): Promise<MediaItem[]> {
   try {
     await ensureSchema();
     const sql = db();
-    const rows = (await sql`
-      SELECT * FROM upcoming_items
-      WHERE type = ANY(${types})
-      ORDER BY first_seen_at DESC, popularity_score DESC
-      LIMIT ${limit}
-    `) as unknown as UpcomingDBRow[];
+    const filterSQL = excludeHiddenSQL(hidden);
+    const rows = (
+      hidden.length === 0
+        ? await sql`
+            SELECT * FROM upcoming_items
+            WHERE type = ANY(${types}) AND popularity_score >= ${JUST_ANNOUNCED_MIN_POPULARITY}
+            ORDER BY first_seen_at DESC, popularity_score DESC
+            LIMIT ${limit}
+          `
+        : await sql(
+            `SELECT * FROM upcoming_items WHERE type = ANY($1) AND popularity_score >= $3 ${filterSQL}
+             ORDER BY first_seen_at DESC, popularity_score DESC LIMIT $2`,
+            [types, limit, JUST_ANNOUNCED_MIN_POPULARITY]
+          )
+    ) as unknown as UpcomingDBRow[];
     return rows.map(rowToMediaItem);
   } catch {
     return [];
@@ -114,8 +238,9 @@ export async function upsertUpcoming(rows: UpcomingRow[]): Promise<void> {
     const batch = rows.slice(i, i + BATCH_SIZE);
     if (batch.length === 0) continue;
     await sql`
-      INSERT INTO upcoming_items (id, type, title, overview, poster_url, release_date, date_confirmed, popularity_score)
-      SELECT * FROM UNNEST(
+      INSERT INTO upcoming_items (id, type, title, overview, poster_url, release_date, date_confirmed, popularity_score, first_seen_at, genres, original_language)
+      SELECT id, type, title, overview, poster_url, release_date, date_confirmed, popularity_score, COALESCE(announced_at, now()), genres, original_language
+      FROM UNNEST(
         ${batch.map((r) => r.id)}::text[],
         ${batch.map((r) => r.type)}::text[],
         ${batch.map((r) => r.title)}::text[],
@@ -123,8 +248,11 @@ export async function upsertUpcoming(rows: UpcomingRow[]): Promise<void> {
         ${batch.map((r) => r.posterURL ?? null)}::text[],
         ${batch.map((r) => r.releaseDate ?? null)}::date[],
         ${batch.map((r) => r.dateConfirmed)}::boolean[],
-        ${batch.map((r) => r.popularityScore)}::int[]
-      )
+        ${batch.map((r) => r.popularityScore)}::int[],
+        ${batch.map((r) => r.announcedAt ?? null)}::timestamptz[],
+        ${batch.map((r) => JSON.stringify(r.genres ?? []))}::jsonb[],
+        ${batch.map((r) => r.originalLanguage ?? null)}::text[]
+      ) AS t(id, type, title, overview, poster_url, release_date, date_confirmed, popularity_score, announced_at, genres, original_language)
       ON CONFLICT (id) DO UPDATE SET
         title = excluded.title,
         overview = excluded.overview,
@@ -132,6 +260,8 @@ export async function upsertUpcoming(rows: UpcomingRow[]): Promise<void> {
         release_date = excluded.release_date,
         date_confirmed = excluded.date_confirmed,
         popularity_score = excluded.popularity_score,
+        genres = excluded.genres,
+        original_language = excluded.original_language,
         updated_at = now()
     `;
   }

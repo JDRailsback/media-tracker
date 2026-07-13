@@ -10,13 +10,13 @@ const jakarta = Plus_Jakarta_Sans({
 });
 
 export const metadata: Metadata = {
-  title: "Media Tracker",
+  title: "Trackr",
   description: "Follow movies, shows, games, and manga — know the moment something new drops.",
   manifest: "/manifest.json",
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",
-    title: "Media Tracker",
+    title: "Trackr",
   },
 };
 

@@ -315,12 +315,40 @@ export async function resolveCollection(slug: string): Promise<ResolvedCollectio
   }
 
   const all = [...ranked.movie, ...ranked.tvShow, ...ranked.game, ...ranked.manga];
-  const upcoming = all
+  // Catches: (a) a next episode of a show already in this collection (once
+  // catalogRowToMediaItem computes a real next-episode releaseDate for TV,
+  // this naturally flows through here — no special-casing needed), and (b)
+  // any already-catalogued title with a future date on file (rare, but a
+  // fresh ingest can occasionally catch one pre-release).
+  const catalogUpcoming = all
     .filter((i): i is RankedItem & { releaseDate: string } => !!i.releaseDate && new Date(i.releaseDate) > new Date())
     .sort((a, b) => (a.releaseDate < b.releaseDate ? -1 : 1));
-  const nextRelease = upcoming.length > 0
-    ? { date: upcoming[0].releaseDate, title: upcoming[0].title, posterURL: upcoming[0].posterURL }
+  const catalogNext = catalogUpcoming.length > 0
+    ? { date: catalogUpcoming[0].releaseDate, title: catalogUpcoming[0].title, posterURL: catalogUpcoming[0].posterURL }
     : null;
+
+  // Brand-new titles that aren't in catalog_items at all yet — precomputed
+  // by rebuildAllCollections against upcoming_items (see collection_next_release
+  // in lib/db.ts). Whichever of the two has the earlier date wins; either,
+  // both, or neither may exist for a given collection. Degrades to "none"
+  // on a DB error, same as every other read in this file.
+  let upcomingNext: { date: string; title: string; posterURL?: string } | null = null;
+  try {
+    await ensureSchema();
+    const rows = await db()`
+      SELECT title, poster_url, release_date::text AS release_date
+      FROM collection_next_release WHERE collection_slug = ${slug}
+    `;
+    const row = rows[0] as { title: string; poster_url: string | null; release_date: string } | undefined;
+    if (row) upcomingNext = { date: row.release_date, title: row.title, posterURL: row.poster_url ?? undefined };
+  } catch {
+    // upcomingNext stays null
+  }
+
+  const nextRelease =
+    catalogNext && upcomingNext
+      ? (catalogNext.date < upcomingNext.date ? catalogNext : upcomingNext)
+      : catalogNext ?? upcomingNext;
 
   // Explicit override wins; otherwise fall back to the first resolved part
   // that has a poster, same as before the editor existed.

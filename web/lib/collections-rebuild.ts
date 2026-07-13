@@ -99,6 +99,70 @@ async function matchTitles(type: PartType, titles: string[]): Promise<Map<string
   return resolved;
 }
 
+// Same tiered exact/prefix/contains approach as matchTier, but against
+// upcoming_items — for finding a collection's next NOT-YET-RELEASED entry
+// (see collection_next_release in lib/db.ts). Only date_confirmed=true rows
+// qualify: an undated "TBA" entry has no date to show on the "Up next" card.
+// upcoming_items only ever holds movie/tvShow/game rows (manga has no
+// "upcoming" concept), so this is only ever called for those three types.
+interface UpcomingMatch {
+  wanted: string;
+  id: string;
+  title: string;
+  posterURL: string | null;
+  releaseDate: string;
+}
+
+// Deliberately only exact + prefix — NO contains tier. Verified live: a
+// "sports" curated title "Air" (2023, already released, correctly absent
+// from upcoming_items) fell through to a contains match against "Avatar
+// Aang: The Last Airbender" purely because "Air" is a substring of
+// "Airbender". Harmless for bulk catalog membership (matchTier, many items
+// blended together — see rationale there), but this feeds a single
+// prominent "Up next" card per franchise: a false match is far worse than
+// no match, so a curated title with no exact/prefix hit in upcoming_items
+// just means "nothing upcoming for this title" rather than reaching for a
+// loose guess.
+async function matchUpcomingTier(
+  type: PartType,
+  titles: string[],
+  tier: "exact" | "prefix"
+): Promise<UpcomingMatch[]> {
+  const sql = db();
+  const rows =
+    tier === "exact"
+      ? await sql`
+          SELECT t.title AS wanted, m.id, m.title, m.poster_url AS "posterURL", m.release_date::text AS "releaseDate"
+          FROM UNNEST(${titles}::text[]) AS t(title)
+          JOIN LATERAL (
+            SELECT id, title, poster_url, release_date FROM upcoming_items
+            WHERE type = ${type} AND date_confirmed = true AND lower(title) = lower(t.title)
+            ORDER BY release_date ASC LIMIT 1
+          ) m ON true
+        `
+      : await sql`
+          SELECT t.title AS wanted, m.id, m.title, m.poster_url AS "posterURL", m.release_date::text AS "releaseDate"
+          FROM UNNEST(${titles}::text[]) AS t(title)
+          JOIN LATERAL (
+            SELECT id, title, poster_url, release_date FROM upcoming_items
+            WHERE type = ${type} AND date_confirmed = true AND title ILIKE t.title || '%'
+            ORDER BY release_date ASC LIMIT 1
+          ) m ON true
+        `;
+  return rows as unknown as UpcomingMatch[];
+}
+
+async function matchUpcomingTitles(type: PartType, titles: string[]): Promise<Map<string, UpcomingMatch>> {
+  const resolved = new Map<string, UpcomingMatch>();
+  let remaining = titles;
+  for (const tier of ["exact", "prefix"] as const) {
+    if (remaining.length === 0) break;
+    for (const r of await matchUpcomingTier(type, remaining, tier)) resolved.set(r.wanted, r);
+    remaining = remaining.filter((t) => !resolved.has(t));
+  }
+  return resolved;
+}
+
 export async function rebuildAllCollections(): Promise<RebuildSummary> {
   await ensureSchema();
   const sql = db();
@@ -122,13 +186,24 @@ export async function rebuildAllCollections(): Promise<RebuildSummary> {
     resolvedByType[type] = await matchTitles(type, [...titlesByType[type]]);
   }
 
+  // Same shared-resolution-once approach against upcoming_items, for the
+  // "Up next" franchise card (collection_next_release) — manga excluded,
+  // upcoming_items never has manga rows.
+  const UPCOMING_TYPES: PartType[] = ["movie", "tvShow", "game"];
+  const upcomingResolvedByType = {} as Record<PartType, Map<string, UpcomingMatch>>;
+  for (const type of UPCOMING_TYPES) {
+    upcomingResolvedByType[type] = await matchUpcomingTitles(type, [...titlesByType[type]]);
+  }
+
   // Assemble each collection's membership from the shared resolution maps.
   const collections: CollectionRebuildResult[] = [];
   const pairs: { slug: string; itemId: string }[] = [];
+  const nextReleases: { slug: string; itemId: string; title: string; posterURL: string | null; releaseDate: string }[] = [];
   let totalUnmatched = 0;
   for (const def of COLLECTIONS) {
     const perType: CollectionTypeResult[] = [];
     const ids = new Set<string>();
+    let best: UpcomingMatch | null = null;
     for (const type of TYPES) {
       const titles = def.curated?.[type];
       if (!titles || titles.length === 0) continue;
@@ -137,12 +212,26 @@ export async function rebuildAllCollections(): Promise<RebuildSummary> {
         const id = resolvedByType[type].get(title);
         if (id) ids.add(id);
         else unmatched.push(title);
+
+        if (type !== "manga") {
+          const upcomingMatch = upcomingResolvedByType[type as (typeof UPCOMING_TYPES)[number]].get(title);
+          if (upcomingMatch && (!best || upcomingMatch.releaseDate < best.releaseDate)) best = upcomingMatch;
+        }
       }
       totalUnmatched += unmatched.length;
       perType.push({ type, matched: titles.length - unmatched.length, total: titles.length, unmatched });
     }
     collections.push({ slug: def.slug, custom: false, perType });
     for (const itemId of ids) pairs.push({ slug: def.slug, itemId });
+    if (best) {
+      nextReleases.push({
+        slug: def.slug,
+        itemId: best.id,
+        title: best.title,
+        posterURL: best.posterURL,
+        releaseDate: best.releaseDate,
+      });
+    }
   }
 
   // Full replace in two statements: clear every static slug, then insert the
@@ -154,6 +243,26 @@ export async function rebuildAllCollections(): Promise<RebuildSummary> {
       INSERT INTO collection_items (collection_slug, item_id)
       SELECT * FROM UNNEST(${pairs.map((p) => p.slug)}::text[], ${pairs.map((p) => p.itemId)}::text[])
       ON CONFLICT DO NOTHING
+    `;
+  }
+
+  // Same full-replace pattern for the "Up next" precomputed row — a
+  // collection with no current upcoming match simply gets no row (not a
+  // stale one left over from a previous rebuild).
+  await sql`DELETE FROM collection_next_release WHERE collection_slug = ANY(${staticSlugs})`;
+  if (nextReleases.length > 0) {
+    await sql`
+      INSERT INTO collection_next_release (collection_slug, item_id, title, poster_url, release_date)
+      SELECT * FROM UNNEST(
+        ${nextReleases.map((r) => r.slug)}::text[],
+        ${nextReleases.map((r) => r.itemId)}::text[],
+        ${nextReleases.map((r) => r.title)}::text[],
+        ${nextReleases.map((r) => r.posterURL)}::text[],
+        ${nextReleases.map((r) => r.releaseDate)}::date[]
+      )
+      ON CONFLICT (collection_slug) DO UPDATE SET
+        item_id = excluded.item_id, title = excluded.title,
+        poster_url = excluded.poster_url, release_date = excluded.release_date
     `;
   }
 

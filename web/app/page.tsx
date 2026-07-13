@@ -18,7 +18,10 @@ import Shelf from "@/components/Shelf";
 import Sidebar, { View } from "@/components/Sidebar";
 import ThemeToggle from "@/components/ThemeToggle";
 import PlatformPrefs from "@/components/PlatformPrefs";
+import ContentFilters from "@/components/ContentFilters";
 import AmbientBackground from "@/components/AmbientBackground";
+import type { ContentCategory } from "@/lib/contentFilters";
+import { getHiddenCategories } from "@/lib/hiddenCategories";
 
 const CATEGORY_TITLE: Record<string, string> = {
   movies: "Trending movies",
@@ -40,6 +43,21 @@ const SEARCH_TYPE_FILTERS: { value: string; label: string }[] = [
   { value: "franchise", label: "Collections" },
 ];
 
+// Categories whose "see all" grid should also show the date pill — mirrors
+// the three Discover shelves that pass dateLabel (see below).
+const DATED_CATEGORIES = new Set(["upcoming", "just-announced", "new-releases"]);
+
+// Short date pill for the Discover upcoming/new-releases/just-announced
+// shelves (see MediaCard's dateLabel prop) — "TBA" for an upcoming item
+// whose date isn't confirmed yet (upcomingTop/upcomingNewest can both
+// return those), a real short date otherwise.
+function shelfDateLabel(item: MediaItem): string {
+  if (!item.releaseDate) return "TBA";
+  const d = new Date(item.releaseDate);
+  if (Number.isNaN(d.getTime())) return "TBA";
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
 // See the restore/persist effects in Home() for why this exists.
 const SESSION_KEY = "appViewState";
 interface PersistedState {
@@ -57,6 +75,20 @@ export default function Home() {
   const [view, setView] = useState<View>("feed");
   const [selected, setSelected] = useState<MediaItem | null>(null);
   const [followed, setFollowed] = useState<FollowedItem[]>([]);
+  // Display-only refresh of followed items' releaseDate/subtitle/posterURL,
+  // fetched from the server each load (see app/api/followed/route.ts) —
+  // localStorage (`followed` above) is a frozen snapshot taken at follow
+  // time and stays the source of truth for WHICH items are followed;
+  // followedAt never changes. This overlay is what keeps "next episode"/
+  // "next release" dates from going stale without ever writing back to
+  // localStorage.
+  const [freshById, setFreshById] = useState<Record<string, MediaItem>>({});
+  // Whether the /api/followed refresh has completed at least once for the
+  // CURRENT followed list — distinguishes "haven't tried yet" (show the
+  // frozen snapshot briefly rather than flash empty) from "tried, and this
+  // id didn't come back" (a followed item whose id no longer resolves in
+  // the catalog — see the merge logic below).
+  const [freshLoaded, setFreshLoaded] = useState(false);
   const [pushEnabled, setPushEnabled] = useState(false);
 
   // Discover
@@ -67,6 +99,13 @@ export default function Home() {
   const [categoryLoading, setCategoryLoading] = useState(false);
   const [creatingCollection, setCreatingCollection] = useState(false);
 
+  // Settings → Content filters — read once on mount; changing it clears
+  // discoverData so the next render's effect refetches under the new
+  // ?hide= filter (see the ContentFilters onChange handler further down).
+  const [hiddenCategories, setHiddenCategories] = useState<ContentCategory[]>([]);
+  useEffect(() => setHiddenCategories(getHiddenCategories()), []);
+  const hideParam = hiddenCategories.length > 0 ? `hide=${hiddenCategories.join(",")}` : "";
+
   // Search
   const [query, setQuery] = useState("");
   const [searchType, setSearchType] = useState("");
@@ -76,14 +115,27 @@ export default function Home() {
 
   useEffect(() => setFollowed(getFollowed()), []);
 
+  const followedIdsKey = followed.map((f) => f.id).join(",");
+  useEffect(() => {
+    if (!followedIdsKey) return;
+    setFreshLoaded(false);
+    fetch(`/api/followed?ids=${encodeURIComponent(followedIdsKey)}`)
+      .then((r) => (r.ok ? r.json() : {}))
+      .then((fresh: Record<string, MediaItem>) => setFreshById(fresh))
+      .catch(() => setFreshById({}))
+      .finally(() => setFreshLoaded(true));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [followedIdsKey]);
+
   useEffect(() => {
     if (view !== "discover" || discoverData || discoverLoading) return;
     setDiscoverLoading(true);
-    fetch("/api/discover")
+    fetch(`/api/discover${hideParam ? `?${hideParam}` : ""}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => d && setDiscoverData(d))
       .finally(() => setDiscoverLoading(false));
-  }, [view, discoverData, discoverLoading]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, discoverData, discoverLoading, hideParam]);
 
   // This SPA never reflects `view`/search state in the URL — it's all one
   // route ("/"). That means the browser's back button, on its own, can only
@@ -135,7 +187,7 @@ export default function Home() {
   function openCategory(cat: string) {
     setCategory(cat);
     setCategoryLoading(true);
-    fetch(`/api/discover?category=${cat}`)
+    fetch(`/api/discover?category=${cat}${hideParam ? `&${hideParam}` : ""}`)
       .then((r) => (r.ok ? r.json() : []))
       .then(setCategoryItems)
       .finally(() => setCategoryLoading(false));
@@ -145,9 +197,10 @@ async function runSearch(q: string, type: string) {
     if (!q.trim()) return;
     setSearchLoading(true);
     try {
-      const url = type
+      const base = type
         ? `/api/search?q=${encodeURIComponent(q)}&type=${type}`
         : `/api/search?q=${encodeURIComponent(q)}`;
+      const url = hideParam ? `${base}&${hideParam}` : base;
       const res = await fetch(url);
       setSearchResults(res.ok ? await res.json() : []);
     } finally {
@@ -201,7 +254,23 @@ async function runSearch(q: string, type: string) {
     }
   }
 
-  const feed = buildFeed(followed);
+  const freshFollowed = followed.map((f) => {
+    if (freshById[f.id]) return { ...f, ...freshById[f.id], followedAt: f.followedAt };
+    // Tried to refresh and this id didn't come back — its catalog entry no
+    // longer resolves (a stale/orphaned follow, e.g. from before an id
+    // scheme change). Trusting the old frozen releaseDate/subtitle here
+    // would show confidently wrong "current" info; strip them instead so it
+    // reads as "no known release info" (drops out of the date-grouped Home
+    // feed entirely — see buildFeed) rather than a false date. Before the
+    // fetch has resolved even once, keep showing the frozen snapshot so the
+    // page doesn't flash empty.
+    if (freshLoaded) return { ...f, releaseDate: undefined, subtitle: undefined };
+    return f;
+  });
+  // Collections never belong on Home, even a followed one with a real next
+  // release — the feed is about individual titles you're tracking, not
+  // franchise containers. Following (the full list) still shows them.
+  const feed = buildFeed(freshFollowed.filter((f) => f.type !== "franchise"));
   const selectedFollowed = selected ? isFollowed(selected.id) : false;
 
   return (
@@ -232,10 +301,11 @@ async function runSearch(q: string, type: string) {
               <div className="space-y-9">
                 {feed.map((group) => (
                   <section key={group.key}>
-                    <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-subtle">
+                    <h2 className="mb-3 flex items-center gap-2 text-[12.5px] font-semibold uppercase tracking-[0.08em] text-subtle">
+                      <span className="h-1.5 w-1.5 rounded-full bg-accent" aria-hidden />
                       {group.title}
                     </h2>
-                    <div className="rounded-2xl border border-hairline bg-panel/70 p-1.5 shadow-sm backdrop-blur-xl">
+                    <div className="divide-y divide-hairline/70 overflow-hidden rounded-2xl border border-hairline bg-panel/70 shadow-sm backdrop-blur-xl">
                       {group.items.map((item, i) => (
                         <FeedRow
                           key={item.id}
@@ -266,18 +336,27 @@ async function runSearch(q: string, type: string) {
                   items={discoverData.popularUpcoming}
                   onSelect={handleSelect}
                   onSeeAll={() => openCategory("upcoming")}
+                  renderItem={(item, i) => (
+                    <MediaCard item={item} index={i} onSelect={handleSelect} dateLabel={shelfDateLabel(item)} />
+                  )}
                 />
                 <Shelf
                   title={CATEGORY_TITLE["just-announced"]}
                   items={discoverData.justAnnounced}
                   onSelect={handleSelect}
                   onSeeAll={() => openCategory("just-announced")}
+                  renderItem={(item, i) => (
+                    <MediaCard item={item} index={i} onSelect={handleSelect} dateLabel={shelfDateLabel(item)} />
+                  )}
                 />
                 <Shelf
                   title={CATEGORY_TITLE["new-releases"]}
                   items={discoverData.newReleases}
                   onSelect={handleSelect}
                   onSeeAll={() => openCategory("new-releases")}
+                  renderItem={(item, i) => (
+                    <MediaCard item={item} index={i} onSelect={handleSelect} dateLabel={shelfDateLabel(item)} />
+                  )}
                 />
                 <div className="mb-2 flex items-center justify-end">
                   <button
@@ -359,6 +438,8 @@ async function runSearch(q: string, type: string) {
                 {categoryItems.map((item, i) =>
                   category === "collections" ? (
                     <CollectionCard key={item.id} item={item} index={i} />
+                  ) : DATED_CATEGORIES.has(category) ? (
+                    <MediaCard key={item.id} item={item} index={i} onSelect={handleSelect} dateLabel={shelfDateLabel(item)} />
                   ) : (
                     <MediaCard key={item.id} item={item} index={i} onSelect={handleSelect} />
                   )
@@ -469,8 +550,8 @@ async function runSearch(q: string, type: string) {
                 text="Find something in Discover or Search and follow it to start tracking releases."
               />
             ) : (
-              <div className="rounded-2xl border border-hairline bg-panel/70 p-1.5 shadow-sm backdrop-blur-xl">
-                {followed.map((item, i) => (
+              <div className="divide-y divide-hairline/70 overflow-hidden rounded-2xl border border-hairline bg-panel/70 shadow-sm backdrop-blur-xl">
+                {freshFollowed.map((item, i) => (
                   <FeedRow
                     key={item.id}
                     item={item}
@@ -508,6 +589,22 @@ async function runSearch(q: string, type: string) {
                   </p>
                 </div>
                 <PlatformPrefs />
+              </div>
+              <div className="rounded-2xl border border-hairline bg-panel/70 px-5 py-4 shadow-sm backdrop-blur-xl">
+                <div className="mb-3">
+                  <span className="text-[15px] font-medium text-ink">Content filters</span>
+                  <p className="mt-0.5 text-[13px] text-subtle">
+                    Hide categories from Discover and Search. Applies immediately.
+                  </p>
+                </div>
+                <ContentFilters
+                  onChange={(next) => {
+                    setHiddenCategories(next);
+                    setDiscoverData(null);
+                    setSearchResults([]);
+                    setHasSearched(false);
+                  }}
+                />
               </div>
             </div>
           </>

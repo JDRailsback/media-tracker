@@ -7,6 +7,11 @@ import {
   validateCollectionInput,
 } from "@/lib/sources/collectionAdmin";
 
+// Reads live DB state through params only (no `request` usage) — must opt
+// out of Next's static route caching explicitly, same bug class as
+// /api/item (see the comment there).
+export const dynamic = "force-dynamic";
+
 // GET /api/collection/star-wars — the one genuinely live read endpoint in the
 // collection system: full merged definition (curated defaults + any admin
 // override) plus parts aggregated across TMDB/IGDB/MangaDex. The detail page

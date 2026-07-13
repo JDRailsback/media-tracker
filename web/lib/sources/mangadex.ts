@@ -135,7 +135,7 @@ async function fetchFollows(ids: string[]): Promise<Record<string, number>> {
   for (let i = 0; i < ids.length; i += 100) {
     const chunk = ids.slice(i, i + 100);
     const params = chunk.map((id) => `manga[]=${id}`).join("&");
-    const res = await fetch(`https://api.mangadex.org/statistics/manga?${params}`);
+    const res = await fetch(`https://api.mangadex.org/statistics/manga?${params}`, { cache: "no-store" });
     if (!res.ok) continue;
     const data = await res.json();
     for (const id of chunk) {
@@ -156,7 +156,7 @@ export async function searchMangaDex(
 ): Promise<RankedItem[]> {
   const limit = opts?.lenient ? 40 : 15;
   const url = `https://api.mangadex.org/manga?title=${encodeURIComponent(q)}&limit=${limit}&includes[]=cover_art&${CONTENT_RATING}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`MangaDex search failed: ${res.status}`);
   const data = await res.json();
   const results = data.data as MDManga[];
@@ -190,7 +190,7 @@ export async function searchMangaDex(
 }
 
 export async function detailsMangaDex(id: string): Promise<MediaItem> {
-  const res = await fetch(`https://api.mangadex.org/manga/${id}?includes[]=cover_art`);
+  const res = await fetch(`https://api.mangadex.org/manga/${id}?includes[]=cover_art`, { cache: "no-store" });
   if (!res.ok) throw new Error(`MangaDex details failed: ${res.status}`);
   const manga = (await res.json()).data as MDManga;
 
@@ -204,7 +204,7 @@ export async function detailsMangaDex(id: string): Promise<MediaItem> {
 // sort server-side by follow count, so no extra statistics call is needed here.
 export async function discoverMangaDex(limit = 20): Promise<MediaItem[]> {
   const url = `https://api.mangadex.org/manga?order[followedCount]=desc&limit=${limit}&includes[]=cover_art&hasAvailableChapters=true&${CONTENT_RATING}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`MangaDex discover failed: ${res.status}`);
   const data = await res.json();
   return (data.data as MDManga[]).filter((m) => coverURL(m)).map((m) => mapManga(m));
@@ -246,7 +246,7 @@ export async function paginatedMangaDex(
   const rows: CatalogRow[] = [];
   for (let offset = 0; rows.length < targetCount; offset += MANGADEX_PAGE_SIZE) {
     const url = `https://api.mangadex.org/manga?order[followedCount]=desc&limit=${MANGADEX_PAGE_SIZE}&offset=${offset}&includes[]=cover_art&hasAvailableChapters=true&${CONTENT_RATING}`;
-    const res = await fetch(url);
+    const res = await fetch(url, { cache: "no-store" });
     if (!res.ok) throw new Error(`MangaDex catalog page (offset ${offset}) failed: ${res.status}`);
     const data = await res.json();
     const page = (data.data as MDManga[]).filter((m) => coverURL(m));
@@ -284,8 +284,8 @@ export async function discoverMangaDexRecent(limit = 60): Promise<CatalogRow[]> 
     .slice(0, 19);
   const common = `limit=${MANGADEX_PAGE_SIZE}&includes[]=cover_art&hasAvailableChapters=true&${CONTENT_RATING}`;
   const [risingRes, newestRes] = await Promise.all([
-    fetch(`https://api.mangadex.org/manga?order[followedCount]=desc&createdAtSince=${since}&${common}`),
-    fetch(`https://api.mangadex.org/manga?order[createdAt]=desc&${common}`),
+    fetch(`https://api.mangadex.org/manga?order[followedCount]=desc&createdAtSince=${since}&${common}`, { cache: "no-store" }),
+    fetch(`https://api.mangadex.org/manga?order[createdAt]=desc&${common}`, { cache: "no-store" }),
   ]);
   if (!risingRes.ok) throw new Error(`MangaDex recent (rising) failed: ${risingRes.status}`);
   if (!newestRes.ok) throw new Error(`MangaDex recent (newest) failed: ${newestRes.status}`);
@@ -310,7 +310,7 @@ async function nextOfficialChapter(
   id: string
 ): Promise<{ chapter: string; date: string } | null> {
   const url = `https://api.mangadex.org/manga/${id}/feed?translatedLanguage[]=en&order[publishAt]=asc&includeExternalUrl=1&includeFuturePublishAt=1&limit=100`;
-  const res = await fetch(url);
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) return null;
   const data = await res.json();
   const now = Date.now();
