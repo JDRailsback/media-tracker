@@ -8,6 +8,7 @@ import { ensureSchema } from "../lib/db";
 import { paginatedTMDBMovies, paginatedTMDBTV } from "../lib/sources/tmdb";
 import { paginatedIGDBGames } from "../lib/sources/igdb";
 import { paginatedMangaDex } from "../lib/sources/mangadex";
+import { paginatedDeezerArtists } from "../lib/sources/artist";
 import { upsertCatalog } from "../lib/catalog";
 import type { CatalogRow } from "../lib/catalog";
 
@@ -16,6 +17,10 @@ const DEFAULT_COUNTS: Record<string, number> = {
   tv: 10000,
   game: 10000,
   manga: 1000,
+  // Practical ceiling, not a popularity cut — the union of Deezer's genre
+  // charts is only a few thousand artists (music has no deep "top N"
+  // endpoint anywhere); the live search fallback covers everyone else.
+  artist: 3000,
 };
 
 function parseArgs(): { type: string; count?: number } {
@@ -50,8 +55,11 @@ async function runType(type: string, count: number): Promise<void> {
     case "manga":
       rows = await paginatedMangaDex(count, onPage);
       break;
+    case "artist":
+      rows = await paginatedDeezerArtists(count, onPage);
+      break;
     default:
-      throw new Error(`Unknown --type: ${type} (expected movie|tv|game|manga|all)`);
+      throw new Error(`Unknown --type: ${type} (expected movie|tv|game|manga|artist|all)`);
   }
 
   // TMDB's discover pagination isn't perfectly stable when many entries tie
@@ -71,7 +79,7 @@ async function main(): Promise<void> {
   const types = type === "all" ? Object.keys(DEFAULT_COUNTS) : [type];
   for (const t of types) {
     if (!(t in DEFAULT_COUNTS)) {
-      throw new Error(`Unknown --type: ${t} (expected movie|tv|game|manga|all)`);
+      throw new Error(`Unknown --type: ${t} (expected movie|tv|game|manga|artist|all)`);
     }
     await runType(t, count ?? DEFAULT_COUNTS[t]);
   }

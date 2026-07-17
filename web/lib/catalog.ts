@@ -1,4 +1,4 @@
-import type { EpisodeInfo, ExternalLink, MediaItem, MediaType } from "@/lib/types";
+import type { EpisodeInfo, ExternalLink, MediaItem, MediaType, ReleaseGroupInfo } from "@/lib/types";
 import { db, ensureSchema } from "@/lib/db";
 import type { RankedItem } from "@/lib/sources/textMatch";
 import { excludeHiddenSQL, type ContentCategory } from "@/lib/contentFilters";
@@ -9,10 +9,11 @@ import { excludeHiddenSQL, type ContentCategory } from "@/lib/contentFilters";
 // this is just "what a catalog row looks like on the way into Postgres."
 export interface CatalogRow {
   id: string; // e.g. "movie:603" — matches MediaItem.id's format
-  type: "movie" | "tvShow" | "game" | "manga";
+  type: "movie" | "tvShow" | "game" | "manga" | "artist";
   title: string;
   overview?: string;
   posterURL?: string;
+  backdropURL?: string; // wide hero art — see MediaItem.backdropURL
   releaseDate?: string; // ISO date
   popularityScore: number; // vote_count / total_rating_count / follows — see each adapter
   genres: string[];
@@ -49,13 +50,14 @@ export async function upsertCatalog(rows: CatalogRow[], onBatch?: (done: number,
     const batch = rows.slice(i, i + UPSERT_BATCH_SIZE);
     if (batch.length === 0) continue;
     await sql`
-      INSERT INTO catalog_items (id, type, title, overview, poster_url, release_date, popularity_score, genres, external_links, metadata, tags, original_language)
+      INSERT INTO catalog_items (id, type, title, overview, poster_url, backdrop_url, release_date, popularity_score, genres, external_links, metadata, tags, original_language)
       SELECT * FROM UNNEST(
         ${batch.map((r) => r.id)}::text[],
         ${batch.map((r) => r.type)}::text[],
         ${batch.map((r) => r.title)}::text[],
         ${batch.map((r) => r.overview ?? null)}::text[],
         ${batch.map((r) => r.posterURL ?? null)}::text[],
+        ${batch.map((r) => r.backdropURL ?? null)}::text[],
         ${batch.map((r) => r.releaseDate ?? null)}::date[],
         ${batch.map((r) => r.popularityScore)}::int[],
         ${batch.map((r) => JSON.stringify(r.genres))}::jsonb[],
@@ -68,6 +70,9 @@ export async function upsertCatalog(rows: CatalogRow[], onBatch?: (done: number,
         title = excluded.title,
         overview = excluded.overview,
         poster_url = excluded.poster_url,
+        -- COALESCE: a refresh that didn't carry a backdrop (older write path,
+        -- source omitted it this run) must not wipe one captured earlier.
+        backdrop_url = COALESCE(excluded.backdrop_url, catalog_items.backdrop_url),
         release_date = excluded.release_date,
         popularity_score = excluded.popularity_score,
         genres = excluded.genres,
@@ -86,12 +91,15 @@ export async function upsertCatalog(rows: CatalogRow[], onBatch?: (done: number,
 // here degrades to empty/null on a DB error rather than throwing, so a
 // hiccup shows "no results" instead of a 500.
 
-interface CatalogDBRow {
+// Exported for lib/search.ts's combined catalog+upcoming query, which maps
+// each UNION branch through its own table's mapper.
+export interface CatalogDBRow {
   id: string;
   type: string;
   title: string;
   overview: string | null;
   poster_url: string | null;
+  backdrop_url: string | null;
   release_date: string | Date | null;
   popularity_score: number;
   genres: unknown;
@@ -130,7 +138,34 @@ export function catalogRowToMediaItem(row: CatalogDBRow): MediaItem {
   let subtitle: string | undefined;
   let episodes: EpisodeInfo[] | undefined;
   let episodeCount: number | undefined;
+  let releases: ReleaseGroupInfo[] | undefined;
   let releaseDate: string | undefined = toISODate(row.release_date);
+
+  if (type === "artist") {
+    // Same read-time split as the tvShow branch below: releaseDate means
+    // "next upcoming release" for an artist (the thing the Home feed and
+    // poll notifications track), never their latest past album — that lives
+    // in the stored release_date column and the discography list. The
+    // discography is stored newest-first (see lib/sources/artist.ts).
+    const discography = (metadata.discography as ReleaseGroupInfo[] | undefined) ?? [];
+    releases = discography.length > 0 ? discography : undefined;
+
+    const todayISO = new Date().toISOString().slice(0, 10);
+    const next = discography
+      .filter((r) => r.date && r.date >= todayISO)
+      .sort((a, b) => (a.date! < b.date! ? -1 : 1))[0];
+
+    const KIND_LABEL: Record<ReleaseGroupInfo["kind"], string> = { album: "Album", ep: "EP", single: "Single" };
+    if (next) {
+      subtitle = `${KIND_LABEL[next.kind]} — ${next.title}`;
+      releaseDate = next.date;
+    } else {
+      // Nothing announced — no releaseDate: correctly absent from the Home
+      // feed (nothing new to report), still listed under Following.
+      subtitle = undefined;
+      releaseDate = undefined;
+    }
+  }
 
   if (type === "tvShow") {
     const seasons = (metadata.seasons as CatalogSeasonMeta[] | undefined) ?? [];
@@ -182,10 +217,12 @@ export function catalogRowToMediaItem(row: CatalogDBRow): MediaItem {
     subtitle,
     overview: row.overview ?? undefined,
     posterURL: row.poster_url ?? undefined,
+    backdropURL: row.backdrop_url ?? undefined,
     releaseDate,
     externalLinks: externalLinks.length > 0 ? externalLinks : undefined,
     episodes,
     episodeCount,
+    releases,
   };
 }
 
@@ -349,8 +386,7 @@ export async function getCatalogItem(id: string): Promise<MediaItem | null> {
     const rows = await sql`SELECT * FROM catalog_items WHERE id = ${id}`;
     const row = (rows as unknown as CatalogDBRow[])[0];
     return row ? catalogRowToMediaItem(row) : null;
-  } catch (err) {
-    console.error(`getCatalogItem(${id}) failed:`, err);
+  } catch {
     return null;
   }
 }

@@ -7,7 +7,15 @@ export function db(): NeonQueryFunction<false, false> {
   if (!client) {
     const url = process.env.DATABASE_URL;
     if (!url) throw new Error("DATABASE_URL is not set");
-    client = neon(url);
+    // cache: "no-store" is CRITICAL, not an optimization tweak. Neon's HTTP
+    // driver issues every query as a POST fetch — and Next 14's Data Cache
+    // caches POST fetches made inside GET route handlers, keyed by URL +
+    // body (query text + params). Without this, a query result gets frozen
+    // the first time that exact (query, params) pair runs and is served
+    // stale forever after — even across server restarts (the cache persists
+    // in .next). Verified live: a row inserted later was permanently
+    // "missing" through one call site while identical inline SQL saw it.
+    client = neon(url, { fetchOptions: { cache: "no-store" } });
   }
   return client;
 }
@@ -17,7 +25,22 @@ let schema: Promise<void> | null = null;
 
 export function ensureSchema(): Promise<void> {
   if (!schema) {
-    schema = (async () => {
+    // The cached promise must be CLEARED if it rejects — otherwise one
+    // transient DB failure at first touch (verified live: the Neon quota
+    // outage) poisons this module instance for the server's whole lifetime,
+    // and every read that awaits ensureSchema() silently returns null/[]
+    // forever after the DB is healthy again. Symptom was maddening: some
+    // routes permanently "Not found" while freshly-compiled routes worked.
+    schema = buildSchema().catch((err) => {
+      schema = null;
+      throw err;
+    });
+  }
+  return schema;
+}
+
+function buildSchema(): Promise<void> {
+  return (async () => {
       const sql = db();
       await sql`CREATE TABLE IF NOT EXISTS followed_items (
         id SERIAL PRIMARY KEY,
@@ -164,7 +187,36 @@ export function ensureSchema(): Promise<void> {
       await sql`ALTER TABLE catalog_items ADD COLUMN IF NOT EXISTS original_language TEXT`;
       await sql`ALTER TABLE upcoming_items ADD COLUMN IF NOT EXISTS original_language TEXT`;
       await sql`ALTER TABLE upcoming_items ADD COLUMN IF NOT EXISTS genres JSONB NOT NULL DEFAULT '[]'`;
-    })();
-  }
-  return schema;
+      // Genuinely-trending-right-now data (see lib/trending.ts) — full
+      // replace-on-refresh by the daily cron, distinct from catalog_items'
+      // all-time popularity_score. `rank` is the source's own trending
+      // order, not a score, so 1 always means "most trending" regardless of
+      // how each source's underlying signal is scaled.
+      await sql`CREATE TABLE IF NOT EXISTS trending_items (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        overview TEXT,
+        poster_url TEXT,
+        release_date DATE,
+        rank INTEGER NOT NULL,
+        genres JSONB NOT NULL DEFAULT '[]',
+        original_language TEXT,
+        updated_at TIMESTAMPTZ DEFAULT now()
+      )`;
+      await sql`CREATE INDEX IF NOT EXISTS trending_items_type_idx ON trending_items (type)`;
+      // Wide landscape artwork for the detail card's hero header (TMDB
+      // backdrops, IGDB artworks/screenshots — see MediaItem.backdropURL).
+      // Manga rows stay NULL: MangaDex only has portrait covers. Added after
+      // each table's initial rollout — ALTER for installs that already ran it.
+      await sql`ALTER TABLE catalog_items ADD COLUMN IF NOT EXISTS backdrop_url TEXT`;
+      await sql`ALTER TABLE upcoming_items ADD COLUMN IF NOT EXISTS backdrop_url TEXT`;
+      await sql`ALTER TABLE trending_items ADD COLUMN IF NOT EXISTS backdrop_url TEXT`;
+      // "Available on" links for not-yet-released titles — storefront
+      // pre-order pages for games (IGDB websites), the title's TMDB page for
+      // movies/TV (no watch providers exist pre-release). catalog_items has
+      // had this column from the start; upcoming_items simply never did, so
+      // an upcoming title's detail card had nothing to link to.
+      await sql`ALTER TABLE upcoming_items ADD COLUMN IF NOT EXISTS external_links JSONB NOT NULL DEFAULT '[]'`;
+  })();
 }

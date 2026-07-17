@@ -149,7 +149,7 @@ export default function CollectionPage({ params }: { params: { slug: string } })
       className={`flex items-center gap-2 rounded-full px-6 py-2.5 text-[15px] font-semibold transition-all duration-200 active:scale-95 ${
         collectionFollowed
           ? "bg-surface text-ink ring-1 ring-hairline hover:bg-canvas"
-          : "bg-gradient-to-r from-accent to-accent-2 text-on-accent shadow-sm shadow-accent/25 hover:brightness-110"
+          : "bg-accent text-on-accent hover:brightness-110"
       }`}
     >
       {collectionFollowed ? <Check size={16} /> : <Plus size={16} />}
@@ -184,7 +184,7 @@ export default function CollectionPage({ params }: { params: { slug: string } })
       className={`flex shrink-0 items-center gap-1.5 rounded-full px-4 py-1.5 text-[13px] font-semibold transition-all duration-200 active:scale-95 ${
         collectionFollowed
           ? "bg-surface text-ink ring-1 ring-hairline hover:bg-canvas"
-          : "bg-gradient-to-r from-accent to-accent-2 text-on-accent shadow-sm shadow-accent/25 hover:brightness-110"
+          : "bg-accent text-on-accent hover:brightness-110"
       }`}
     >
       {collectionFollowed ? <Check size={14} /> : <Plus size={14} />}
@@ -248,14 +248,14 @@ export default function CollectionPage({ params }: { params: { slug: string } })
           kept ready for when that's wired back up. ── */}
       {hasNextRelease
         ? controlsShell(
-            <div className="flex overflow-hidden rounded-xl2 border border-hairline bg-panel/70 shadow-sm backdrop-blur-xl">
+            <div className="flex overflow-hidden rounded-xl2 bg-surface ring-1 ring-hairline">
               {/* Poster — bleeds to the left card edge */}
               <div className="relative w-[4.5rem] shrink-0 self-stretch sm:w-24">
                 {data.nextRelease!.posterURL ? (
                   // eslint-disable-next-line @next/next/no-img-element
                   <img src={data.nextRelease!.posterURL} alt="" className="h-full w-full object-cover" />
                 ) : (
-                  <div className="h-full w-full bg-gradient-to-b from-surface to-canvas" />
+                  <div className="h-full w-full bg-canvas" />
                 )}
               </div>
               <div className="w-px shrink-0 bg-hairline" />

@@ -1,5 +1,6 @@
 import type { ExternalLink, MediaItem } from "@/lib/types";
 import type { CatalogRow } from "@/lib/catalog";
+import type { TrendingRow } from "@/lib/trending";
 import { fuzzyMatches, isExactMatch, matchTier, RankedItem } from "./textMatch";
 
 // MangaDex adapter (TS port). v1 = official English chapter dates only.
@@ -304,6 +305,48 @@ export async function discoverMangaDexRecent(limit = 60): Promise<CatalogRow[]> 
     .sort((a, b) => (follows[b.id] ?? 0) - (follows[a.id] ?? 0))
     .slice(0, limit)
     .map((m) => mangaToCatalogRow(m, follows[m.id] ?? 0, m.attributes.createdAt?.slice(0, 10)));
+}
+
+// ---------- Trending (app/api/cron/daily/route.ts, via lib/trending.ts) ----------
+// MangaDex has no momentum/velocity metric at all (no view counts, no
+// trending endpoint) — follows is the only popularity signal it exposes, and
+// it's purely cumulative (see the identical caveat on popularity_score
+// throughout this file). The proxy used here: pull the pool of series with
+// the most RECENT chapter activity (order[latestUploadedChapter]=desc — a
+// real "still actively serializing, right now" signal MangaDex does expose),
+// then rank that pool by follows. This answers "what's both being actively
+// released AND already popular," which is the closest honest approximation
+// of "trending" available from this source — not a claim that it's
+// measuring real-time reader attention the way TMDB/IGDB's primitives do.
+// MangaDex caps non-feed `limit` at 100 (verified live: 150 -> 400 "Non-feed
+// limit query param may not be >100") — MANGADEX_PAGE_SIZE already reflects
+// that same cap elsewhere in this file, reused here rather than a second
+// magic number.
+const TRENDING_MANGA_POOL_SIZE = MANGADEX_PAGE_SIZE;
+const TRENDING_MANGA_MIN_FOLLOWS = 200;
+
+export async function discoverMangaDexTrending(limit = 20): Promise<TrendingRow[]> {
+  const url = `https://api.mangadex.org/manga?order[latestUploadedChapter]=desc&limit=${TRENDING_MANGA_POOL_SIZE}&includes[]=cover_art&hasAvailableChapters=true&${CONTENT_RATING}`;
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`MangaDex trending failed: ${res.status}`);
+  const data = await res.json();
+  const candidates = (data.data as MDManga[]).filter((m) => coverURL(m));
+  const follows = await fetchFollows(candidates.map((m) => m.id));
+
+  return candidates
+    .filter((m) => (follows[m.id] ?? 0) >= TRENDING_MANGA_MIN_FOLLOWS)
+    .sort((a, b) => (follows[b.id] ?? 0) - (follows[a.id] ?? 0))
+    .slice(0, limit)
+    .map((m, i) => ({
+      id: `manga:${m.id}`,
+      type: "manga",
+      title: titleOf(m),
+      overview: m.attributes.description?.en,
+      posterURL: coverURL(m),
+      releaseDate: m.attributes.year ? `${m.attributes.year}-01-01` : undefined,
+      rank: i + 1,
+      genres: (m.attributes.tags ?? []).map((t) => t.attributes.name.en).filter((n): n is string => !!n),
+    }));
 }
 
 async function nextOfficialChapter(

@@ -6,7 +6,7 @@ import { parseHiddenCategories } from "@/lib/contentFilters";
 // can't silently turn it into a statically-cached route (see /api/item).
 export const dynamic = "force-dynamic";
 
-// GET /api/discover                          -> DiscoverPayload (trending/popular shelves + popularUpcoming, newReleases, justAnnounced, featuredCollections)
+// GET /api/discover                          -> DiscoverPayload (trending shelves + popularUpcoming, newReleases, featuredCollections)
 // GET /api/discover?category=movies          -> MediaItem[] (expanded single category)
 // &hide=manga,anime,asian-drama,indie-games   -> Settings' Content filters selection, applied to either form
 export async function GET(request: Request) {

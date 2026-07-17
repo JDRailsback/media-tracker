@@ -245,7 +245,9 @@ export default function CollectionEditForm({
   const [excludeIds, setExcludeIds] = useState<string[]>(initial?.excludeIds ?? []);
 
   const [addQuery, setAddQuery] = useState("");
-  const [addType, setAddType] = useState<Exclude<MediaType, "franchise">>("movie");
+  // Same narrowing as IncludedPart.type — collections hold titled works
+  // (movie/TV/game/manga), never music artists.
+  const [addType, setAddType] = useState<Exclude<MediaType, "franchise" | "artist">>("movie");
   const [addResults, setAddResults] = useState<MediaItem[]>([]);
   const [addSearching, setAddSearching] = useState(false);
 
@@ -469,7 +471,7 @@ export default function CollectionEditForm({
             <div className="flex gap-2">
               <select
                 value={addType}
-                onChange={(e) => setAddType(e.target.value as Exclude<MediaType, "franchise">)}
+                onChange={(e) => setAddType(e.target.value as Exclude<MediaType, "franchise" | "artist">)}
                 className="input w-28 shrink-0"
               >
                 {PART_TYPES.map(({ key, label }) => (

@@ -16,7 +16,9 @@ import { matchTier, fuzzyMatches, normalizedScores, RankedItem, stripRanking } f
 // MediaItem, since it's hand-entered rather than fetched.
 export interface IncludedPart {
   id: string;
-  type: Exclude<MediaType, "franchise">;
+  // Collections group movie/TV/game/manga parts only — never another
+  // franchise, and not music artists (a person, not a titled work).
+  type: Exclude<MediaType, "franchise" | "artist">;
   title: string;
   posterURL?: string;
   releaseDate?: string;

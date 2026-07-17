@@ -8,7 +8,9 @@
     "start": "next start",
     "lint": "next lint",
     "ingest": "tsx scripts/ingest-catalog.ts",
-    "rebuild-collections": "tsx scripts/rebuild-collections.ts"
+    "rebuild-collections": "tsx scripts/rebuild-collections.ts",
+    "refresh-trending": "tsx scripts/refresh-trending.ts",
+    "backfill-backdrops": "tsx scripts/backfill-backdrops.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.9.4",

@@ -1,6 +1,7 @@
 import type { ExternalLink, MediaItem } from "@/lib/types";
 import type { CatalogRow } from "@/lib/catalog";
 import type { UpcomingRow } from "@/lib/upcoming";
+import type { TrendingRow } from "@/lib/trending";
 import { isExactMatch, RankedItem } from "./textMatch";
 
 // IGDB adapter (TS port). OAuth token + POST query body.
@@ -176,19 +177,23 @@ function throttle(): Promise<void> {
   return gate;
 }
 
-async function query(body: string): Promise<IGDBGame[]> {
+async function queryEndpoint<T>(endpoint: string, body: string): Promise<T[]> {
   const clientID = process.env.IGDB_CLIENT_ID as string;
   const token = await getToken();
 
   await throttle();
-  const res = await fetch("https://api.igdb.com/v4/games", {
+  const res = await fetch(`https://api.igdb.com/v4/${endpoint}`, {
     method: "POST",
     headers: { "Client-ID": clientID, Authorization: `Bearer ${token}` },
     body,
     cache: "no-store",
   });
-  if (!res.ok) throw new Error(`IGDB request failed: ${res.status}`);
-  return (await res.json()) as IGDBGame[];
+  if (!res.ok) throw new Error(`IGDB request failed (${endpoint}): ${res.status}`);
+  return (await res.json()) as T[];
+}
+
+async function query(body: string): Promise<IGDBGame[]> {
+  return queryEndpoint<IGDBGame>("games", body);
 }
 
 function mapGame(g: IGDBGame): MediaItem {
@@ -210,6 +215,24 @@ function mapGame(g: IGDBGame): MediaItem {
 }
 
 const SEARCH_FIELDS = "name,summary,cover.url,first_release_date,total_rating_count,hypes,game_type";
+
+// Wide hero art for the detail card (see MediaItem.backdropURL). Games have
+// no TMDB-style "backdrop" concept; IGDB's closest equivalents, in
+// preference order: `artworks` (curated promotional key art, usually
+// landscape) then `screenshots` (always landscape, but gameplay captures —
+// serviceable, less poster-like). Both come back inline on the same games
+// request, no extra call. t_1080p, not t_cover_big — this renders as a
+// full-width header, same reasoning as TMDB's BACKDROP_BASE.
+interface IGDBImageRef {
+  url?: string;
+}
+
+function backdropOf(g: { artworks?: IGDBImageRef[]; screenshots?: IGDBImageRef[] }): string | undefined {
+  const raw = g.artworks?.find((a) => a.url)?.url ?? g.screenshots?.find((s) => s.url)?.url;
+  if (!raw) return undefined;
+  const big = raw.replace("t_thumb", "t_1080p");
+  return big.startsWith("//") ? `https:${big}` : big;
+}
 
 // IGDB sometimes has more than one entry for the same title (e.g. a
 // main_game AND a separate port/edition entry both literally named
@@ -300,9 +323,13 @@ interface IGDBGameWithCompanies extends IGDBGame {
   involved_companies?: { company?: { name?: string } }[];
   created_at?: number; // Unix seconds — when IGDB's own entry was created, a real "announced" signal
   genres?: { name: string }[]; // for lib/contentFilters.ts (e.g. "indie games")
+  artworks?: IGDBImageRef[];
+  screenshots?: IGDBImageRef[];
+  websites?: { url?: string }[]; // storefront pre-order pages, via storeLinks()
+  url?: string; // IGDB's own slug-based page URL — the always-available fallback link
 }
 
-const UPCOMING_GAME_FIELDS = `${SEARCH_FIELDS},involved_companies.company.name,created_at,genres.name`;
+const UPCOMING_GAME_FIELDS = `${SEARCH_FIELDS},involved_companies.company.name,created_at,genres.name,artworks.url,screenshots.url,websites.url,url`;
 
 // Has a real credited developer/publisher — the "official announcement, not
 // speculative" gate for games. Checked in JS after the fetch: IGDB's
@@ -316,25 +343,48 @@ function hasCreditedStudio(g: IGDBGameWithCompanies): boolean {
 // Big and/or brand-new upcoming games, DATED OR NOT (for "Popular
 // upcoming" — see /api/cron/upcoming, lib/upcoming.ts). Filtered to NOT YET
 // RELEASED (no first_release_date, or a future one) — never something
-// already out. Two sorts merged: hypes desc (IGDB's own "anticipation"
-// counter, built for exactly "big, no date yet") and created_at desc
-// (catches a brand-new announcement before hype has had time to accumulate).
+// already out. Three merged strategies:
+//  (a) hypes desc — IGDB's own "anticipation" counter, built for exactly
+//      "big, no date yet".
+//  (b) created_at desc — catches a brand-new announcement before hype has
+//      had time to accumulate.
+//  (c) ALL dated-future games, exhaustively (date asc, offset-paginated) —
+//      the same "vast dated" principle the TMDB side already applies. A
+//      real title with a CONFIRMED date needs no hype to be findable:
+//      verified live, "One Piece: Grand Gourmet" (dated 2026-10-23, Bandai
+//      Namco credited, 5 hypes, created a month before the check) fell
+//      below (a)'s top-500 hype cutoff AND had aged out of (b)'s
+//      newest-500 window — unfindable in the app despite being exactly
+//      what a release tracker exists to know about.
 // Quality gate: a real credited developer/publisher (hasCreditedStudio), NOT
 // a hype/rating floor — an unannounced/placeholder/fan entry has no company
 // credited regardless of how much hype it happened to accumulate, and a
 // small legitimate indie announcement can have real company credits with
-// zero hype yet. hypes/created_at stay as the two sort/discovery strategies,
-// just not as the quality gate itself.
-export async function discoverIGDBUpcoming(limit = 500): Promise<UpcomingRow[]> {
+// zero hype yet. hypes/created_at stay as sort/discovery strategies, just
+// not as the quality gate itself.
+const DATED_FUTURE_MAX = 3000;
+
+export async function discoverIGDBUpcoming(limit = 4000): Promise<UpcomingRow[]> {
   const nowSeconds = Math.floor(Date.now() / 1000);
   const condition = `(first_release_date = null | first_release_date > ${nowSeconds}) & cover != null`;
   const [byHype, byNew] = (await Promise.all([
-    query(`fields ${UPCOMING_GAME_FIELDS}; where ${condition}; sort hypes desc; limit ${limit};`),
-    query(`fields ${UPCOMING_GAME_FIELDS}; where ${condition}; sort created_at desc; limit ${limit};`),
+    query(`fields ${UPCOMING_GAME_FIELDS}; where ${condition}; sort hypes desc; limit 500;`),
+    query(`fields ${UPCOMING_GAME_FIELDS}; where ${condition}; sort created_at desc; limit 500;`),
   ])) as [IGDBGameWithCompanies[], IGDBGameWithCompanies[]];
 
+  // Nearest dates first, so if the cap ever bites it drops the far future,
+  // not next month.
+  const dated: IGDBGameWithCompanies[] = [];
+  for (let offset = 0; offset < DATED_FUTURE_MAX; offset += IGDB_PAGE_SIZE) {
+    const page = (await query(
+      `fields ${UPCOMING_GAME_FIELDS}; where first_release_date > ${nowSeconds} & cover != null; sort first_release_date asc; limit ${IGDB_PAGE_SIZE}; offset ${offset};`
+    )) as IGDBGameWithCompanies[];
+    dated.push(...page);
+    if (page.length < IGDB_PAGE_SIZE) break;
+  }
+
   const rows = new Map<string, UpcomingRow>();
-  for (const g of [...byHype, ...byNew].filter(isMainGame).filter(hasCreditedStudio)) {
+  for (const g of [...byHype, ...byNew, ...dated].filter(isMainGame).filter(hasCreditedStudio)) {
     const mapped = mapGame(g);
     if (rows.has(mapped.id)) continue;
     rows.set(mapped.id, {
@@ -343,14 +393,89 @@ export async function discoverIGDBUpcoming(limit = 500): Promise<UpcomingRow[]> 
       title: mapped.title,
       overview: mapped.overview,
       posterURL: mapped.posterURL,
+      backdropURL: backdropOf(g),
       releaseDate: g.first_release_date ? new Date(g.first_release_date * 1000).toISOString() : undefined,
       dateConfirmed: !!g.first_release_date,
       popularityScore: g.hypes ?? 0,
       announcedAt: g.created_at ? new Date(g.created_at * 1000).toISOString() : undefined,
       genres: (g.genres ?? []).map((x) => x.name),
+      // Storefront pre-order pages when IGDB knows them, else the game's
+      // own IGDB page — same always-link-somewhere rule as detailsIGDB.
+      externalLinks:
+        storeLinks(g.websites) ?? (g.url ? [{ provider: "IGDB", url: g.url, kind: "info" as const }] : undefined),
     });
   }
   return [...rows.values()].slice(0, limit);
+}
+
+// ---------- Trending (app/api/cron/daily/route.ts, via lib/trending.ts) ----------
+// IGDB's popularity_primitives is a real momentum signal (recent
+// visits/want-to-play/playing activity), separate from total_rating_count
+// used everywhere else in this file — that's an all-time cumulative rating
+// count, not "hot right now." popularity_type ids are assigned dynamically
+// per IGDB's own docs (not stable literals to hardcode), so the id is
+// resolved by name against /popularity_types and cached for the process
+// lifetime, same spirit as the OAuth token cache above. "Visits" (IGDB's own
+// page-view counter, refreshed daily) is the closest analogue to "trending"
+// among the available primitives; falls through to other momentum-ish types
+// if a given IGDB account's plan doesn't expose it.
+const TRENDING_TYPE_PREFERENCE = ["Visits", "Want to Play", "Playing"];
+let trendingTypeId: number | null | undefined;
+
+interface IGDBPopularityType {
+  id: number;
+  name: string;
+}
+
+async function resolveTrendingPopularityTypeId(): Promise<number | null> {
+  if (trendingTypeId !== undefined) return trendingTypeId;
+  try {
+    const types = await queryEndpoint<IGDBPopularityType>("popularity_types", "fields id,name; limit 50;");
+    const byName = new Map(types.map((t) => [t.name, t.id]));
+    trendingTypeId = TRENDING_TYPE_PREFERENCE.map((name) => byName.get(name)).find((id) => id != null) ?? null;
+  } catch {
+    trendingTypeId = null;
+  }
+  return trendingTypeId;
+}
+
+interface IGDBPopularityPrimitive {
+  game_id: number;
+  value: number;
+}
+
+export async function discoverIGDBTrending(limit = 20): Promise<TrendingRow[]> {
+  const typeId = await resolveTrendingPopularityTypeId();
+  if (typeId == null) return [];
+  const primitives = await queryEndpoint<IGDBPopularityPrimitive>(
+    "popularity_primitives",
+    `fields game_id,value; where popularity_type = ${typeId}; sort value desc; limit ${limit * 3};`
+  );
+  if (primitives.length === 0) return [];
+
+  const games = (await query(
+    `fields ${UPCOMING_GAME_FIELDS}; where id = (${primitives.map((p) => p.game_id).join(",")}) & cover != null;`
+  )) as IGDBGameWithCompanies[];
+  const byId = new Map(games.filter(isMainGame).map((g) => [g.id, g]));
+
+  const rows: TrendingRow[] = [];
+  for (const p of primitives) {
+    const g = byId.get(p.game_id);
+    if (!g) continue;
+    rows.push({
+      id: `game:${g.id}`,
+      type: "game",
+      title: g.name,
+      overview: g.summary,
+      posterURL: mapGame(g).posterURL,
+      backdropURL: backdropOf(g),
+      releaseDate: g.first_release_date ? new Date(g.first_release_date * 1000).toISOString() : undefined,
+      rank: rows.length + 1,
+      genres: (g.genres ?? []).map((x) => x.name),
+    });
+    if (rows.length >= limit) break;
+  }
+  return rows;
 }
 
 // ---------- Bulk catalog ingestion (scripts/ingest-catalog.ts only) ----------
@@ -365,6 +490,8 @@ interface IGDBGameWithGenres extends IGDBGame {
   franchises?: { name: string }[];
   keywords?: { name: string }[];
   themes?: { name: string }[];
+  artworks?: IGDBImageRef[];
+  screenshots?: IGDBImageRef[];
 }
 
 // platforms.name, websites.url, and franchises/keywords/themes all come back
@@ -372,7 +499,7 @@ interface IGDBGameWithGenres extends IGDBGame {
 // runtime/watch-providers. franchises/keywords/themes feed `tags`, a superset
 // of genres used ONLY for collection matching (see
 // scripts/rebuild-collections.ts), never shown in the UI the way genres are.
-const CATALOG_FIELDS = `${SEARCH_FIELDS},genres.name,platforms.name,websites.url,franchises.name,keywords.name,themes.name`;
+const CATALOG_FIELDS = `${SEARCH_FIELDS},genres.name,platforms.name,websites.url,franchises.name,keywords.name,themes.name,artworks.url,screenshots.url`;
 const IGDB_PAGE_SIZE = 500;
 
 // One CATALOG_FIELDS response → CatalogRow, shared by the bulk ingest and
@@ -385,6 +512,7 @@ function gameToCatalogRow(g: IGDBGameWithGenres): CatalogRow {
     title: mapped.title,
     overview: mapped.overview,
     posterURL: mapped.posterURL,
+    backdropURL: backdropOf(g),
     releaseDate: mapped.releaseDate,
     popularityScore: g.total_rating_count ?? 0,
     genres: (g.genres ?? []).map((x) => x.name),
@@ -420,6 +548,26 @@ export async function paginatedIGDBGames(
     if (games.length < IGDB_PAGE_SIZE) break;
   }
   return rows.slice(0, targetCount);
+}
+
+// ---------- Backdrop backfill (scripts/backfill-backdrops.ts only) ----------
+// Same job as tmdb.ts's listTMDBBackdrops: rows ingested before backdrop
+// capture existed have backdrop_url = NULL, and re-walking the list pages
+// (artworks/screenshots come back inline — no per-item requests) is far
+// cheaper than a full re-ingest. Returns id -> backdrop URL.
+export async function listIGDBBackdrops(targetCount = 10000): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  for (let offset = 0; offset < targetCount; offset += IGDB_PAGE_SIZE) {
+    const games = (await query(
+      `fields artworks.url,screenshots.url; where total_rating_count > 0 & cover != null; sort total_rating_count desc; limit ${IGDB_PAGE_SIZE}; offset ${offset};`
+    )) as IGDBGameWithGenres[];
+    for (const g of games) {
+      const url = backdropOf(g);
+      if (url) map.set(`game:${g.id}`, url);
+    }
+    if (games.length < IGDB_PAGE_SIZE) break;
+  }
+  return map;
 }
 
 // ---------- Daily recent-releases refresh (app/api/cron/daily/route.ts) ----------

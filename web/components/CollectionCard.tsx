@@ -39,21 +39,16 @@ export default function CollectionCard({
       className="group flex w-full animate-fade-up flex-col text-left"
       style={{ animationDelay: `${Math.min(index, 12) * 35}ms` }}
     >
-      <div className="relative aspect-[3/2] w-full overflow-hidden rounded-xl2 shadow-sm ring-1 ring-black/[0.04] transition-all duration-300 group-hover:-translate-y-1 group-hover:shadow-xl dark:ring-white/[0.06]">
+      <div className="relative aspect-[3/2] w-full overflow-hidden rounded-xl2 ring-1 ring-hairline transition-transform duration-300 group-hover:-translate-y-1">
         {item.posterURL ? (
           // eslint-disable-next-line @next/next/no-img-element
-          <img
-            src={item.posterURL}
-            alt=""
-            className="h-full w-full object-cover transition-transform duration-500 ease-out group-hover:scale-[1.06]"
-          />
+          <img src={item.posterURL} alt="" className="h-full w-full object-cover" />
         ) : (
           <div
             className="h-full w-full"
             style={{ backgroundImage: `linear-gradient(155deg, rgb(${primary}), rgb(${secondary}))` }}
           />
         )}
-        <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-black/0 to-transparent opacity-0 transition-opacity duration-300 group-hover:opacity-100" />
       </div>
       <div className="mt-2.5">
         <div className="line-clamp-2 text-[13.5px] font-semibold leading-tight text-ink">

@@ -21,6 +21,10 @@ const STYLE: Record<MediaType, { label: string; className: string }> = {
     label: "Collection",
     className: "bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300",
   },
+  artist: {
+    label: "Music",
+    className: "bg-cyan-50 text-cyan-700 dark:bg-cyan-500/15 dark:text-cyan-300",
+  },
 };
 
 export default function TypeTag({ type }: { type: MediaType }) {

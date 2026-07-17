@@ -1,17 +1,19 @@
 "use client";
 
-import { Home, Search, Compass, Bookmark, Settings, Clapperboard } from "lucide-react";
+import { Home, Compass, Bookmark, Settings } from "lucide-react";
 
-export type View = "feed" | "discover" | "search" | "following" | "settings";
+export type View = "feed" | "discover" | "following" | "settings";
 
 const ITEMS: { id: View; label: string; icon: typeof Home }[] = [
   { id: "feed", label: "Home", icon: Home },
   { id: "discover", label: "Discover", icon: Compass },
-  { id: "search", label: "Search", icon: Search },
   { id: "following", label: "Following", icon: Bookmark },
   { id: "settings", label: "Settings", icon: Settings },
 ];
 
+// Nocturne sidebar: no glass panel, no gradient logo chip — a tracked
+// uppercase wordmark with the final letter in accent, and a 2px left bar as
+// the only active-state decoration. The chrome recedes; the feed is the show.
 export default function Sidebar({
   active,
   onChange,
@@ -20,28 +22,25 @@ export default function Sidebar({
   onChange: (v: View) => void;
 }) {
   return (
-    <aside className="fixed inset-y-0 left-0 z-20 hidden w-64 flex-col border-r border-hairline bg-panel/70 px-4 py-7 backdrop-blur-xl md:flex">
-      <div className="flex items-center gap-2.5 px-2 pb-9">
-        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-accent to-accent-2 shadow-lg shadow-accent/30">
-          <Clapperboard size={17} className="text-on-accent" strokeWidth={2.2} />
-        </div>
-        <span className="text-[15px] font-semibold tracking-tight text-ink">Media Tracker</span>
+    <aside className="fixed inset-y-0 left-0 z-20 hidden w-64 flex-col border-r border-hairline/70 px-4 py-5 md:flex">
+      <div className="px-3 pb-5 text-[42px] font-extrabold uppercase tracking-[0.14em] text-ink">
+        Track<span className="text-accent">r</span>
       </div>
 
-      <nav className="flex flex-col gap-1">
+      <nav className="flex flex-col gap-0.5">
         {ITEMS.map(({ id, label, icon: Icon }) => {
           const isActive = active === id;
           return (
             <button
               key={id}
               onClick={() => onChange(id)}
-              className={`relative flex items-center gap-3 rounded-xl px-3 py-2.5 text-[14px] transition-all duration-200 ${
+              className={`flex items-center gap-3 border-l-2 px-3 py-2.5 text-[14px] transition-colors duration-200 ${
                 isActive
-                  ? "bg-gradient-to-r from-accent/15 to-accent-2/10 font-semibold text-accent"
-                  : "text-subtle hover:bg-surface hover:text-ink"
+                  ? "border-accent font-semibold text-ink"
+                  : "border-transparent text-subtle hover:text-ink"
               }`}
             >
-              <Icon size={18} strokeWidth={isActive ? 2.3 : 1.9} className="transition-transform duration-200" />
+              <Icon size={17} strokeWidth={isActive ? 2.3 : 1.9} />
               {label}
             </button>
           );

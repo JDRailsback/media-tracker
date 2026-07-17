@@ -1,6 +1,7 @@
 import type { EpisodeInfo, ExternalLink, LinkKind, MediaItem } from "@/lib/types";
 import type { CatalogRow } from "@/lib/catalog";
 import type { UpcomingRow } from "@/lib/upcoming";
+import type { TrendingRow } from "@/lib/trending";
 import { isExactMatch, RankedItem } from "./textMatch";
 import { mapWithConcurrency, withRetries } from "./concurrency";
 
@@ -10,6 +11,9 @@ import { mapWithConcurrency, withRetries } from "./concurrency";
 // makes "new episode this Friday" possible via next_episode_to_air.
 
 const IMAGE_BASE = "https://image.tmdb.org/t/p/w500";
+// Backdrops render as a full-width hero header (see DetailModal), so they
+// need more resolution than the w500 posters.
+const BACKDROP_BASE = "https://image.tmdb.org/t/p/w1280";
 
 // Quality bar: cuts out obscure/low-signal entries (see docs/DISCOVER_AND_SEARCH.md).
 // Unreleased titles get a pass on vote count — they legitimately have none yet.
@@ -84,6 +88,7 @@ interface TMDBMovie {
   title: string;
   overview?: string;
   poster_path?: string | null;
+  backdrop_path?: string | null; // free on every list/detail response, like poster_path
   release_date?: string;
   popularity?: number;
   vote_count?: number;
@@ -139,6 +144,7 @@ function mapMovie(m: TMDBMovie): MediaItem {
     title: m.title,
     overview: m.overview || undefined,
     posterURL: m.poster_path ? `${IMAGE_BASE}${m.poster_path}` : undefined,
+    backdropURL: m.backdrop_path ? `${BACKDROP_BASE}${m.backdrop_path}` : undefined,
     releaseDate: m.release_date || undefined,
   };
 }
@@ -184,10 +190,7 @@ export async function discoverTMDBMovies(limit = 20): Promise<MediaItem[]> {
 // popularity is stored (popularityScore) purely so read-time consumers that
 // specifically want "the popular ones" (the Discover shelf, via
 // upcomingTop's pool-then-sort — see lib/upcoming.ts) can select for it,
-// without the underlying pool itself being popularity-filtered. This is
-// also what makes "just announced" (upcomingNewest) meaningful: a real
-// title no longer drops in and out of the table as its day-to-day
-// popularity crosses a threshold, so first_seen_at stops churning.
+// without the underlying pool itself being popularity-filtered.
 
 // Real gate on "officially confirmed, not speculative": TMDB tags every
 // movie/show with a status. "Rumored" is exactly the fan-leak/speculation
@@ -246,18 +249,27 @@ async function filterOfficialOnly<T extends { id: string }>(
 const DISCOVER_PAGE_CONCURRENCY = 15;
 
 async function discoverPages<T>(url: (page: number) => string, maxPages: number): Promise<T[]> {
-  const firstRes = await fetch(url(1), { cache: "no-store" });
-  if (!firstRes.ok) throw new Error(`TMDB discover (page 1) failed: ${firstRes.status}`);
-  const firstData = await firstRes.json();
+  // Every page fetch retries with backoff — verified live that a long
+  // multi-list run (the backdrop backfill walks movie pages then TV pages
+  // back-to-back) trips TMDB's rate limiter with a real 429 partway
+  // through, and one throttled page shouldn't sink the whole run. Backoff
+  // starts at 2s: TMDB's throttle window is per-second, so the 500ms
+  // default just retries into the same closed window.
+  const fetchPage = (page: number) =>
+    withRetries(async () => {
+      const res = await fetch(url(page), { cache: "no-store" });
+      if (!res.ok) throw new Error(`TMDB discover (page ${page}) failed: ${res.status}`);
+      return res.json();
+    }, 4, 2000);
+
+  const firstData = await fetchPage(1);
   const results: T[] = (firstData.results ?? []) as T[];
   const totalPages = Math.min(firstData.total_pages ?? 1, maxPages);
   if (totalPages <= 1) return results;
 
   const remainingPages = Array.from({ length: totalPages - 1 }, (_, i) => i + 2);
   const rest = await mapWithConcurrency(remainingPages, DISCOVER_PAGE_CONCURRENCY, async (page) => {
-    const res = await fetch(url(page), { cache: "no-store" });
-    if (!res.ok) throw new Error(`TMDB discover (page ${page}) failed: ${res.status}`);
-    const data = await res.json();
+    const data = await fetchPage(page);
     return (data.results ?? []) as T[];
   });
   return [...results, ...rest.flat()];
@@ -289,11 +301,13 @@ export async function discoverTMDBUpcomingMovies(limit = 4000): Promise<Upcoming
       title: m.title,
       overview: m.overview || undefined,
       posterURL: `${IMAGE_BASE}${m.poster_path}`,
+      backdropURL: m.backdrop_path ? `${BACKDROP_BASE}${m.backdrop_path}` : undefined,
       releaseDate: m.release_date,
       dateConfirmed: true,
       popularityScore: Math.round(m.popularity ?? 0),
       genres: genresOf(m),
       originalLanguage: m.original_language,
+      externalLinks: tmdbPageFallback("movie", String(m.id)),
     });
   }
   for (const m of trending) {
@@ -306,11 +320,13 @@ export async function discoverTMDBUpcomingMovies(limit = 4000): Promise<Upcoming
       title: m.title,
       overview: m.overview || undefined,
       posterURL: `${IMAGE_BASE}${m.poster_path}`,
+      backdropURL: m.backdrop_path ? `${BACKDROP_BASE}${m.backdrop_path}` : undefined,
       releaseDate: m.release_date && m.release_date > today ? m.release_date : undefined,
       dateConfirmed: !!(m.release_date && m.release_date > today),
       popularityScore: Math.round(m.popularity ?? 0),
       genres: genresOf(m),
       originalLanguage: m.original_language,
+      externalLinks: tmdbPageFallback("movie", String(m.id)),
     });
   }
   const official = await filterOfficialOnly("movie", [...rows.values()]);
@@ -324,6 +340,7 @@ interface TMDBShow {
   name: string;
   overview?: string;
   poster_path?: string | null;
+  backdrop_path?: string | null; // free on every list/detail response, like poster_path
   first_air_date?: string;
   status?: string; // "Returning Series", "Ended", "Canceled", ...
   popularity?: number;
@@ -377,6 +394,7 @@ function mapShow(s: TMDBShow): MediaItem {
       : s.status || undefined,
     overview: s.overview || undefined,
     posterURL: s.poster_path ? `${IMAGE_BASE}${s.poster_path}` : undefined,
+    backdropURL: s.backdrop_path ? `${BACKDROP_BASE}${s.backdrop_path}` : undefined,
     // Only set when a next episode is actually scheduled — otherwise the show
     // simply doesn't appear in the release feed (nothing to be "up to date" on).
     releaseDate: next?.air_date,
@@ -487,11 +505,13 @@ export async function discoverTMDBUpcomingTV(limit = 1000): Promise<UpcomingRow[
       title: s.name,
       overview: s.overview || undefined,
       posterURL: `${IMAGE_BASE}${s.poster_path}`,
+      backdropURL: s.backdrop_path ? `${BACKDROP_BASE}${s.backdrop_path}` : undefined,
       releaseDate: s.first_air_date,
       dateConfirmed: true,
       popularityScore: Math.round(s.popularity ?? 0),
       genres: genresOf(s),
       originalLanguage: s.original_language,
+      externalLinks: tmdbPageFallback("tv", String(s.id)),
     });
   }
   for (const s of trending) {
@@ -504,15 +524,65 @@ export async function discoverTMDBUpcomingTV(limit = 1000): Promise<UpcomingRow[
       title: s.name,
       overview: s.overview || undefined,
       posterURL: `${IMAGE_BASE}${s.poster_path}`,
+      backdropURL: s.backdrop_path ? `${BACKDROP_BASE}${s.backdrop_path}` : undefined,
       releaseDate: s.first_air_date && s.first_air_date > today ? s.first_air_date : undefined,
       dateConfirmed: !!(s.first_air_date && s.first_air_date > today),
       popularityScore: Math.round(s.popularity ?? 0),
       genres: genresOf(s),
       originalLanguage: s.original_language,
+      externalLinks: tmdbPageFallback("tv", String(s.id)),
     });
   }
   const official = await filterOfficialOnly("tv", [...rows.values()]);
   return official.slice(0, limit);
+}
+
+// ---------- Trending (app/api/cron/daily/route.ts, via lib/trending.ts) ----------
+// TMDB's own trending/week endpoint IS a real momentum signal (recent
+// views/searches), unlike `popularity` used elsewhere in this file for
+// admission gating — this is the one place that signal is exactly what's
+// wanted. Already ranked by TMDB itself; `rank` here is just the response's
+// own order (1 = most trending), not a recomputed score.
+export async function discoverTMDBTrendingMovies(limit = 20): Promise<TrendingRow[]> {
+  const genreMap = await tmdbGenreMap("movie");
+  const url = `https://api.themoviedb.org/3/trending/movie/week?api_key=${key()}`;
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`TMDB trending movies failed: ${res.status}`);
+  const data = await res.json();
+  const results = (data.results as TMDBDiscoverMovie[]).filter((m) => m.poster_path);
+  return results.slice(0, limit).map((m, i) => ({
+    id: `movie:${m.id}`,
+    type: "movie",
+    title: m.title,
+    overview: m.overview || undefined,
+    posterURL: `${IMAGE_BASE}${m.poster_path}`,
+    backdropURL: m.backdrop_path ? `${BACKDROP_BASE}${m.backdrop_path}` : undefined,
+    releaseDate: m.release_date || undefined,
+    rank: i + 1,
+    genres: (m.genre_ids ?? []).map((id) => genreMap.get(id)).filter((n): n is string => !!n),
+    originalLanguage: m.original_language,
+  }));
+}
+
+export async function discoverTMDBTrendingTV(limit = 20): Promise<TrendingRow[]> {
+  const genreMap = await tmdbGenreMap("tv");
+  const url = `https://api.themoviedb.org/3/trending/tv/week?api_key=${key()}`;
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`TMDB trending TV failed: ${res.status}`);
+  const data = await res.json();
+  const results = (data.results as TMDBDiscoverShow[]).filter((s) => s.poster_path);
+  return results.slice(0, limit).map((s, i) => ({
+    id: `tvShow:${s.id}`,
+    type: "tvShow",
+    title: s.name,
+    overview: s.overview || undefined,
+    posterURL: `${IMAGE_BASE}${s.poster_path}`,
+    backdropURL: s.backdrop_path ? `${BACKDROP_BASE}${s.backdrop_path}` : undefined,
+    releaseDate: s.first_air_date || undefined,
+    rank: i + 1,
+    genres: (s.genre_ids ?? []).map((id) => genreMap.get(id)).filter((n): n is string => !!n),
+    originalLanguage: s.original_language,
+  }));
 }
 
 // ---------- Bulk catalog ingestion (scripts/ingest-catalog.ts only) ----------
@@ -656,6 +726,7 @@ export async function paginatedTMDBMovies(
         title: m.title,
         overview: m.overview || undefined,
         posterURL: `${IMAGE_BASE}${m.poster_path}`,
+        backdropURL: m.backdrop_path ? `${BACKDROP_BASE}${m.backdrop_path}` : undefined,
         releaseDate: m.release_date || undefined,
         popularityScore: m.vote_count ?? 0,
         genres: (m.genre_ids ?? []).map((id) => genres.get(id)).filter((n): n is string => !!n),
@@ -749,6 +820,17 @@ async function tvExtra(
   seasons: CatalogSeason[];
   externalLinks: ExternalLink[];
   tags: string[];
+  // IMDb id (via external_ids, free on the same request) — stored in
+  // metadata so lib/airtimes.ts can resolve the show on TVmaze exactly
+  // instead of by name.
+  imdbId?: string;
+  // TMDB's own network/platform names (e.g. "Apple TV" for Apple TV+) —
+  // already on this same response, no extra request. Consumed by
+  // lib/streamingSchedules.ts as the ONLY signal for its known-platform
+  // drop-time heuristic, so that heuristic and the date it's applied to
+  // both come from the one trusted source instead of cross-referencing a
+  // second, less reliable one (TVmaze's own webChannel field).
+  networks?: string[];
   // TMDB's OWN "the next episode scheduled to air" field — a direct signal,
   // separate from (and sometimes populated when) the full per-season
   // episode list isn't. Verified live it's frequently null for a show
@@ -760,7 +842,7 @@ async function tvExtra(
 }> {
   try {
     return await withRetries(async () => {
-      const url = `https://api.themoviedb.org/3/tv/${id}?api_key=${key()}&append_to_response=watch/providers,keywords`;
+      const url = `https://api.themoviedb.org/3/tv/${id}?api_key=${key()}&append_to_response=watch/providers,keywords,external_ids`;
       const res = await fetch(url, { cache: "no-store" });
       if (!res.ok) throw new Error(`TMDB show details (${id}) failed: ${res.status}`);
       const d = (await res.json()) as TMDBShowDetails & {
@@ -768,6 +850,7 @@ async function tvExtra(
         networks?: { name?: string }[];
         production_companies?: { name?: string }[];
         keywords?: { results?: { name?: string }[] };
+        external_ids?: { imdb_id?: string | null };
       };
 
       const seasonSummaries = d.seasons ?? [];
@@ -801,6 +884,8 @@ async function tvExtra(
           title
         ),
         tags: tvTags(d),
+        imdbId: d.external_ids?.imdb_id ?? undefined,
+        networks: (d.networks ?? []).map((n) => n.name).filter((n): n is string => !!n),
         nextEpisodeToAir: d.next_episode_to_air
           ? {
               season: d.next_episode_to_air.season_number,
@@ -839,6 +924,7 @@ export async function paginatedTMDBTV(
         title: s.name,
         overview: s.overview || undefined,
         posterURL: `${IMAGE_BASE}${s.poster_path}`,
+        backdropURL: s.backdrop_path ? `${BACKDROP_BASE}${s.backdrop_path}` : undefined,
         releaseDate: s.first_air_date || undefined,
         popularityScore: s.vote_count ?? 0,
         genres: (s.genre_ids ?? []).map((id) => genres.get(id)).filter((n): n is string => !!n),
@@ -866,6 +952,11 @@ async function enrichTVRows(rows: CatalogRow[], onEnrich?: (done: number, total:
       numberOfEpisodes: extra.numberOfEpisodes,
       seasons: extra.seasons,
       nextEpisodeToAir: extra.nextEpisodeToAir,
+      // Consumed by lib/airtimes.ts to resolve the show on TVmaze exactly,
+      // instead of by (fuzzy, collision-prone) name match.
+      imdbId: extra.imdbId,
+      // Consumed by lib/streamingSchedules.ts's known-platform heuristic.
+      networks: extra.networks,
     };
     row.externalLinks = extra.externalLinks;
     row.tags = extra.tags;
@@ -920,6 +1011,7 @@ export async function discoverTMDBRecentMovies(limit = 100): Promise<CatalogRow[
       title: m.title,
       overview: m.overview || undefined,
       posterURL: `${IMAGE_BASE}${m.poster_path}`,
+      backdropURL: m.backdrop_path ? `${BACKDROP_BASE}${m.backdrop_path}` : undefined,
       releaseDate: m.release_date || undefined,
       popularityScore: m.vote_count ?? 0,
       genres: (m.genre_ids ?? []).map((id) => genres.get(id)).filter((n): n is string => !!n),
@@ -978,6 +1070,7 @@ export async function discoverTMDBRecentTV(): Promise<CatalogRow[]> {
     title: s.name,
     overview: s.overview || undefined,
     posterURL: `${IMAGE_BASE}${s.poster_path}`,
+    backdropURL: s.backdrop_path ? `${BACKDROP_BASE}${s.backdrop_path}` : undefined,
     releaseDate: s.first_air_date || undefined,
     popularityScore: s.vote_count ?? 0,
     genres: (s.genre_ids ?? []).map((id) => genres.get(id)).filter((n): n is string => !!n),
@@ -998,6 +1091,26 @@ export async function discoverTMDBRecentTV(): Promise<CatalogRow[]> {
   const all = [...rows.values()];
   await enrichTVRows(all);
   return all;
+}
+
+// ---------- Backdrop backfill (scripts/backfill-backdrops.ts only) ----------
+// The bulk ingest now captures backdrop_path as it goes, but everything
+// ingested BEFORE that change has backdrop_url = NULL. Re-running the full
+// ingest would refetch per-item enrichment (10k+ detail requests per type);
+// this instead re-walks just the LIST pages (backdrop_path is on every
+// discover response already — zero per-item requests) and returns id ->
+// backdrop URL for the script to bulk-UPDATE.
+export async function listTMDBBackdrops(kind: "movie" | "tv"): Promise<Map<string, string>> {
+  const idPrefix = kind === "movie" ? "movie" : "tvShow";
+  const results = await discoverPages<{ id: number; backdrop_path?: string | null }>(
+    (page) => `https://api.themoviedb.org/3/discover/${kind}?api_key=${key()}&sort_by=vote_count.desc&page=${page}`,
+    TMDB_MAX_PAGE
+  );
+  const map = new Map<string, string>();
+  for (const r of results) {
+    if (r.backdrop_path) map.set(`${idPrefix}:${r.id}`, `${BACKDROP_BASE}${r.backdrop_path}`);
+  }
+  return map;
 }
 
 // ---------- Franchise movie parts (TMDB "collections") ----------

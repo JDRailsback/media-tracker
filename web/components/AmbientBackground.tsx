@@ -1,11 +1,37 @@
-// Decorative, fixed ambient glow behind the app content. Purely visual —
-// aria-hidden and non-interactive.
+// Nocturne starfield — a sparse scatter of 1px pinpricks fixed to the
+// viewport, dark theme only. Deliberately NOT glowing: each star is a hard
+// sub-2px radial stop at low opacity, texture rather than light source.
+// Light mode renders nothing — stars don't show in daylight, and the paper
+// canvas stays clean. Purely visual: aria-hidden and non-interactive.
+const STARS: [number, number, number, number][] = [
+  // [x%, y%, size(px), opacity]
+  [12, 18, 1, 0.5],
+  [27, 41, 1, 0.28],
+  [33, 64, 1, 0.32],
+  [48, 27, 1.5, 0.4],
+  [56, 12, 1.5, 0.4],
+  [63, 55, 1, 0.24],
+  [71, 43, 1, 0.28],
+  [79, 88, 1, 0.3],
+  [87, 76, 1, 0.38],
+  [44, 89, 1.5, 0.26],
+  [92, 22, 1, 0.3],
+  [8, 84, 1, 0.3],
+  [18, 60, 1, 0.22],
+  [97, 52, 1, 0.26],
+];
+
+const STARFIELD = STARS.map(
+  ([x, y, size, alpha]) =>
+    `radial-gradient(${size}px ${size}px at ${x}% ${y}%, rgb(199 214 246 / ${alpha}) 49%, transparent 51%)`
+).join(", ");
+
 export default function AmbientBackground() {
   return (
-    <div aria-hidden className="pointer-events-none fixed inset-0 -z-10 overflow-hidden">
-      <div className="absolute -left-40 -top-40 h-[32rem] w-[32rem] rounded-full bg-gradient-to-br from-accent/25 via-accent-2/10 to-transparent blur-3xl" />
-      <div className="absolute -right-32 top-1/3 h-[26rem] w-[26rem] rounded-full bg-gradient-to-bl from-accent-2/20 via-accent/10 to-transparent blur-3xl" />
-      <div className="absolute bottom-[-10rem] left-1/3 h-[28rem] w-[28rem] rounded-full bg-gradient-to-tr from-accent/15 to-transparent blur-3xl" />
-    </div>
+    <div
+      aria-hidden
+      className="pointer-events-none fixed inset-0 -z-10 hidden dark:block"
+      style={{ backgroundImage: STARFIELD }}
+    />
   );
 }

@@ -1,7 +1,6 @@
-import type { MediaItem, MediaType } from "@/lib/types";
+import type { ExternalLink, MediaItem, MediaType } from "@/lib/types";
 import { db, ensureSchema } from "@/lib/db";
 import { excludeHiddenSQL, type ContentCategory } from "@/lib/contentFilters";
-import { buildPrefixQuery } from "@/lib/catalog";
 
 // Row shape produced by the upcoming-releases fetchers (tmdb.ts/igdb.ts) and
 // stored in upcoming_items (see lib/db.ts's ensureSchema). Distinct from
@@ -14,6 +13,7 @@ export interface UpcomingRow {
   title: string;
   overview?: string;
   posterURL?: string;
+  backdropURL?: string; // wide hero art — see MediaItem.backdropURL
   releaseDate?: string; // ISO date — only ever set when dateConfirmed is true
   dateConfirmed: boolean;
   popularityScore: number;
@@ -28,17 +28,23 @@ export interface UpcomingRow {
   // CatalogRow's, movie/TV/game only (manga never appears in upcoming_items).
   genres?: string[];
   originalLanguage?: string;
+  // Pre-release "Available on" links: storefront pre-order pages for games
+  // (IGDB websites), the title's TMDB page for movies/TV — watch providers
+  // don't exist before release, so an info link beats an empty section.
+  externalLinks?: ExternalLink[];
 }
 
-interface UpcomingDBRow {
+export interface UpcomingDBRow {
   id: string;
   type: string;
   title: string;
   overview: string | null;
   poster_url: string | null;
+  backdrop_url: string | null;
   release_date: string | Date | null;
   date_confirmed: boolean;
   popularity_score: number;
+  external_links: unknown;
 }
 
 function toISODate(value: string | Date | null): string | undefined {
@@ -46,14 +52,31 @@ function toISODate(value: string | Date | null): string | undefined {
   return value instanceof Date ? value.toISOString() : value;
 }
 
-function rowToMediaItem(row: UpcomingDBRow): MediaItem {
+// Neon returns JSONB parsed in practice; guard against a raw string anyway
+// (same defensive pattern as lib/catalog.ts's parseJSON).
+function parseLinks(value: unknown): ExternalLink[] {
+  if (value == null) return [];
+  if (typeof value !== "string") return value as ExternalLink[];
+  try {
+    return JSON.parse(value) as ExternalLink[];
+  } catch {
+    return [];
+  }
+}
+
+// Exported for lib/search.ts's combined catalog+upcoming query, which maps
+// each UNION branch through its own table's mapper.
+export function upcomingRowToMediaItem(row: UpcomingDBRow): MediaItem {
+  const externalLinks = parseLinks(row.external_links);
   return {
     id: row.id,
     type: row.type as MediaType,
     title: row.title,
     overview: row.overview ?? undefined,
     posterURL: row.poster_url ?? undefined,
+    backdropURL: row.backdrop_url ?? undefined,
     releaseDate: row.date_confirmed ? toISODate(row.release_date) : undefined,
+    externalLinks: externalLinks.length > 0 ? externalLinks : undefined,
   };
 }
 
@@ -69,52 +92,15 @@ export async function getUpcomingItem(id: string): Promise<MediaItem | null> {
     await ensureSchema();
     const sql = db();
     const rows = (await sql`SELECT * FROM upcoming_items WHERE id = ${id}`) as unknown as UpcomingDBRow[];
-    return rows[0] ? rowToMediaItem(rows[0]) : null;
+    return rows[0] ? upcomingRowToMediaItem(rows[0]) : null;
   } catch {
     return null;
   }
 }
 
-// Search previously only covered catalog_items (already-released titles) —
-// an upcoming/announced title (Avengers: Doomsday, GTA VI, ...) was
-// unfindable through the search bar no matter how big it was, only
-// reachable via the Discover shelves. upcoming_items already has its own
-// generated search_vector (see lib/db.ts), so this is the same word-prefix
-// full-text pattern searchCatalog uses, just against the other table.
-// Deliberately no popularity gate — "vast" per the user's directive; a
-// search should find a real, officially-confirmed title regardless of how
-// much current buzz it has.
-export async function searchUpcoming(
-  query: string,
-  types: string[] = ["movie", "tvShow", "game"],
-  limit = 20,
-  hidden: ContentCategory[] = []
-): Promise<MediaItem[]> {
-  const tsq = buildPrefixQuery(query);
-  if (!tsq) return [];
-  try {
-    await ensureSchema();
-    const sql = db();
-    const filterSQL = excludeHiddenSQL(hidden);
-    const rows = (
-      hidden.length === 0
-        ? await sql`
-            SELECT * FROM upcoming_items
-            WHERE type = ANY(${types}) AND search_vector @@ to_tsquery('english', ${tsq})
-            ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsq})) DESC, popularity_score DESC
-            LIMIT ${limit}
-          `
-        : await sql(
-            `SELECT * FROM upcoming_items WHERE type = ANY($1) AND search_vector @@ to_tsquery('english', $2) ${filterSQL}
-             ORDER BY ts_rank(search_vector, to_tsquery('english', $2)) DESC, popularity_score DESC LIMIT $3`,
-            [types, tsq, limit]
-          )
-    ) as unknown as UpcomingDBRow[];
-    return rows.map(rowToMediaItem);
-  } catch {
-    return [];
-  }
-}
+// NOTE: search over upcoming_items lives in lib/search.ts now — one
+// UNION ALL round trip with catalog_items instead of a separate query per
+// table (Neon's HTTP driver pays ~50-150ms per round trip).
 
 // "Popular upcoming" — popularity decides WHICH titles qualify, release date
 // decides the ORDER they're shown in. Two different jobs: selection and
@@ -173,52 +159,7 @@ export async function upcomingTop(types: string[], limit = 16, hidden: ContentCa
           ]);
     // Dated (chronological) first, undated (popularity) after — NOT
     // re-sorted together, that would undo the chronological ordering.
-    return [...dated, ...undated].map(rowToMediaItem);
-  } catch {
-    return [];
-  }
-}
-
-// Newest announcements first — the "Just announced" Discover shelf.
-// first_seen_at is set once and preserved across refreshes (see
-// upsertUpcoming), so it genuinely means "when this title first appeared in
-// any source feed." Caveat: every row present when the table was first
-// seeded shares that seed timestamp, so for the first few days this is
-// effectively popularity-ordered; it becomes a real announcement timeline
-// as daily runs discover new titles. Degrades to [] on a DB error.
-//
-// popularity_score >= 5 here specifically — verified live against the real
-// distribution: the underlying table is deliberately NOT popularity-gated
-// at admission (see tmdb.ts), and a `> 0` floor still let through a flood of
-// score-1-to-4 noise (1,274 titles clustered at the same first_seen_at from
-// a single admission-criteria change) ahead of anything recognizable. 5 is
-// the real breakpoint where genuine titles start appearing (e.g. "Sonic the
-// Hedgehog 4", an Elden Ring adaptation) — chosen from the actual data, not
-// guessed. This Discover shelf is exactly the kind of surface the user said
-// a popularity filter belongs on — the table itself, and search, stay
-// unfiltered.
-const JUST_ANNOUNCED_MIN_POPULARITY = 5;
-
-export async function upcomingNewest(types: string[], limit = 16, hidden: ContentCategory[] = []): Promise<MediaItem[]> {
-  try {
-    await ensureSchema();
-    const sql = db();
-    const filterSQL = excludeHiddenSQL(hidden);
-    const rows = (
-      hidden.length === 0
-        ? await sql`
-            SELECT * FROM upcoming_items
-            WHERE type = ANY(${types}) AND popularity_score >= ${JUST_ANNOUNCED_MIN_POPULARITY}
-            ORDER BY first_seen_at DESC, popularity_score DESC
-            LIMIT ${limit}
-          `
-        : await sql(
-            `SELECT * FROM upcoming_items WHERE type = ANY($1) AND popularity_score >= $3 ${filterSQL}
-             ORDER BY first_seen_at DESC, popularity_score DESC LIMIT $2`,
-            [types, limit, JUST_ANNOUNCED_MIN_POPULARITY]
-          )
-    ) as unknown as UpcomingDBRow[];
-    return rows.map(rowToMediaItem);
+    return [...dated, ...undated].map(upcomingRowToMediaItem);
   } catch {
     return [];
   }
@@ -238,30 +179,35 @@ export async function upsertUpcoming(rows: UpcomingRow[]): Promise<void> {
     const batch = rows.slice(i, i + BATCH_SIZE);
     if (batch.length === 0) continue;
     await sql`
-      INSERT INTO upcoming_items (id, type, title, overview, poster_url, release_date, date_confirmed, popularity_score, first_seen_at, genres, original_language)
-      SELECT id, type, title, overview, poster_url, release_date, date_confirmed, popularity_score, COALESCE(announced_at, now()), genres, original_language
+      INSERT INTO upcoming_items (id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, first_seen_at, genres, original_language, external_links)
+      SELECT id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, COALESCE(announced_at, now()), genres, original_language, external_links
       FROM UNNEST(
         ${batch.map((r) => r.id)}::text[],
         ${batch.map((r) => r.type)}::text[],
         ${batch.map((r) => r.title)}::text[],
         ${batch.map((r) => r.overview ?? null)}::text[],
         ${batch.map((r) => r.posterURL ?? null)}::text[],
+        ${batch.map((r) => r.backdropURL ?? null)}::text[],
         ${batch.map((r) => r.releaseDate ?? null)}::date[],
         ${batch.map((r) => r.dateConfirmed)}::boolean[],
         ${batch.map((r) => r.popularityScore)}::int[],
         ${batch.map((r) => r.announcedAt ?? null)}::timestamptz[],
         ${batch.map((r) => JSON.stringify(r.genres ?? []))}::jsonb[],
-        ${batch.map((r) => r.originalLanguage ?? null)}::text[]
-      ) AS t(id, type, title, overview, poster_url, release_date, date_confirmed, popularity_score, announced_at, genres, original_language)
+        ${batch.map((r) => r.originalLanguage ?? null)}::text[],
+        ${batch.map((r) => JSON.stringify(r.externalLinks ?? []))}::jsonb[]
+      ) AS t(id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, announced_at, genres, original_language, external_links)
       ON CONFLICT (id) DO UPDATE SET
         title = excluded.title,
         overview = excluded.overview,
         poster_url = excluded.poster_url,
+        -- COALESCE: same backdrop-preserving rule as upsertCatalog.
+        backdrop_url = COALESCE(excluded.backdrop_url, upcoming_items.backdrop_url),
         release_date = excluded.release_date,
         date_confirmed = excluded.date_confirmed,
         popularity_score = excluded.popularity_score,
         genres = excluded.genres,
         original_language = excluded.original_language,
+        external_links = excluded.external_links,
         updated_at = now()
     `;
   }

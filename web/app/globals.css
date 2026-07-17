@@ -2,28 +2,34 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Nocturne palette. Dark is the flagship: deepest blue-black with a
+   periwinkle "moonlight" accent — atmospheric through tone, never glow.
+   Light is its daylight translation (same hue family, deepened for
+   contrast on paper), not a naive inversion. on-accent flips per theme
+   because the accent itself flips character: pale moonlight chip with
+   near-black text at night, deep periwinkle chip with white text by day. */
 :root {
-  --color-canvas: 244 247 251;
+  --color-canvas: 245 247 251;
   --color-panel: 255 255 255;
-  --color-surface: 255 255 255;
-  --color-ink: 17 24 39;
-  --color-subtle: 100 111 130;
-  --color-hairline: 224 229 237;
-  --color-accent: 68 87 232;
-  --color-accent-2: 34 197 220;
+  --color-surface: 240 243 249;
+  --color-ink: 23 28 40;
+  --color-subtle: 103 113 138;
+  --color-hairline: 221 227 238;
+  --color-accent: 63 99 196;
+  --color-accent-2: 108 143 224;
   --color-on-accent: 255 255 255;
 }
 
 .dark {
-  --color-canvas: 10 13 19;
-  --color-panel: 14 18 26;
-  --color-surface: 19 24 34;
-  --color-ink: 232 236 243;
-  --color-subtle: 138 148 168;
-  --color-hairline: 32 39 53;
-  --color-accent: 91 114 255;
-  --color-accent-2: 45 212 232;
-  --color-on-accent: 255 255 255;
+  --color-canvas: 5 7 13;
+  --color-panel: 10 14 24;
+  --color-surface: 16 21 34;
+  --color-ink: 229 234 244;
+  --color-subtle: 117 129 158;
+  --color-hairline: 36 44 66;
+  --color-accent: 127 160 224;
+  --color-accent-2: 168 191 240;
+  --color-on-accent: 7 10 18;
 }
 
 

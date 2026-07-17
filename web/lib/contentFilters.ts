@@ -14,13 +14,14 @@
 //                  (the NOT keeps anime and Asian drama mutually exclusive)
 //   indie-games  = game, genre "Indie"
 //   manga        = type = manga (already a first-class type, no heuristic needed)
-export type ContentCategory = "manga" | "anime" | "asian-drama" | "indie-games";
+export type ContentCategory = "manga" | "anime" | "asian-drama" | "indie-games" | "music";
 
 export const CONTENT_CATEGORIES: { key: ContentCategory; label: string; description: string }[] = [
   { key: "manga", label: "Manga", description: "Hide all manga." },
   { key: "anime", label: "Anime", description: "Hide Japanese-language animated movies and shows." },
   { key: "asian-drama", label: "Asian dramas", description: "Hide Korean, Japanese, Chinese, and Thai-language TV dramas." },
   { key: "indie-games", label: "Indie games", description: "Hide games tagged Indie." },
+  { key: "music", label: "Music", description: "Hide all music artists." },
 ];
 
 const KNOWN_CATEGORIES = new Set<string>(CONTENT_CATEGORIES.map((c) => c.key));
@@ -37,6 +38,7 @@ const CATEGORY_SQL: Record<ContentCategory, string> = {
   anime: `type IN ('movie','tvShow') AND original_language = 'ja' AND genres @> '["Animation"]'::jsonb`,
   "asian-drama": `type = 'tvShow' AND original_language = ANY(ARRAY['ko','zh','ja','th']) AND NOT (genres @> '["Animation"]'::jsonb)`,
   "indie-games": `type = 'game' AND genres @> '["Indie"]'::jsonb`,
+  music: `type = 'artist'`,
 };
 
 // Parses a comma-separated `?hide=manga,anime` query param, dropping
