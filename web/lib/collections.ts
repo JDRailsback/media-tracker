@@ -63,7 +63,7 @@ export const COLLECTIONS: CollectionDef[] = [
     queries: {},
     curated: {
       movie: ["Star Wars", "The Empire Strikes Back", "Return of the Jedi", "The Phantom Menace", "Attack of the Clones", "Revenge of the Sith", "The Force Awakens", "The Last Jedi", "The Rise of Skywalker", "Rogue One", "Solo: A Star Wars Story", "Star Wars: The Clone Wars"],
-      tvShow: ["The Mandalorian", "Andor", "Ahsoka", "Star Wars: The Bad Batch", "Obi-Wan Kenobi", "The Book of Boba Fett", "Star Wars: The Clone Wars", "Star Wars Rebels", "The Acolyte", "Star Wars: Visions", "Star Wars: Skeleton Crew"],
+      tvShow: ["The Mandalorian", "Andor", "Ahsoka", "Star Wars: The Bad Batch", "Obi-Wan Kenobi", "The Book of Boba Fett", "Star Wars: The Clone Wars", "Star Wars Rebels", "The Acolyte", "Star Wars: Visions", "Star Wars: Skeleton Crew", "Star Wars: Tales of the Jedi", "Star Wars: Tales of the Empire"],
       game: ["Star Wars Jedi: Fallen Order", "Star Wars Jedi: Survivor", "Star Wars: Battlefront", "Star Wars: Battlefront II", "Star Wars Battlefront", "Star Wars Battlefront II", "Star Wars: Squadrons", "Star Wars: Knights of the Old Republic", "Star Wars: Knights of the Old Republic II", "Star Wars: The Old Republic", "Star Wars: Republic Commando", "Star Wars: Empire at War", "Star Wars: The Force Unleashed", "Star Wars: The Force Unleashed II", "LEGO Star Wars: The Skywalker Saga", "LEGO Star Wars: The Complete Saga", "Star Wars Outlaws", "Star Wars: Dark Forces", "Star Wars: Jedi Knight II - Jedi Outcast", "Star Wars: Jedi Knight - Jedi Academy"],
     },
     featured: true,
@@ -76,7 +76,12 @@ export const COLLECTIONS: CollectionDef[] = [
     queries: {},
     curated: {
       movie: ["Iron Man", "Iron Man 2", "Iron Man 3", "The Incredible Hulk", "Thor", "Captain America: The First Avenger", "The Avengers", "Thor: The Dark World", "Captain America: The Winter Soldier", "Guardians of the Galaxy", "Avengers: Age of Ultron", "Ant-Man", "Captain America: Civil War", "Doctor Strange", "Guardians of the Galaxy Vol. 2", "Spider-Man: Homecoming", "Thor: Ragnarok", "Black Panther", "Avengers: Infinity War", "Ant-Man and the Wasp", "Captain Marvel", "Avengers: Endgame", "Spider-Man: Far From Home", "Black Widow", "Shang-Chi and the Legend of the Ten Rings", "Eternals", "Spider-Man: No Way Home", "Doctor Strange in the Multiverse of Madness", "Thor: Love and Thunder", "Black Panther: Wakanda Forever", "Ant-Man and the Wasp: Quantumania", "Guardians of the Galaxy Vol. 3", "The Marvels", "Deadpool & Wolverine", "Captain America: Brave New World", "Thunderbolts", "The Fantastic 4: First Steps"],
-      tvShow: ["WandaVision", "Loki", "The Falcon and the Winter Soldier", "Hawkeye", "Moon Knight", "Ms. Marvel", "She-Hulk: Attorney at Law", "Secret Invasion", "What If...?", "Echo", "Agatha All Along", "Daredevil", "Daredevil: Born Again", "Agents of S.H.I.E.L.D."],
+      tvShow: ["WandaVision", "Loki", "The Falcon and the Winter Soldier", "Hawkeye", "Moon Knight", "Ms. Marvel", "She-Hulk: Attorney at Law", "Secret Invasion", "What If...?", "Echo", "Agatha All Along", "Daredevil", "Daredevil: Born Again", "Agents of S.H.I.E.L.D.", "Ironheart", "Wonder Man"],
+      // Same precedent as DC's game list below — blends continuities outside
+      // the strict MCU film timeline (Insomniac's Spider-Man universe, LEGO
+      // crossovers, fighting games) rather than requiring in-canon-only,
+      // since "Marvel games" is what people actually mean by this shelf.
+      game: ["Marvel's Spider-Man", "Marvel's Spider-Man: Miles Morales", "Marvel's Spider-Man 2", "Marvel's Avengers", "Marvel's Midnight Suns", "Marvel's Guardians of the Galaxy", "Marvel Ultimate Alliance", "Marvel Ultimate Alliance 2", "Marvel Ultimate Alliance 3: The Black Order", "Marvel vs. Capcom 2", "Marvel vs. Capcom 3: Fate of Two Worlds", "Ultimate Marvel vs. Capcom 3", "Marvel vs. Capcom: Infinite", "LEGO Marvel Super Heroes", "LEGO Marvel's Avengers", "LEGO Marvel Super Heroes 2", "Marvel Rivals", "Marvel Snap"],
     },
     featured: true,
   },
@@ -88,7 +93,7 @@ export const COLLECTIONS: CollectionDef[] = [
     queries: {},
     curated: {
       movie: ["Batman Begins", "The Dark Knight", "The Dark Knight Rises", "Batman", "Batman Returns", "Batman Forever", "Batman & Robin", "Man of Steel", "Batman v Superman: Dawn of Justice", "Suicide Squad", "Wonder Woman", "Justice League", "Zack Snyder's Justice League", "Aquaman", "Aquaman and the Lost Kingdom", "Shazam!", "Shazam! Fury of the Gods", "Birds of Prey (and the Fantabulous Emancipation of One Harley Quinn)", "Wonder Woman 1984", "The Suicide Squad", "The Batman", "Black Adam", "The Flash", "Blue Beetle", "Joker", "Joker: Folie à Deux", "Superman", "Superman II", "Superman Returns", "Watchmen", "V for Vendetta", "Constantine", "The Lego Batman Movie", "Batman: Mask of the Phantasm", "Batman: The Killing Joke", "Batman: Under the Red Hood"],
-      tvShow: ["Arrow", "The Flash", "Supergirl", "Gotham", "Titans", "Doom Patrol", "Peacemaker", "Harley Quinn", "Smallville", "Superman & Lois", "Batman: The Animated Series", "Young Justice", "Watchmen", "The Sandman", "Lucifer"],
+      tvShow: ["Arrow", "The Flash", "Supergirl", "Gotham", "Titans", "Doom Patrol", "Peacemaker", "Harley Quinn", "Smallville", "Superman & Lois", "Batman: The Animated Series", "Young Justice", "Watchmen", "The Sandman", "Lucifer", "Creature Commandos"],
       game: ["Batman: Arkham Asylum", "Batman: Arkham City", "Batman: Arkham Knight", "Batman: Arkham Origins", "Injustice: Gods Among Us", "Injustice 2", "Gotham Knights", "Suicide Squad: Kill the Justice League", "LEGO Batman: The Videogame"],
     },
     featured: true,
@@ -101,6 +106,11 @@ export const COLLECTIONS: CollectionDef[] = [
     queries: {},
     curated: {
       movie: ["Harry Potter and the Philosopher's Stone", "Harry Potter and the Chamber of Secrets", "Harry Potter and the Prisoner of Azkaban", "Harry Potter and the Goblet of Fire", "Harry Potter and the Order of the Phoenix", "Harry Potter and the Half-Blood Prince", "Harry Potter and the Deathly Hallows: Part 1", "Harry Potter and the Deathly Hallows: Part 2", "Fantastic Beasts and Where to Find Them", "Fantastic Beasts: The Crimes of Grindelwald", "Fantastic Beasts: The Secrets of Dumbledore"],
+      // The HBO reboot series (announced 2023, filming for a 2026 premiere)
+      // — no prior TV entry existed in this franchise before it, which is
+      // why this array was missing entirely (verified live: with no tvShow
+      // keywords at all, the real upcoming show could never be admitted).
+      tvShow: ["Harry Potter"],
       game: ["Hogwarts Legacy", "LEGO Harry Potter: Years 1-4", "LEGO Harry Potter: Years 5-7"],
     },
     featured: true,

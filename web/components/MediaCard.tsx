@@ -29,7 +29,7 @@ export default function MediaCard({
         <div className="aspect-square w-[85%] overflow-hidden rounded-full bg-surface ring-1 ring-hairline transition-transform duration-300 group-hover:-translate-y-1">
           {item.posterURL ? (
             // eslint-disable-next-line @next/next/no-img-element
-            <img src={item.posterURL} alt="" className="h-full w-full object-cover" />
+            <img src={item.posterURL} alt="" loading="lazy" decoding="async" className="h-full w-full object-cover" />
           ) : (
             <div className="flex h-full w-full items-center justify-center text-[12px] text-subtle">
               No image
@@ -57,7 +57,7 @@ export default function MediaCard({
       <div className="relative aspect-[2/3] w-full overflow-hidden rounded-xl2 bg-surface ring-1 ring-hairline transition-transform duration-300 group-hover:-translate-y-1">
         {item.posterURL ? (
           // eslint-disable-next-line @next/next/no-img-element
-          <img src={item.posterURL} alt="" className="h-full w-full object-cover" />
+          <img src={item.posterURL} alt="" loading="lazy" decoding="async" className="h-full w-full object-cover" />
         ) : (
           <div className="flex h-full w-full items-center justify-center bg-surface text-[12px] text-subtle">
             No image

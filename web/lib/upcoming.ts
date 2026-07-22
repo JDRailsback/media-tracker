@@ -1,6 +1,5 @@
 import type { ExternalLink, MediaItem, MediaType } from "@/lib/types";
 import { db, ensureSchema } from "@/lib/db";
-import { excludeHiddenSQL, type ContentCategory } from "@/lib/contentFilters";
 
 // Row shape produced by the upcoming-releases fetchers (tmdb.ts/igdb.ts) and
 // stored in upcoming_items (see lib/db.ts's ensureSchema). Distinct from
@@ -101,69 +100,15 @@ export async function getUpcomingItem(id: string): Promise<MediaItem | null> {
 // NOTE: search over upcoming_items lives in lib/search.ts now — one
 // UNION ALL round trip with catalog_items instead of a separate query per
 // table (Neon's HTTP driver pays ~50-150ms per round trip).
-
-// "Popular upcoming" — popularity decides WHICH titles qualify, release date
-// decides the ORDER they're shown in. Two different jobs: selection and
-// display. Earlier versions conflated them (either sorted the whole list by
-// popularity — GTA VI first regardless of it releasing months out — or
-// sorted the whole list by date — a low-buzz title releasing next week
-// buried GTA VI). Neither is what "Popular upcoming" should mean: it's a
-// radar of the BIG stuff, in the order it's actually arriving. So: pull a
-// pool of the most popular dated titles (POOL_MULTIPLIER larger than the
-// display limit, so the date-sort has real candidates to work with, not
-// just the single most-popular item), then sort THAT pool chronologically.
-// Undated-but-big titles get a reserved slice (no date to sort by, so they
-// stay popularity-ordered) appended after the dated ones — guaranteed
-// visibility without disrupting the calendar ordering of what has a date.
-const POOL_MULTIPLIER = 5;
-const MIN_POOL_SIZE = 60;
-
-export async function upcomingTop(types: string[], limit = 16, hidden: ContentCategory[] = []): Promise<MediaItem[]> {
-  try {
-    await ensureSchema();
-    const sql = db();
-    const filterSQL = excludeHiddenSQL(hidden);
-    const undatedSlots = Math.max(1, Math.round(limit / 4));
-    const datedSlots = limit - undatedSlots;
-    const poolSize = Math.max(datedSlots * POOL_MULTIPLIER, MIN_POOL_SIZE);
-    const [dated, undated] =
-      hidden.length === 0
-        ? await Promise.all([
-            sql`
-              SELECT * FROM (
-                SELECT * FROM upcoming_items WHERE type = ANY(${types}) AND date_confirmed = true
-                ORDER BY popularity_score DESC LIMIT ${poolSize}
-              ) pool
-              ORDER BY release_date ASC LIMIT ${datedSlots}
-            ` as unknown as Promise<UpcomingDBRow[]>,
-            sql`
-              SELECT * FROM upcoming_items
-              WHERE type = ANY(${types}) AND date_confirmed = false
-              ORDER BY popularity_score DESC
-              LIMIT ${undatedSlots}
-            ` as unknown as Promise<UpcomingDBRow[]>,
-          ])
-        : await Promise.all([
-            sql(
-              `SELECT * FROM (
-                 SELECT * FROM upcoming_items WHERE type = ANY($1) AND date_confirmed = true ${filterSQL}
-                 ORDER BY popularity_score DESC LIMIT $2
-               ) pool ORDER BY release_date ASC LIMIT $3`,
-              [types, poolSize, datedSlots]
-            ) as unknown as Promise<UpcomingDBRow[]>,
-            sql(
-              `SELECT * FROM upcoming_items WHERE type = ANY($1) AND date_confirmed = false ${filterSQL}
-               ORDER BY popularity_score DESC LIMIT $2`,
-              [types, undatedSlots]
-            ) as unknown as Promise<UpcomingDBRow[]>,
-          ]);
-    // Dated (chronological) first, undated (popularity) after — NOT
-    // re-sorted together, that would undo the chronological ordering.
-    return [...dated, ...undated].map(upcomingRowToMediaItem);
-  } catch {
-    return [];
-  }
-}
+//
+// NOTE: "Popular upcoming" (the Discover shelf + its "See all" page) no
+// longer reads upcoming_items live — see lib/upcomingCalendar.ts. That
+// module's refreshUpcomingCalendar() (called once daily by the cron) is
+// what reads upcoming_items (and catalog_items, for returning shows'
+// season premieres) and materializes the precomputed upcoming_calendar
+// table that getUpcomingCalendarTop/getUpcomingCalendarPage actually serve
+// from. This file stays focused on upcoming_items' own write path (the
+// daily ingest) and the single-item lookup above.
 
 // Batched UNNEST upsert (same pattern as lib/catalog.ts's upsertCatalog) —
 // used only by app/api/cron/daily/route.ts, never a user request path.

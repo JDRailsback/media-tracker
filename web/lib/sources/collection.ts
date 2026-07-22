@@ -134,11 +134,27 @@ async function loadOverrideRow(slug: string): Promise<OverrideRow | null> {
   }
 }
 
+// Excludes banner_url/logo_url (and the unused page_background/color_scheme
+// columns, never read by rowToEffective at all) — verified live, editor-
+// uploaded art is stored as inline base64 data URIs, not hosted URLs, and one
+// row alone reached 3.7MB. effectiveCollections()'s three callers (this
+// module's searchCollections/discoverCollections, plus
+// collections-rebuild.ts's slug-only custom-collection cleanup) never touch
+// bannerURL/logoURL — only getEffectiveCollection's single-row
+// loadOverrideRow (the actual collection detail page, which DOES render the
+// banner/logo) needs the full row. Before this, EVERY search paid the cost
+// of transferring every collection's banner+logo just to text-match 23
+// names — measured live at ~2.2-2.6s per call, the dominant cost of the
+// whole search path by a wide margin.
 async function loadAllOverrides(): Promise<OverrideRow[]> {
   try {
     await ensureSchema();
     const sql = db();
-    return (await sql`SELECT * FROM collection_overrides`) as unknown as OverrideRow[];
+    return (await sql`
+      SELECT slug, name, tagline, theme_primary, theme_secondary, poster_url,
+             queries, movie_collection_id, featured, include_overrides, exclude_ids, is_custom
+      FROM collection_overrides
+    `) as unknown as OverrideRow[];
   } catch {
     return [];
   }

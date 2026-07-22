@@ -42,7 +42,7 @@ export default function CollectionCard({
       <div className="relative aspect-[3/2] w-full overflow-hidden rounded-xl2 ring-1 ring-hairline transition-transform duration-300 group-hover:-translate-y-1">
         {item.posterURL ? (
           // eslint-disable-next-line @next/next/no-img-element
-          <img src={item.posterURL} alt="" className="h-full w-full object-cover" />
+          <img src={item.posterURL} alt="" loading="lazy" decoding="async" className="h-full w-full object-cover" />
         ) : (
           <div
             className="h-full w-full"

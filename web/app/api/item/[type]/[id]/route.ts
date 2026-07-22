@@ -16,7 +16,14 @@ export async function GET(
 ) {
   try {
     const item = await details(params.type, params.id);
-    return NextResponse.json(item);
+    // Same cadence as /api/discover and /api/search: the underlying catalog
+    // only refreshes once a day (plus a 24h-cached TV airtime lookup), so
+    // the edge can serve a repeat open of the same item without a DB round
+    // trip. Errors are NOT cached (no headers on the catch branch) — a
+    // transient failure shouldn't calcify into a 404 for 30 minutes.
+    return NextResponse.json(item, {
+      headers: { "Cache-Control": "public, s-maxage=1800, stale-while-revalidate=86400" },
+    });
   } catch (err) {
     console.error(err);
     return NextResponse.json({ error: "Not found" }, { status: 404 });

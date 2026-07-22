@@ -38,14 +38,19 @@ export async function searchCatalogAndUpcoming(
     const sql = db();
     const filterSQL = excludeHiddenSQL(hidden);
 
-    // Params are positional; the optional catalog type predicate is
-    // appended last so the fixed ones keep stable numbers.
-    const params: unknown[] = [tsq, catalogLimit, upcomingLimit, upcomingTypes];
-    let catalogTypePred = "";
-    if (catalogType) {
-      params.push(catalogType);
-      catalogTypePred = `AND type = $${params.length}`;
-    }
+    // The catalog side is ALWAYS restricted to upcomingTypes, not just
+    // optionally to a single catalogType — verified live, this was the bug
+    // behind manga still appearing in plain/"All" search after manga was
+    // removed from Discover: the default caller passes catalogType=undefined
+    // (meaning "any of these 3 types", relying on upcomingTypes alone) but
+    // that predicate was only ever applied to the upcoming_items half of the
+    // UNION, so catalog_items — where already-released manga still sits,
+    // ingestion paused but not deleted — ran with NO type filter at all and
+    // matched every type. catalogType is kept as a param for callers that
+    // want a SINGLE type (movie/tvShow/game individual searches), where it's
+    // identical to a 1-element upcomingTypes array anyway.
+    const catalogTypes = catalogType ? [catalogType] : upcomingTypes;
+    const params: unknown[] = [tsq, catalogLimit, upcomingLimit, upcomingTypes, catalogTypes];
 
     // The upcoming branch aliases empty JSONB literals into the catalog-only
     // columns so both branches share one projection; `src` tells the mapper
@@ -57,7 +62,7 @@ export async function searchCatalogAndUpcoming(
                  NULL::boolean AS date_confirmed, 0 AS src,
                  ts_rank(search_vector, to_tsquery('english', $1)) AS rank
           FROM catalog_items
-          WHERE search_vector @@ to_tsquery('english', $1) ${catalogTypePred} ${filterSQL}
+          WHERE search_vector @@ to_tsquery('english', $1) AND type = ANY($5) ${filterSQL}
           ORDER BY rank DESC, popularity_score DESC
           LIMIT $2)
          UNION ALL

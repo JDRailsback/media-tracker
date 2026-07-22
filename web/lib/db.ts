@@ -122,6 +122,15 @@ function buildSchema(): Promise<void> {
       )`;
       await sql`CREATE INDEX IF NOT EXISTS catalog_items_search_idx ON catalog_items USING GIN (search_vector)`;
       await sql`CREATE INDEX IF NOT EXISTS catalog_items_type_idx ON catalog_items (type)`;
+      // catalogTop()'s exact access pattern (WHERE type = $1 ORDER BY
+      // popularity_score DESC) — every Discover trending/popular shelf reads
+      // through this. The plain type index above still serves other
+      // type-only lookups; this one avoids a sort step on top of it.
+      await sql`CREATE INDEX IF NOT EXISTS catalog_items_type_popularity_idx ON catalog_items (type, popularity_score DESC)`;
+      // recentReleases()'s range scan (release_date BETWEEN now() and
+      // now()-N days) for the "New releases" shelf — unindexed, this was a
+      // full-table filter as the catalog grows.
+      await sql`CREATE INDEX IF NOT EXISTS catalog_items_release_date_idx ON catalog_items (release_date)`;
       // Added after the table's initial rollout — ALTER for anyone who already ran it.
       await sql`ALTER TABLE catalog_items ADD COLUMN IF NOT EXISTS external_links JSONB NOT NULL DEFAULT '[]'`;
       // Not-yet-released movies/TV/games — refreshed daily by the
@@ -218,5 +227,138 @@ function buildSchema(): Promise<void> {
       // had this column from the start; upcoming_items simply never did, so
       // an upcoming title's detail card had nothing to link to.
       await sql`ALTER TABLE upcoming_items ADD COLUMN IF NOT EXISTS external_links JSONB NOT NULL DEFAULT '[]'`;
+      // Notification history — one GLOBAL row per logged event (mirrors
+      // followed_items' one-row-per-item model, not per-subscriber), written
+      // only by /api/poll, read by /api/notifications filtered to the ids
+      // the client already holds in localStorage (same no-auth trust model
+      // as /api/followed). title/subtitle/message are FROZEN at log time so
+      // history reads correctly even after the item's data changes.
+      //
+      // lead_days uses a -1 sentinel for 'change' rows instead of NULL on
+      // purpose: Postgres UNIQUE treats NULLs as always-distinct, which
+      // would silently defeat the idempotency constraint below (two
+      // identical 'change' rows could both insert). Don't "simplify" it
+      // back to nullable. Keying the constraint on release_date (not the
+      // log date) is also load-bearing: a rescheduled release gets a fresh
+      // reminder for its new date instead of staying suppressed.
+      await sql`CREATE TABLE IF NOT EXISTS notification_history (
+        id SERIAL PRIMARY KEY,
+        followed_item_id INTEGER NOT NULL REFERENCES followed_items(id) ON DELETE CASCADE,
+        item_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        lead_days INTEGER NOT NULL DEFAULT -1,
+        release_date DATE NOT NULL,
+        title TEXT NOT NULL,
+        subtitle TEXT,
+        message TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (followed_item_id, event_type, release_date, lead_days)
+      )`;
+      await sql`CREATE INDEX IF NOT EXISTS notification_history_item_idx ON notification_history (item_id)`;
+      // Alert customization. Per-item mute lives on the join table (a phone
+      // and a laptop are different subscriptions — muting on one shouldn't
+      // silence the other); type-mutes and the reminder lead-time are
+      // per-subscription for the same reason. lead_time_days = 0 means
+      // reminders off; muted_types holds MediaType strings incl "franchise".
+      await sql`ALTER TABLE subscription_follows ADD COLUMN IF NOT EXISTS muted BOOLEAN NOT NULL DEFAULT false`;
+      await sql`ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS muted_types JSONB NOT NULL DEFAULT '[]'`;
+      await sql`ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS lead_time_days INTEGER NOT NULL DEFAULT 0`;
+      // Precomputed Discover payload — a SINGLE row (id is always 1),
+      // refreshed once daily by /api/cron/daily (see
+      // lib/discoverSnapshot.ts's refreshDiscoverSnapshot). Turns the common
+      // request — nobody has hidden any content-filter category, by far
+      // the majority case — from 8 parallel reads across trending_items/
+      // upcoming_items/catalog_items/collections into one. A request WITH a
+      // hidden-category filter still computes live; see
+      // lib/discoverSnapshot.ts for why that case isn't also precomputed.
+      await sql`CREATE TABLE IF NOT EXISTS discover_snapshot (
+        id INTEGER PRIMARY KEY DEFAULT 1,
+        payload JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CHECK (id = 1)
+      )`;
+      // "Popular upcoming"'s full release calendar (see
+      // lib/upcomingCalendar.ts's refreshUpcomingCalendar) — a single flat,
+      // pre-merged, pre-filtered table of every confirmed-date upcoming
+      // release worth showing (movies/brand-new TV/games from
+      // upcoming_items, PLUS season premieres of already-catalogued
+      // returning shows computed from catalog_items — something no live
+      // request path can afford to scan for on every call, since the source
+      // is 10,000+ rows of full episode metadata). Rebuilt wholesale once
+      // daily by /api/cron/daily, same "replace fully every run" contract as
+      // trending_items — reads become a single indexed date-range query
+      // instead of a live multi-table computation.
+      await sql`CREATE TABLE IF NOT EXISTS upcoming_calendar (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        subtitle TEXT,
+        poster_url TEXT,
+        backdrop_url TEXT,
+        release_date DATE NOT NULL,
+        external_links JSONB NOT NULL DEFAULT '[]',
+        genres JSONB NOT NULL DEFAULT '[]',
+        original_language TEXT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`;
+      await sql`CREATE INDEX IF NOT EXISTS upcoming_calendar_date_idx ON upcoming_calendar (release_date)`;
+      await sql`CREATE INDEX IF NOT EXISTS upcoming_calendar_type_idx ON upcoming_calendar (type)`;
+      // Real "how big is this" signal per row — Trakt's anticipated
+      // list_count for movies/brand-new TV, catalog vote_count for
+      // returning-show premieres, IGDB hypes for games (see
+      // lib/upcomingCalendar.ts). NOT used to decide what's IN this table
+      // (admission already happened during the refresh) — only to pick the
+      // shelf's small highlight slice (getUpcomingCalendarTop), so the
+      // biggest thing per type surfaces regardless of how soon it arrives.
+      // The full "See all" browse stays pure chronological and ignores this
+      // column entirely (see getUpcomingCalendarPage) — verified live that a
+      // shelf sorted by release_date ASC alone surfaced whatever small title
+      // happened to release THIS WEEK ahead of Avengers: Doomsday releasing
+      // in December, which is backwards for a "biggest per type" highlight.
+      await sql`ALTER TABLE upcoming_calendar ADD COLUMN IF NOT EXISTS rank_score INTEGER NOT NULL DEFAULT 0`;
+      await sql`CREATE INDEX IF NOT EXISTS upcoming_calendar_type_rank_idx ON upcoming_calendar (type, rank_score DESC)`;
+      // Marks a row admitted purely for belonging to a major, hand-curated
+      // franchise (Star Wars, One Piece, ...) — regardless of Trakt
+      // anticipation or IGDB hype (see lib/upcomingCalendar.ts's
+      // fetchFranchisePicks). Exempt from the international/general bars,
+      // same as games and returning-TV premieres — the whole point is
+      // "show it regardless of popularity."
+      await sql`ALTER TABLE upcoming_calendar ADD COLUMN IF NOT EXISTS franchise_pick BOOLEAN NOT NULL DEFAULT false`;
+      // "New releases"' calendar — same shape as upcoming_calendar, same
+      // admission decisions, just the other side of one title's lifecycle.
+      // A row only ever enters this table by GRADUATING out of
+      // upcoming_calendar once its release_date passes (see
+      // lib/upcomingCalendar.ts's graduateReleasedTitles) — never by
+      // independently re-deriving "is this a real release" from scratch.
+      // That was a deliberate simplification over giving new releases their
+      // own Trakt-based admission signal (Trakt's equivalent for
+      // already-released titles, movies/played/weekly, is 751 pages deep —
+      // completely impractical to paginate daily, and would've risked
+      // another cross-scale mixup like the returning-TV-premiere bug):
+      // reusing the SAME rank_score a title already earned while upcoming
+      // means the general/international bar thresholds apply unchanged,
+      // and a title can only ever be in ONE of the two calendars at a time
+      // (moving OUT of upcoming_calendar and INTO this one is a single
+      // atomic transition), which is what guarantees they never overlap.
+      await sql`CREATE TABLE IF NOT EXISTS new_releases_calendar (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        subtitle TEXT,
+        poster_url TEXT,
+        backdrop_url TEXT,
+        release_date DATE NOT NULL,
+        external_links JSONB NOT NULL DEFAULT '[]',
+        genres JSONB NOT NULL DEFAULT '[]',
+        original_language TEXT,
+        rank_score INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`;
+      await sql`CREATE INDEX IF NOT EXISTS new_releases_calendar_date_idx ON new_releases_calendar (release_date)`;
+      await sql`CREATE INDEX IF NOT EXISTS new_releases_calendar_type_idx ON new_releases_calendar (type)`;
+      // Same franchise-pick marker as upcoming_calendar (see there) — added
+      // via ALTER, not the CREATE TABLE body above, since that statement is
+      // a no-op once the table already exists on anyone's DB.
+      await sql`ALTER TABLE new_releases_calendar ADD COLUMN IF NOT EXISTS franchise_pick BOOLEAN NOT NULL DEFAULT false`;
   })();
 }

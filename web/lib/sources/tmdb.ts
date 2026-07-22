@@ -10,7 +10,12 @@ import { mapWithConcurrency, withRetries } from "./concurrency";
 // Covers both movies (search/movie) and TV shows (search/tv) — TV is what
 // makes "new episode this Friday" possible via next_episode_to_air.
 
-const IMAGE_BASE = "https://image.tmdb.org/t/p/w500";
+// w342 (not w500) — every poster surface in the app renders at 144px CSS
+// width or less (grid cards, feed rows, the modal thumbnail); w342 stays
+// sharp at 2x DPR for anything that small while cutting real bytes off
+// every image on the site. w500 was sized for a full-detail single poster
+// view that doesn't exist here.
+const IMAGE_BASE = "https://image.tmdb.org/t/p/w342";
 // Backdrops render as a full-width hero header (see DetailModal), so they
 // need more resolution than the w500 posters.
 const BACKDROP_BASE = "https://image.tmdb.org/t/p/w1280";

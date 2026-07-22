@@ -1,4 +1,7 @@
-// Browser-side Web Push helpers: permission, subscription, and follow sync.
+// Browser-side Web Push helpers: permission, subscription, follow sync, and
+// notification preferences (type mutes, lead-time reminders, per-item mute).
+
+import type { MediaType } from "@/lib/types";
 
 function urlBase64ToUint8Array(base64: string): Uint8Array {
   const padding = "=".repeat((4 - (base64.length % 4)) % 4);
@@ -35,19 +38,62 @@ export async function enablePush(): Promise<boolean> {
   return true;
 }
 
-async function currentSubscription(): Promise<PushSubscription | null> {
+// Exported so Settings/DetailModal can know whether push is active at all
+// (preference controls are meaningless without a subscription to hang them on).
+export async function currentSubscription(): Promise<PushSubscription | null> {
   if (!("serviceWorker" in navigator)) return null;
   const reg = await navigator.serviceWorker.getRegistration();
   return (await reg?.pushManager.getSubscription()) ?? null;
 }
 
-// Sync a follow/unfollow to the server (only if the user has enabled push).
+// Sync a follow/unfollow to the server. Follows ALWAYS post, subscription or
+// not — the server needs the followed_items row to log notification history
+// even for push-less devices (see /api/follow). Unfollow without a
+// subscription stays a no-op: there's no subscription link to remove, and
+// the global followed_items row may still serve other devices.
 export async function syncFollow(itemID: string, following: boolean): Promise<void> {
   const sub = await currentSubscription();
-  if (!sub) return;
+  if (!following && !sub) return;
   await fetch(following ? "/api/follow" : "/api/unfollow", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ itemID, subscription: sub }),
   });
+}
+
+export interface NotificationPrefs {
+  mutedTypes: MediaType[];
+  leadTimeDays: number; // 0 = reminders off
+  mutedItemIds: string[];
+}
+
+// Read (no update fields) or update (with them) this device's notification
+// preferences. Returns null when push was never enabled — there's no
+// subscription to attach preferences to. POST even for the read: the push
+// endpoint is a capability URL and shouldn't appear in query strings/logs.
+export async function fetchPrefs(update?: {
+  mutedTypes?: MediaType[];
+  leadTimeDays?: number;
+}): Promise<NotificationPrefs | null> {
+  const sub = await currentSubscription();
+  if (!sub) return null;
+  const res = await fetch("/api/prefs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ subscription: sub, ...update }),
+  });
+  return res.ok ? ((await res.json()) as NotificationPrefs) : null;
+}
+
+// Mute/unmute pushes for one followed item on THIS device (it stays
+// followed and still appears in history). No-op without a subscription.
+export async function setItemMuted(itemID: string, muted: boolean): Promise<boolean> {
+  const sub = await currentSubscription();
+  if (!sub) return false;
+  const res = await fetch("/api/mute", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ itemID, subscription: sub, muted }),
+  });
+  return res.ok;
 }

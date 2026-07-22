@@ -1,10 +1,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { X, Play, Plus, Check, Star } from "lucide-react";
+import { X, Play, Plus, Check, Star, Bell, BellOff } from "lucide-react";
 import type { MediaItem } from "@/lib/types";
 import { describeRelease, formatTime } from "@/lib/feed";
 import { getPreferredPlatforms, isPreferredProvider } from "@/lib/platformPrefs";
+import { fetchPrefs, setItemMuted } from "@/lib/push-client";
 import TypeTag from "./TypeTag";
 
 export default function DetailModal({
@@ -22,8 +23,19 @@ export default function DetailModal({
 }) {
   const [full, setFull] = useState<MediaItem>(item);
   const [preferred, setPreferred] = useState<string[]>([]);
+  // null = mute control hidden (not followed, or push never enabled on this
+  // device — there's no subscription for a mute to act on).
+  const [muted, setMuted] = useState<boolean | null>(null);
 
   useEffect(() => setPreferred(getPreferredPlatforms()), []);
+
+  useEffect(() => {
+    if (!isFollowed) {
+      setMuted(null);
+      return;
+    }
+    fetchPrefs().then((p) => setMuted(p ? p.mutedItemIds.includes(item.id) : null));
+  }, [isFollowed, item.id]);
 
   useEffect(() => {
     const idx = item.id.indexOf(":");
@@ -127,17 +139,35 @@ export default function DetailModal({
                 )}
               </div>
 
-              <button
-                onClick={() => (isFollowed ? onUnfollow() : onFollow(full))}
-                className={`flex items-center gap-1.5 rounded-full px-4 py-2 text-[14px] font-semibold transition-all duration-200 active:scale-95 ${
-                  isFollowed
-                    ? "bg-canvas text-ink hover:bg-hairline/60"
-                    : "bg-accent text-on-accent hover:brightness-110"
-                }`}
-              >
-                {isFollowed ? <Check size={15} /> : <Plus size={15} />}
-                {isFollowed ? "Following" : "Follow"}
-              </button>
+              <div className="flex items-center gap-2">
+                {muted !== null && (
+                  <button
+                    onClick={() => {
+                      const next = !muted;
+                      setMuted(next); // optimistic — resyncs on next open
+                      void setItemMuted(full.id, next);
+                    }}
+                    aria-label={muted ? "Unmute alerts for this title" : "Mute alerts for this title"}
+                    title={muted ? "Alerts muted on this device — tap to unmute" : "Mute alerts for this title on this device"}
+                    className={`rounded-full p-2 transition-colors duration-200 ${
+                      muted ? "bg-accent/12 text-accent" : "bg-canvas text-subtle hover:text-ink"
+                    }`}
+                  >
+                    {muted ? <BellOff size={15} /> : <Bell size={15} />}
+                  </button>
+                )}
+                <button
+                  onClick={() => (isFollowed ? onUnfollow() : onFollow(full))}
+                  className={`flex items-center gap-1.5 rounded-full px-4 py-2 text-[14px] font-semibold transition-all duration-200 active:scale-95 ${
+                    isFollowed
+                      ? "bg-canvas text-ink hover:bg-hairline/60"
+                      : "bg-accent text-on-accent hover:brightness-110"
+                  }`}
+                >
+                  {isFollowed ? <Check size={15} /> : <Plus size={15} />}
+                  {isFollowed ? "Following" : "Follow"}
+                </button>
+              </div>
             </div>
 
             {full.externalLinks && full.externalLinks.length > 0 && (

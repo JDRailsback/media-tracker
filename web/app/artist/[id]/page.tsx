@@ -2,10 +2,10 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowLeft, Check, Plus, Play } from "lucide-react";
+import { ArrowLeft, Check, Plus, Play, Bell, BellOff } from "lucide-react";
 import type { MediaItem, ReleaseGroupInfo } from "@/lib/types";
 import { addFollow, removeFollow, isFollowed as checkFollowed } from "@/lib/library";
-import { syncFollow } from "@/lib/push-client";
+import { fetchPrefs, setItemMuted, syncFollow } from "@/lib/push-client";
 import { parseReleaseDay } from "@/lib/feed";
 import CollectionRow from "@/components/CollectionRow";
 
@@ -37,7 +37,10 @@ export default function ArtistPage({ params }: { params: { id: string } }) {
   const [item, setItem] = useState<MediaItem | null>(null);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
-  const [, setFollowVersion] = useState(0);
+  const [followVersion, setFollowVersion] = useState(0);
+  // null = mute control hidden (not followed, or push never enabled on this
+  // device — there's no subscription for a mute to act on).
+  const [muted, setMuted] = useState<boolean | null>(null);
 
   useEffect(() => {
     setLoading(true);
@@ -52,6 +55,14 @@ export default function ArtistPage({ params }: { params: { id: string } }) {
       .then((d) => d && setItem(d))
       .finally(() => setLoading(false));
   }, [params.id]);
+
+  useEffect(() => {
+    if (!checkFollowed(artistID)) {
+      setMuted(null);
+      return;
+    }
+    fetchPrefs().then((p) => setMuted(p ? p.mutedItemIds.includes(artistID) : null));
+  }, [artistID, followVersion]);
 
   if (notFound) {
     return (
@@ -150,6 +161,22 @@ export default function ArtistPage({ params }: { params: { id: string } }) {
             {followed ? <Check size={15} /> : <Plus size={15} />}
             {followed ? "Following" : "Follow"}
           </button>
+          {muted !== null && (
+            <button
+              onClick={() => {
+                const next = !muted;
+                setMuted(next); // optimistic — resyncs on next visit
+                void setItemMuted(artistID, next);
+              }}
+              aria-label={muted ? "Unmute alerts for this artist" : "Mute alerts for this artist"}
+              title={muted ? "Alerts muted on this device — tap to unmute" : "Mute alerts for this artist on this device"}
+              className={`rounded-full p-2.5 transition-colors duration-200 ${
+                muted ? "bg-accent/12 text-accent" : "bg-surface text-subtle hover:text-ink"
+              }`}
+            >
+              {muted ? <BellOff size={15} /> : <Bell size={15} />}
+            </button>
+          )}
           {(item.externalLinks ?? []).map((l) => (
             <a
               key={l.url}
@@ -228,7 +255,7 @@ function ReleaseCard({ release, today }: { release: ReleaseGroupInfo; today: str
       >
         {release.coverURL ? (
           // eslint-disable-next-line @next/next/no-img-element
-          <img src={release.coverURL} alt="" className="h-full w-full object-cover" />
+          <img src={release.coverURL} alt="" loading="lazy" decoding="async" className="h-full w-full object-cover" />
         ) : (
           <div className="flex h-full w-full items-center justify-center text-[11px] font-bold uppercase tracking-[0.14em] text-subtle">
             {KIND_LABEL[release.kind]}

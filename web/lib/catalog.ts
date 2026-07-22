@@ -105,6 +105,7 @@ export interface CatalogDBRow {
   genres: unknown;
   external_links: unknown;
   metadata: unknown;
+  original_language: string | null;
 }
 
 // Neon's driver returns JSONB columns already parsed in practice, but this
@@ -226,6 +227,31 @@ export function catalogRowToMediaItem(row: CatalogDBRow): MediaItem {
   };
 }
 
+// A show's upcoming SEASON PREMIERE specifically (episode 1 of a season) —
+// distinct from catalogRowToMediaItem's "next episode airing" above, which
+// is often just next week's episode of an ALREADY-airing season for a
+// weekly show (Big Brother, Criminal Minds, ...). Used by lib/upcoming.ts's
+// "Popular upcoming" returning-show premieres, which wants "a new season is
+// starting," not "here's the next episode of a show mid-run." Same
+// metadata-scan + nextEpisodeToAir-fallback strategy as the tvShow branch
+// above (see there for why both signals exist), just filtered to
+// episode === 1.
+export function nextSeasonPremiere(row: CatalogDBRow): { releaseDate: string; season: number } | undefined {
+  const metadata = parseJSON<Record<string, unknown>>(row.metadata, {});
+  const seasons = (metadata.seasons as CatalogSeasonMeta[] | undefined) ?? [];
+  const todayISO = new Date().toISOString().slice(0, 10);
+  const next = seasons
+    .flatMap((s) => s.episodes.map((e) => ({ season: s.seasonNumber, episode: e.episode, airDate: e.airDate })))
+    .filter((e): e is { season: number; episode: number; airDate: string } => e.episode === 1 && !!e.airDate && e.airDate >= todayISO)
+    .sort((a, b) => (a.airDate < b.airDate ? -1 : 1))[0];
+
+  const rawNext = metadata.nextEpisodeToAir as { season: number; episode: number; airDate: string } | undefined;
+  const fallbackNext = rawNext && rawNext.episode === 1 && rawNext.airDate >= todayISO ? rawNext : undefined;
+
+  const chosen = next ?? fallbackNext;
+  return chosen ? { releaseDate: chosen.airDate, season: chosen.season } : undefined;
+}
+
 // Word-prefix tsquery, e.g. "toy story" -> "toy:* & story:*" — matches
 // partial/still-typing input against the generated search_vector column
 // (see lib/db.ts). Stripped to plain alphanumeric tokens so arbitrary input
@@ -240,6 +266,57 @@ export function buildPrefixQuery(query: string): string | null {
     .slice(0, 8);
   if (tokens.length === 0) return null;
   return tokens.map((t) => `${t}:*`).join(" & ");
+}
+
+// Catalog artists are bulk-ingested via a BFS out from Deezer's chart artists
+// (see lib/sources/deezer.ts's deezerArtistPool) — relevance decays with BFS
+// depth but nothing floors it, so a few hundred near-unknown acts (under
+// 1,000 fans — verified live: 198 of 3,004 catalog artists) end up in the
+// pool and can outrank a real match on ts_rank alone for a generic query.
+// Matches LIVE_ARTIST_MIN_FANS in deezer.ts so a catalog hit and a live
+// fallback hit are held to the same bar.
+//
+// A plain higher floor can't fix the "One Piece"/"One Piece OST" case
+// (searching a franchise name surfaces fan-upload soundtrack accounts) —
+// verified live, those sit at 4,169 and 2,126 fans, but so do genuinely real
+// niche artists (Sidney Gish: 2,874, Squirrel Flower: 1,273, Jockstrap:
+// 3,725) — raising the floor high enough to cut the former would cut the
+// latter too. Two more targeted signals instead: a soundtrack-account name
+// pattern, and a much higher bar applied ONLY when the candidate's name
+// exactly matches something already in our own non-artist catalog (a movie/
+// show/game named "One Piece" already existing is a strong, specific signal
+// that an "artist" by that exact name is more likely riding the franchise's
+// name than being a distinct act — a real band that happens to share an
+// exact title's name would still plausibly clear a high bar on its own,
+// e.g. the French band Air vs. the movie "Air").
+const MIN_ARTIST_CATALOG_POPULARITY = 1000;
+// Exported so lib/sources/index.ts's liveArtistSearch can apply the same bar
+// to the Deezer fallback path — one source of truth for the number.
+export const FRANCHISE_NAME_COLLISION_MIN_FANS = 50000;
+
+function looksLikeSoundtrackAccount(name: string): boolean {
+  return /\b(ost|soundtrack|original score|theme song)\b/i.test(name);
+}
+
+// Cross-references candidate artist names against titles already in our own
+// non-artist catalog (movie/tvShow/game/manga) — used to spot the "One
+// Piece" pattern above. Exact (case-insensitive) match only, to keep false
+// positives rare; a fuzzy/contains match here would falsely flag real bands
+// with common-word names far too often.
+export async function existingMediaTitles(names: string[]): Promise<Set<string>> {
+  if (names.length === 0) return new Set();
+  try {
+    await ensureSchema();
+    const sql = db();
+    const lowerNames = names.map((n) => n.toLowerCase());
+    const rows = (await sql`
+      SELECT DISTINCT lower(title) AS t FROM catalog_items
+      WHERE type != 'artist' AND lower(title) = ANY(${lowerNames})
+    `) as { t: string }[];
+    return new Set(rows.map((r) => r.t));
+  } catch {
+    return new Set();
+  }
 }
 
 export async function searchCatalog(
@@ -284,7 +361,17 @@ export async function searchCatalog(
              ORDER BY ts_rank(search_vector, to_tsquery('english', $1)) DESC, popularity_score DESC LIMIT $2`,
             [tsq, limit]
           );
-    return (rows as unknown as CatalogDBRow[]).map(catalogRowToMediaItem);
+    if (type !== "artist") {
+      return (rows as unknown as CatalogDBRow[]).map(catalogRowToMediaItem);
+    }
+    const artistRows = (rows as unknown as CatalogDBRow[]).filter(
+      (r) => r.popularity_score >= MIN_ARTIST_CATALOG_POPULARITY && !looksLikeSoundtrackAccount(r.title)
+    );
+    const collisions = await existingMediaTitles(artistRows.map((r) => r.title));
+    const filtered = artistRows.filter(
+      (r) => !collisions.has(r.title.toLowerCase()) || r.popularity_score >= FRANCHISE_NAME_COLLISION_MIN_FANS
+    );
+    return filtered.map(catalogRowToMediaItem);
   } catch {
     return [];
   }

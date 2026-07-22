@@ -35,6 +35,8 @@ export default function FeedRow({
         <img
           src={item.posterURL}
           alt=""
+          loading="lazy"
+          decoding="async"
           className={`shrink-0 object-cover ${
             item.type === "artist" ? "h-[72px] w-[72px] rounded-full" : "h-[92px] w-[64px] rounded-[10px]"
           }`}

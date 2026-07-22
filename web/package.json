@@ -10,7 +10,10 @@
     "ingest": "tsx scripts/ingest-catalog.ts",
     "rebuild-collections": "tsx scripts/rebuild-collections.ts",
     "refresh-trending": "tsx scripts/refresh-trending.ts",
-    "backfill-backdrops": "tsx scripts/backfill-backdrops.ts"
+    "backfill-backdrops": "tsx scripts/backfill-backdrops.ts",
+    "shrink-posters": "tsx scripts/shrink-posters.ts",
+    "refresh-discover-snapshot": "tsx scripts/refresh-discover-snapshot.ts",
+    "refresh-upcoming-calendar": "tsx scripts/refresh-upcoming-calendar.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.9.4",

@@ -99,12 +99,16 @@ async function matchTitles(type: PartType, titles: string[]): Promise<Map<string
   return resolved;
 }
 
-// Same tiered exact/prefix/contains approach as matchTier, but against
-// upcoming_items — for finding a collection's next NOT-YET-RELEASED entry
-// (see collection_next_release in lib/db.ts). Only date_confirmed=true rows
-// qualify: an undated "TBA" entry has no date to show on the "Up next" card.
-// upcoming_items only ever holds movie/tvShow/game rows (manga has no
-// "upcoming" concept), so this is only ever called for those three types.
+// Same tiered exact/prefix approach as matchTier, but against
+// upcoming_calendar — for finding a collection's next NOT-YET-RELEASED entry
+// (see collection_next_release in lib/db.ts). Reads upcoming_calendar (the
+// Trakt/IGDB-vetted precomputed calendar — see lib/upcomingCalendar.ts), NOT
+// the raw upcoming_items: every row there already cleared a real quality bar
+// and confirmed-date check, so there's no separate date_confirmed condition
+// to add, and a franchise's "Up next" card can only ever point at something
+// the rest of the site already treats as genuinely notable. upcoming_calendar
+// only ever holds movie/tvShow/game rows (manga has no "upcoming" concept),
+// so this is only ever called for those three types.
 interface UpcomingMatch {
   wanted: string;
   id: string;
@@ -113,54 +117,90 @@ interface UpcomingMatch {
   releaseDate: string;
 }
 
-// Deliberately only exact + prefix — NO contains tier. Verified live: a
-// "sports" curated title "Air" (2023, already released, correctly absent
-// from upcoming_items) fell through to a contains match against "Avatar
-// Aang: The Last Airbender" purely because "Air" is a substring of
-// "Airbender". Harmless for bulk catalog membership (matchTier, many items
-// blended together — see rationale there), but this feeds a single
-// prominent "Up next" card per franchise: a false match is far worse than
-// no match, so a curated title with no exact/prefix hit in upcoming_items
-// just means "nothing upcoming for this title" rather than reaching for a
-// loose guess.
+// Now includes a contains tier (unlike the exact+prefix-only version this
+// used to be) — verified live it's needed: "LEGO ONE PIECE" (a real,
+// Trakt-anticipated show) never prefix-matches the derived keyword "One
+// Piece" because the franchise name sits mid-title, not at the start. Back
+// when this matched against the full unfiltered upcoming_items, a contains
+// tier was too dangerous — a "sports" curated title "Air" (2023, already
+// released) fell through to a contains match against "Avatar Aang: The
+// Last Airbender" purely because "Air" is a substring of "Airbender". Now
+// that this matches against the much smaller, pre-vetted upcoming_calendar
+// instead (~150-300 rows, every one already Trakt/IGDB-admitted), that
+// false-positive surface is far smaller, and even a wrong contains match
+// would itself be a genuinely notable title, not noise.
 async function matchUpcomingTier(
   type: PartType,
   titles: string[],
-  tier: "exact" | "prefix"
+  tier: "exact" | "prefix" | "contains"
 ): Promise<UpcomingMatch[]> {
   const sql = db();
-  const rows =
-    tier === "exact"
-      ? await sql`
-          SELECT t.title AS wanted, m.id, m.title, m.poster_url AS "posterURL", m.release_date::text AS "releaseDate"
-          FROM UNNEST(${titles}::text[]) AS t(title)
-          JOIN LATERAL (
-            SELECT id, title, poster_url, release_date FROM upcoming_items
-            WHERE type = ${type} AND date_confirmed = true AND lower(title) = lower(t.title)
-            ORDER BY release_date ASC LIMIT 1
-          ) m ON true
-        `
-      : await sql`
-          SELECT t.title AS wanted, m.id, m.title, m.poster_url AS "posterURL", m.release_date::text AS "releaseDate"
-          FROM UNNEST(${titles}::text[]) AS t(title)
-          JOIN LATERAL (
-            SELECT id, title, poster_url, release_date FROM upcoming_items
-            WHERE type = ${type} AND date_confirmed = true AND title ILIKE t.title || '%'
-            ORDER BY release_date ASC LIMIT 1
-          ) m ON true
-        `;
-  return rows as unknown as UpcomingMatch[];
+  if (tier === "exact") {
+    return (await sql`
+      SELECT t.title AS wanted, m.id, m.title, m.poster_url AS "posterURL", m.release_date::text AS "releaseDate"
+      FROM UNNEST(${titles}::text[]) AS t(title)
+      JOIN LATERAL (
+        SELECT id, title, poster_url, release_date FROM upcoming_calendar
+        WHERE type = ${type} AND lower(title) = lower(t.title)
+        ORDER BY release_date ASC LIMIT 1
+      ) m ON true
+    `) as unknown as UpcomingMatch[];
+  }
+  if (tier === "prefix") {
+    return (await sql`
+      SELECT t.title AS wanted, m.id, m.title, m.poster_url AS "posterURL", m.release_date::text AS "releaseDate"
+      FROM UNNEST(${titles}::text[]) AS t(title)
+      JOIN LATERAL (
+        SELECT id, title, poster_url, release_date FROM upcoming_calendar
+        WHERE type = ${type} AND title ILIKE t.title || '%'
+        ORDER BY release_date ASC LIMIT 1
+      ) m ON true
+    `) as unknown as UpcomingMatch[];
+  }
+  return (await sql`
+    SELECT t.title AS wanted, m.id, m.title, m.poster_url AS "posterURL", m.release_date::text AS "releaseDate"
+    FROM UNNEST(${titles}::text[]) AS t(title)
+    JOIN LATERAL (
+      SELECT id, title, poster_url, release_date FROM upcoming_calendar
+      WHERE type = ${type} AND title ILIKE '%' || t.title || '%'
+      ORDER BY release_date ASC LIMIT 1
+    ) m ON true
+  `) as unknown as UpcomingMatch[];
 }
 
 async function matchUpcomingTitles(type: PartType, titles: string[]): Promise<Map<string, UpcomingMatch>> {
   const resolved = new Map<string, UpcomingMatch>();
   let remaining = titles;
-  for (const tier of ["exact", "prefix"] as const) {
+  for (const tier of ["exact", "prefix", "contains"] as const) {
     if (remaining.length === 0) break;
     for (const r of await matchUpcomingTier(type, remaining, tier)) resolved.set(r.wanted, r);
     remaining = remaining.filter((t) => !resolved.has(t));
   }
   return resolved;
+}
+
+// The curated lists are an exhaustive record of SPECIFIC known past entries
+// ("Spider-Man: Homecoming", "Spider-Man: No Way Home", ...) — a brand new
+// colon-subtitled sequel that didn't exist yet when the list was written
+// ("Spider-Man: Brand New Day") never exact/prefix-matches any of them, so
+// most franchises' "Up next" card silently stayed empty even with a real
+// upcoming entry sitting in upcoming_calendar (verified live: One Piece's
+// "Grand Gourmet" game, Marvel's "Spider-Man: Brand New Day"). Splitting
+// each curated title on its first ": " recovers the shared franchise-level
+// name behind every subtitled entry (Homecoming/Far From Home/No Way
+// Home/Brand New Day all reduce to "Spider-Man"), which then prefix-matches
+// ANY future entry automatically — no hand-maintenance needed going
+// forward. Titles without a colon ("Iron Man", "The Avengers") don't need
+// this: the bare curated title is already its own effective prefix for a
+// numbered sequel. The length-4 floor skips trivially short/generic
+// fragments that would otherwise risk a wrong match.
+export function deriveUpcomingKeywords(titles: string[]): string[] {
+  const keywords = new Set<string>();
+  for (const title of titles) {
+    const idx = title.indexOf(": ");
+    if (idx > 3) keywords.add(title.slice(0, idx));
+  }
+  return [...keywords];
 }
 
 export async function rebuildAllCollections(): Promise<RebuildSummary> {
@@ -186,13 +226,37 @@ export async function rebuildAllCollections(): Promise<RebuildSummary> {
     resolvedByType[type] = await matchTitles(type, [...titlesByType[type]]);
   }
 
-  // Same shared-resolution-once approach against upcoming_items, for the
+  // Same shared-resolution-once approach against upcoming_calendar, for the
   // "Up next" franchise card (collection_next_release) — manga excluded,
-  // upcoming_items never has manga rows.
-  const UPCOMING_TYPES: PartType[] = ["movie", "tvShow", "game"];
-  const upcomingResolvedByType = {} as Record<PartType, Map<string, UpcomingMatch>>;
+  // upcoming_calendar never has manga rows. Uses a BROADER per-collection
+  // keyword set than catalog membership above: the curated titles
+  // themselves, PLUS each one's derived franchise-level keyword (see
+  // deriveUpcomingKeywords) — kept as its own separate map so a derived
+  // keyword like "Spider-Man" only ever widens the "Up next" search, never
+  // accidentally pulls unrelated catalog items into a collection's actual
+  // membership via matchTitles' contains tier above.
+  const UPCOMING_TYPES = ["movie", "tvShow", "game"] as const;
+  const upcomingTitlesByType: Record<(typeof UPCOMING_TYPES)[number], Set<string>> = {
+    movie: new Set(),
+    tvShow: new Set(),
+    game: new Set(),
+  };
+  const upcomingKeywordsByDef = new Map<string, Partial<Record<(typeof UPCOMING_TYPES)[number], string[]>>>();
+  for (const def of COLLECTIONS) {
+    const perDef: Partial<Record<(typeof UPCOMING_TYPES)[number], string[]>> = {};
+    for (const type of UPCOMING_TYPES) {
+      const curated = def.curated?.[type] ?? [];
+      if (curated.length === 0) continue;
+      const combined = [...new Set([...curated, ...deriveUpcomingKeywords(curated)])];
+      perDef[type] = combined;
+      for (const t of combined) upcomingTitlesByType[type].add(t);
+    }
+    upcomingKeywordsByDef.set(def.slug, perDef);
+  }
+
+  const upcomingResolvedByType = {} as Record<(typeof UPCOMING_TYPES)[number], Map<string, UpcomingMatch>>;
   for (const type of UPCOMING_TYPES) {
-    upcomingResolvedByType[type] = await matchUpcomingTitles(type, [...titlesByType[type]]);
+    upcomingResolvedByType[type] = await matchUpcomingTitles(type, [...upcomingTitlesByType[type]]);
   }
 
   // Assemble each collection's membership from the shared resolution maps.
@@ -212,14 +276,20 @@ export async function rebuildAllCollections(): Promise<RebuildSummary> {
         const id = resolvedByType[type].get(title);
         if (id) ids.add(id);
         else unmatched.push(title);
-
-        if (type !== "manga") {
-          const upcomingMatch = upcomingResolvedByType[type as (typeof UPCOMING_TYPES)[number]].get(title);
-          if (upcomingMatch && (!best || upcomingMatch.releaseDate < best.releaseDate)) best = upcomingMatch;
-        }
       }
       totalUnmatched += unmatched.length;
       perType.push({ type, matched: titles.length - unmatched.length, total: titles.length, unmatched });
+    }
+    // "Up next" search uses the BROADER curated+derived keyword set (see
+    // upcomingKeywordsByDef above), separately from the catalog-membership
+    // loop just above, which stays scoped to the raw curated titles only.
+    for (const type of UPCOMING_TYPES) {
+      const keywords = upcomingKeywordsByDef.get(def.slug)?.[type];
+      if (!keywords) continue;
+      for (const keyword of keywords) {
+        const upcomingMatch = upcomingResolvedByType[type].get(keyword);
+        if (upcomingMatch && (!best || upcomingMatch.releaseDate < best.releaseDate)) best = upcomingMatch;
+      }
     }
     collections.push({ slug: def.slug, custom: false, perType });
     for (const itemId of ids) pairs.push({ slug: def.slug, itemId });

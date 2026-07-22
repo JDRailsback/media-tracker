@@ -6,7 +6,10 @@ import { Search as SearchIcon, Bell, Sparkles, ArrowLeft, Plus } from "lucide-re
 import type { MediaItem } from "@/lib/types";
 import { addFollow, getFollowed, isFollowed, removeFollow, FollowedItem } from "@/lib/library";
 import { buildFeed, describeRelease, parseReleaseDay } from "@/lib/feed";
-import { enablePush, syncFollow } from "@/lib/push-client";
+import { currentSubscription, enablePush, fetchPrefs, syncFollow } from "@/lib/push-client";
+import { getReadIds, markRead, timeAgo } from "@/lib/notificationHistory";
+import { LEAD_TIME_OPTIONS } from "@/lib/notificationPrefs";
+import TypeMutes from "@/components/TypeMutes";
 import type { DiscoverPayload } from "@/lib/sources";
 import DetailModal from "@/components/DetailModal";
 import MediaCard from "@/components/MediaCard";
@@ -20,15 +23,25 @@ import Sidebar, { View } from "@/components/Sidebar";
 import ThemeToggle from "@/components/ThemeToggle";
 import PlatformPrefs from "@/components/PlatformPrefs";
 import ContentFilters from "@/components/ContentFilters";
+import IntlBarSetting from "@/components/IntlBarSetting";
+import GeneralBarSetting from "@/components/GeneralBarSetting";
 import AmbientBackground from "@/components/AmbientBackground";
 import type { ContentCategory } from "@/lib/contentFilters";
 import { getHiddenCategories } from "@/lib/hiddenCategories";
+import { getIntlBarLevel, type IntlBarLevel } from "@/lib/intlBar";
+import { getGeneralBarLevel, type GeneralBarLevel } from "@/lib/generalBar";
+import { getFreshCache, setFreshCache } from "@/lib/freshCache";
+import { getDiscoverCache, setDiscoverCache } from "@/lib/discoverCache";
 
+// Manga is intentionally absent — removed from Discover/Search site-wide for
+// now (explicit request, flagged as something to potentially re-add later;
+// see lib/discoverSnapshot.ts's DiscoverPayload comment). Existing followed
+// manga items still render fine in Following (FOLLOW_GROUP_ORDER/TITLE
+// below) — that's untouched, only the discovery/search surfaces are off.
 const CATEGORY_TITLE: Record<string, string> = {
   movies: "Trending movies",
   tv: "Trending TV",
   games: "Trending games",
-  manga: "Trending manga",
   artists: "Trending artists",
   upcoming: "Popular upcoming",
   "new-releases": "New releases",
@@ -40,7 +53,6 @@ const SEARCH_TYPE_FILTERS: { value: string; label: string }[] = [
   { value: "movie", label: "Movies" },
   { value: "tvShow", label: "TV" },
   { value: "game", label: "Games" },
-  { value: "manga", label: "Manga" },
   { value: "artist", label: "Music" },
   { value: "franchise", label: "Collections" },
 ];
@@ -55,6 +67,21 @@ const MIN_SEARCH_CHARS = 2;
 // In-memory result cache, capped — backspacing through a query re-renders
 // instantly instead of refetching every prefix.
 const SEARCH_CACHE_MAX = 50;
+
+// One row of /api/notifications' response — see that route for field docs.
+interface NotificationEntry {
+  id: number;
+  itemID: string;
+  eventType: string;
+  leadDays: number;
+  releaseDate: string;
+  title: string;
+  subtitle?: string;
+  message: string;
+  createdAt: string;
+}
+
+const VALID_VIEWS = new Set<View>(["feed", "discover", "following", "notifications", "settings"]);
 
 // Following page: grouped sections (in display order) and the sort applied
 // within each group. "Recently followed" (default) mirrors the old flat
@@ -122,7 +149,14 @@ function shelfDateLabel(item: MediaItem): string {
   // midnight read one day early in western timezones (see lib/feed.ts).
   const d = parseReleaseDay(item.releaseDate);
   if (Number.isNaN(d.getTime())) return "TBA";
-  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  // Year only when it's not the current year — "Feb 1" reads as "coming up"
+  // for a same-year date, but silently means 2027 for a title over a year
+  // out (verified live: a "Popular upcoming" list spanning into next year
+  // showed dates like "Feb 1" with no way to tell it wasn't a few weeks
+  // away). Compared against real "now," not the item's own year, so a title
+  // that slips from next year into this one relabels correctly on its own.
+  const showYear = d.getFullYear() !== new Date().getFullYear();
+  return d.toLocaleDateString(undefined, showYear ? { year: "numeric", month: "short", day: "numeric" } : { month: "short", day: "numeric" });
 }
 
 // See the restore/persist effects in Home() for why this exists.
@@ -158,12 +192,30 @@ export default function Home() {
   const [freshLoaded, setFreshLoaded] = useState(false);
   const [pushEnabled, setPushEnabled] = useState(false);
 
-  // Discover
-  const [discoverData, setDiscoverData] = useState<DiscoverPayload | null>(null);
+  // Discover. Hydrated from last session's cache so the shelves render
+  // instantly on the first visit this session instead of blanking behind
+  // "Loading…" — discoverFetched (NOT discoverData) is what actually gates
+  // the fetch effect below, so the cache is purely a stand-in until the
+  // real fetch lands, never a substitute for it (see freshCache.ts for the
+  // identical pattern on Home).
+  const [discoverData, setDiscoverData] = useState<DiscoverPayload | null>(() => getDiscoverCache());
+  const [discoverFetched, setDiscoverFetched] = useState(false);
   const [discoverLoading, setDiscoverLoading] = useState(false);
   const [category, setCategory] = useState<string | null>(null);
   const [categoryItems, setCategoryItems] = useState<MediaItem[]>([]);
   const [categoryLoading, setCategoryLoading] = useState(false);
+  // "upcoming" is the one category page meant to be browsed hundreds deep
+  // (infinite scroll) rather than a single fixed-size grid — see
+  // loadMoreUpcoming below and lib/upcoming.ts's upcomingBrowse.
+  // categoryPageRef is a page NUMBER (matching the API's fixed per-page slot
+  // count, not an item offset — see the API route's comment on why
+  // item-count offsets would drift out of sync with upcomingBrowse's
+  // per-type windows) — a ref, not state, since it's read synchronously
+  // inside loadMoreUpcoming's re-entrancy guard (see there for why).
+  const categoryPageRef = useRef(0);
+  const loadingMoreRef = useRef(false);
+  const [categoryHasMore, setCategoryHasMore] = useState(false);
+  const [categoryLoadingMore, setCategoryLoadingMore] = useState(false);
   const [creatingCollection, setCreatingCollection] = useState(false);
 
   // Settings → Content filters — read once on mount; changing it clears
@@ -172,6 +224,23 @@ export default function Home() {
   const [hiddenCategories, setHiddenCategories] = useState<ContentCategory[]>([]);
   useEffect(() => setHiddenCategories(getHiddenCategories()), []);
   const hideParam = hiddenCategories.length > 0 ? `hide=${hiddenCategories.join(",")}` : "";
+
+  // Settings → Popular upcoming's international bar (see lib/intlBar.ts) —
+  // same read-once-on-mount, clear-and-refetch pattern as hiddenCategories.
+  const [intlBar, setIntlBar] = useState<IntlBarLevel>("moderate");
+  useEffect(() => setIntlBar(getIntlBarLevel()), []);
+  const intlBarParam = `intlBar=${intlBar}`;
+
+  // Settings → Popular upcoming's general bar (see lib/generalBar.ts) —
+  // same pattern, but applies regardless of language.
+  const [generalBar, setGeneralBar] = useState<GeneralBarLevel>("moderate");
+  useEffect(() => setGeneralBar(getGeneralBarLevel()), []);
+  const generalBarParam = `generalBar=${generalBar}`;
+
+  // Combined query string for every Discover-family fetch — both bar params
+  // are always present (they have real defaults), hideParam only when
+  // non-empty.
+  const discoverParams = [intlBarParam, generalBarParam, hideParam].filter(Boolean).join("&");
 
   // Search
   const [query, setQuery] = useState("");
@@ -187,29 +256,115 @@ export default function Home() {
   const [heroIndex, setHeroIndex] = useState(0);
   const [heroPaused, setHeroPaused] = useState(false);
 
-  useEffect(() => setFollowed(getFollowed()), []);
+  // Notifications — fetched on mount regardless of active view so the
+  // Sidebar's unread badge is accurate everywhere. readIds mirrors the
+  // localStorage read-set (lib/notificationHistory.ts); unreadAtOpenRef
+  // snapshots which rows were unread the moment the view opened, so the
+  // unread dots stay visible during the visit even though everything is
+  // marked read immediately (which is what clears the badge).
+  const [notifications, setNotifications] = useState<NotificationEntry[]>([]);
+  const [readIds, setReadIds] = useState<number[]>([]);
+  const unreadAtOpenRef = useRef<Set<number>>(new Set());
+  // null = push not enabled on this device (controls show their hint state).
+  const [leadTime, setLeadTime] = useState<number | null>(null);
+
+  useEffect(() => {
+    setFollowed(getFollowed());
+    // Hydrate the freshness overlay from the LAST session's fetch before
+    // this session's fetch resolves (stale-while-revalidate). Without it,
+    // any item whose frozen follow-time snapshot has a past date — every
+    // weekly TV show, within a week of following — vanished from Home for
+    // the seconds the refresh took, then popped in (verified live).
+    setFreshById(getFreshCache());
+  }, []);
 
   const followedIdsKey = followed.map((f) => f.id).join(",");
   useEffect(() => {
     if (!followedIdsKey) return;
     setFreshLoaded(false);
     fetch(`/api/followed?ids=${encodeURIComponent(followedIdsKey)}`)
-      .then((r) => (r.ok ? r.json() : {}))
-      .then((fresh: Record<string, MediaItem>) => setFreshById(fresh))
-      .catch(() => setFreshById({}))
+      .then((r) => (r.ok ? r.json() : null))
+      .then((fresh: Record<string, MediaItem> | null) => {
+        // On failure, keep whatever we're already showing (the hydrated
+        // cache) — clobbering to {} would blank the page on a bad network.
+        if (!fresh) return;
+        setFreshById(fresh);
+        setFreshCache(fresh);
+      })
+      .catch(() => {})
       .finally(() => setFreshLoaded(true));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [followedIdsKey]);
 
+  // One-time backfill: follows made before the server accepted push-less
+  // registration (see /api/follow) have no followed_items row, so the poll
+  // can't log history for them. Re-sync every local follow once; the flag
+  // is set FIRST so a mid-run reload can't spam duplicate posts (the calls
+  // are idempotent upserts anyway — the flag just avoids the traffic).
   useEffect(() => {
-    if (view !== "discover" || discoverData || discoverLoading) return;
-    setDiscoverLoading(true);
-    fetch(`/api/discover${hideParam ? `?${hideParam}` : ""}`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => d && setDiscoverData(d))
-      .finally(() => setDiscoverLoading(false));
+    if (followed.length === 0) return;
+    if (localStorage.getItem("serverFollowsSynced") === "1") return;
+    localStorage.setItem("serverFollowsSynced", "1");
+    for (const f of followed) void syncFollow(f.id, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, discoverData, discoverLoading, hideParam]);
+  }, [followedIdsKey]);
+
+  useEffect(() => {
+    setReadIds(getReadIds());
+    if (!followedIdsKey) {
+      setNotifications([]);
+      return;
+    }
+    fetch(`/api/notifications?ids=${encodeURIComponent(followedIdsKey)}`)
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows: NotificationEntry[]) => setNotifications(rows))
+      .catch(() => {});
+  }, [followedIdsKey]);
+
+  // Opening the Notifications view marks everything read (clears the
+  // badge) — after snapshotting what WAS unread so the in-list dots
+  // survive the visit.
+  useEffect(() => {
+    if (view !== "notifications" || notifications.length === 0) return;
+    const read = new Set(getReadIds());
+    unreadAtOpenRef.current = new Set(notifications.filter((n) => !read.has(n.id)).map((n) => n.id));
+    markRead(notifications.map((n) => n.id));
+    setReadIds(getReadIds());
+  }, [view, notifications]);
+
+  // Reflect existing push state in Settings (previously the Enable button
+  // always started as "Enable" even when push was already on), and hydrate
+  // the reminder lead-time from this device's stored prefs.
+  useEffect(() => {
+    currentSubscription().then((sub) => {
+      if (!sub) return;
+      setPushEnabled(true);
+      fetchPrefs().then((p) => p && setLeadTime(p.leadTimeDays));
+    });
+  }, []);
+
+  useEffect(() => {
+    // Gated on discoverFetched, NOT discoverData — cached data from a
+    // previous session already fills discoverData on mount (see its lazy
+    // initializer above), but that's stale-while-revalidate filler, not a
+    // reason to skip the real fetch. Once this session's own fetch lands,
+    // discoverFetched stops it from ever refiring for the rest of the visit
+    // (matches the app's existing "fetch once per session" behavior).
+    if (view !== "discover" || discoverFetched || discoverLoading) return;
+    setDiscoverLoading(true);
+    fetch(`/api/discover?${discoverParams}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!d) return;
+        setDiscoverData(d);
+        setDiscoverCache(d);
+      })
+      .finally(() => {
+        setDiscoverLoading(false);
+        setDiscoverFetched(true);
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, discoverFetched, discoverLoading, discoverParams]);
 
   // This SPA never reflects `view`/search state in the URL — it's all one
   // route ("/"). That means the browser's back button, on its own, can only
@@ -232,6 +387,19 @@ export default function Home() {
         setHasSearched(saved.hasSearched ?? false);
         setCategory(saved.category ?? null);
         setCategoryItems(saved.categoryItems ?? []);
+      }
+      // Push-notification deep link (/?view=notifications — see /api/poll's
+      // payload url): a one-shot override of whatever view was restored,
+      // then scrubbed from the URL so a refresh doesn't re-trigger it. The
+      // override is ALSO written into the sessionStorage state before the
+      // scrub — React 18's dev double-mount re-runs this effect after the
+      // URL is already clean, and without the write the second run would
+      // restore the old saved view right over the deep link (verified live).
+      const urlView = new URLSearchParams(window.location.search).get("view") as View | null;
+      if (urlView && VALID_VIEWS.has(urlView)) {
+        setView(urlView);
+        sessionStorage.setItem(SESSION_KEY, JSON.stringify({ ...(saved ?? {}), view: urlView }));
+        window.history.replaceState({}, "", "/");
       }
     } catch {
       // Corrupt/unavailable sessionStorage just means starting fresh.
@@ -280,12 +448,64 @@ export default function Home() {
 
   function openCategory(cat: string) {
     setCategory(cat);
+    setCategoryItems([]);
+    categoryPageRef.current = 0;
+    loadingMoreRef.current = false;
+    setCategoryHasMore(false);
     setCategoryLoading(true);
-    fetch(`/api/discover?category=${cat}${hideParam ? `&${hideParam}` : ""}`)
-      .then((r) => (r.ok ? r.json() : []))
+    fetch(`/api/discover?category=${cat}&${discoverParams}`)
+      .then((r) => {
+        if (cat === "upcoming") setCategoryHasMore(r.headers.get("X-Has-More") === "true");
+        return r.ok ? r.json() : [];
+      })
       .then(setCategoryItems)
       .finally(() => setCategoryLoading(false));
   }
+
+  // "Popular upcoming" is the one See all page meant to be a full,
+  // hundreds-deep release calendar rather than a fixed-size grid (see
+  // lib/upcoming.ts's upcomingBrowse) — this appends the next page instead
+  // of replacing categoryItems, driven by the scroll listener below.
+  //
+  // loadingMoreRef is a SYNCHRONOUS re-entrancy guard, not just the
+  // categoryLoadingMore state — React state updates aren't visible until the
+  // next render, so two scroll events firing back-to-back (verified live:
+  // React 18 dev-mode's effect double-invocation briefly attaches the
+  // scroll listener twice) could both read categoryLoadingMore as still
+  // false and both fire a fetch for the same nextPage, appending every item
+  // on that page twice. The id-based filter on append is a second,
+  // independent safety net against the same failure mode.
+  function loadMoreUpcoming() {
+    if (loadingMoreRef.current || !categoryHasMore) return;
+    loadingMoreRef.current = true;
+    const nextPage = categoryPageRef.current + 1;
+    setCategoryLoadingMore(true);
+    fetch(`/api/discover?category=upcoming&page=${nextPage}&${discoverParams}`)
+      .then(async (r) => {
+        setCategoryHasMore(r.headers.get("X-Has-More") === "true");
+        const items: MediaItem[] = r.ok ? await r.json() : [];
+        setCategoryItems((prev) => {
+          const seen = new Set(prev.map((i) => i.id));
+          return [...prev, ...items.filter((i) => !seen.has(i.id))];
+        });
+        categoryPageRef.current = nextPage;
+      })
+      .finally(() => {
+        setCategoryLoadingMore(false);
+        loadingMoreRef.current = false;
+      });
+  }
+
+  useEffect(() => {
+    if (category !== "upcoming") return;
+    function onScroll() {
+      const nearBottom = document.documentElement.scrollHeight - (window.innerHeight + window.scrollY) < 600;
+      if (nearBottom) loadMoreUpcoming();
+    }
+    window.addEventListener("scroll", onScroll);
+    return () => window.removeEventListener("scroll", onScroll);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [category, categoryHasMore, categoryLoadingMore]);
 
   async function runSearch(q: string, type: string) {
     const trimmed = q.trim();
@@ -359,7 +579,11 @@ export default function Home() {
   }
 
   async function handleEnablePush() {
-    setPushEnabled(await enablePush());
+    const ok = await enablePush();
+    setPushEnabled(ok);
+    // A brand-new subscription starts with default prefs — hydrate the
+    // lead-time control so it goes live without a reload.
+    if (ok) fetchPrefs().then((p) => p && setLeadTime(p.leadTimeDays));
   }
 
   // Collections and artists open their own dedicated pages, not the generic
@@ -436,6 +660,7 @@ export default function Home() {
       <AmbientBackground />
       <Sidebar
         active={view}
+        unreadCount={notifications.filter((n) => !readIds.includes(n.id)).length}
         onChange={(v) => {
           // Clicking "Discover" again while already there clears any active
           // search/drill-down and returns to the landing shelves, instead of
@@ -454,7 +679,7 @@ export default function Home() {
               <EmptyState
                 icon={<Sparkles size={22} className="text-subtle" />}
                 title="You're all caught up"
-                text="Follow a movie, show, game, or manga in Discover to see release updates here."
+                text="Follow a movie, show, or game in Discover to see release updates here."
               />
             ) : (
               <div className="space-y-10">
@@ -590,7 +815,7 @@ export default function Home() {
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search movies, TV, games, collections, and manga…"
+                placeholder="Search movies, TV, games, and collections…"
                 className="w-full bg-transparent text-[15px] text-ink outline-none placeholder:text-subtle"
               />
             </form>
@@ -730,12 +955,6 @@ export default function Home() {
                       onSeeAll={() => openCategory("games")}
                     />
                     <Shelf
-                      title={CATEGORY_TITLE.manga}
-                      items={discoverData.trendingManga}
-                      onSelect={handleSelect}
-                      onSeeAll={() => openCategory("manga")}
-                    />
-                    <Shelf
                       title={CATEGORY_TITLE.artists}
                       items={discoverData.trendingArtists}
                       onSelect={handleSelect}
@@ -789,6 +1008,9 @@ export default function Home() {
                   )
                 )}
               </div>
+            )}
+            {!categoryLoading && category === "upcoming" && categoryLoadingMore && (
+              <p className="mt-6 text-center text-[13px] text-subtle">Loading more…</p>
             )}
           </>
         )}
@@ -850,6 +1072,75 @@ export default function Home() {
           </>
         )}
 
+        {view === "notifications" && (
+          <>
+            <PageHeader
+              title="Notifications"
+              subtitle="Release changes and reminders for what you follow."
+            />
+            {notifications.length === 0 ? (
+              <EmptyState
+                icon={<Bell size={22} className="text-subtle" />}
+                title="Nothing yet"
+                text="When a followed title's release date is set, changed, or coming up, it shows up here."
+              />
+            ) : (
+              <div>
+                {notifications.map((n, i) => {
+                  // Live poster/title come from the same freshById overlay
+                  // the Home feed already maintains; the frozen message text
+                  // is what actually happened, so it never gets rewritten.
+                  const live = freshById[n.itemID];
+                  const unread = unreadAtOpenRef.current.has(n.id);
+                  const isArtist = n.itemID.startsWith("artist:");
+                  return (
+                    <button
+                      key={n.id}
+                      onClick={() => live && handleSelect(live)}
+                      className="flex w-full animate-fade-up items-center gap-4 rounded-xl px-3 py-3.5 text-left transition-colors duration-200 hover:bg-surface/70"
+                      style={{ animationDelay: `${Math.min(i, 12) * 30}ms` }}
+                    >
+                      {live?.posterURL ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={live.posterURL}
+                          alt=""
+                          loading="lazy"
+                          decoding="async"
+                          className={`shrink-0 object-cover ${
+                            isArtist ? "h-[52px] w-[52px] rounded-full" : "h-[64px] w-[44px] rounded-[8px]"
+                          }`}
+                        />
+                      ) : (
+                        <div
+                          className={`shrink-0 bg-surface ${
+                            isArtist ? "h-[52px] w-[52px] rounded-full" : "h-[64px] w-[44px] rounded-[8px]"
+                          }`}
+                        />
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="truncate text-[14.5px] font-semibold text-ink">{n.title}</span>
+                          {n.eventType === "reminder" && (
+                            <span className="shrink-0 rounded-full bg-accent/12 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.06em] text-accent">
+                              Reminder
+                            </span>
+                          )}
+                        </div>
+                        <div className="mt-1 line-clamp-1 text-[13px] text-subtle">{n.message}</div>
+                      </div>
+                      <div className="flex shrink-0 flex-col items-end gap-1.5">
+                        <span className="text-[11.5px] text-subtle">{timeAgo(n.createdAt)}</span>
+                        {unread && <span className="h-2 w-2 rounded-full bg-accent" aria-label="Unread" />}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </>
+        )}
+
         {view === "settings" && (
           <>
             <PageHeader title="Settings" />
@@ -866,6 +1157,38 @@ export default function Home() {
                   {pushEnabled ? "Enabled" : "Enable"}
                 </button>
               </SettingsRow>
+              <SettingsRow label="Release reminders">
+                {leadTime === null ? (
+                  <span className="text-[13px] text-subtle">Enable notifications first</span>
+                ) : (
+                  <select
+                    value={leadTime}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      setLeadTime(v);
+                      void fetchPrefs({ leadTimeDays: v });
+                    }}
+                    className="input w-44"
+                  >
+                    {LEAD_TIME_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </SettingsRow>
+              <div className="rounded-2xl bg-surface px-5 py-4 ring-1 ring-hairline">
+                <div className="mb-3">
+                  <span className="text-[15px] font-medium text-ink">Muted alert types</span>
+                  <p className="mt-0.5 text-[13px] text-subtle">
+                    Muted types never push notifications on this device; they still show in your history.
+                  </p>
+                </div>
+                {/* Keyed on push state so enabling push swaps the hint for
+                    the live controls without a reload. */}
+                <TypeMutes key={String(pushEnabled)} />
+              </div>
               <div className="rounded-2xl bg-surface px-5 py-4 ring-1 ring-hairline">
                 <div className="mb-3">
                   <span className="text-[15px] font-medium text-ink">Preferred platforms</span>
@@ -886,8 +1209,39 @@ export default function Home() {
                   onChange={(next) => {
                     setHiddenCategories(next);
                     setDiscoverData(null);
+                    setDiscoverFetched(false);
                     setSearchResults([]);
                     setHasSearched(false);
+                  }}
+                />
+              </div>
+              <div className="rounded-2xl bg-surface px-5 py-4 ring-1 ring-hairline">
+                <div className="mb-3">
+                  <span className="text-[15px] font-medium text-ink">Popular upcoming — international bar</span>
+                  <p className="mt-0.5 text-[13px] text-subtle">
+                    How much real anticipation a non-English title needs to appear. English-language titles are unaffected.
+                  </p>
+                </div>
+                <IntlBarSetting
+                  onChange={(next) => {
+                    setIntlBar(next);
+                    setDiscoverData(null);
+                    setDiscoverFetched(false);
+                  }}
+                />
+              </div>
+              <div className="rounded-2xl bg-surface px-5 py-4 ring-1 ring-hairline">
+                <div className="mb-3">
+                  <span className="text-[15px] font-medium text-ink">Popular upcoming — general bar</span>
+                  <p className="mt-0.5 text-[13px] text-subtle">
+                    How much real anticipation ANY title needs to appear, regardless of language.
+                  </p>
+                </div>
+                <GeneralBarSetting
+                  onChange={(next) => {
+                    setGeneralBar(next);
+                    setDiscoverData(null);
+                    setDiscoverFetched(false);
                   }}
                 />
               </div>

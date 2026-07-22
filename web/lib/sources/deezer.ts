@@ -98,15 +98,57 @@ export function artistToMediaItem(a: DeezerArtist): MediaItem {
 // catalog pool walk — the related-artists graph only reaches real acts.
 const LIVE_ARTIST_MIN_FANS = 1000;
 
+// Deezer's own search silently drops numeric/short tokens instead of
+// requiring them — verified live: searching "coco 2" returns "CoCo Jones",
+// "Coco & Clair Clair", and two different artists just named "Coco", none of
+// which contain "2" at all (Deezer matched "coco" alone and ignored the
+// rest). The catalog's own tsquery requires every token to match
+// (buildPrefixQuery joins tokens with "&"), so the live fallback needs the
+// same discipline or it's visibly less strict than the catalog path it's
+// supposed to be filling gaps for.
+function tokenize(q: string): string[] {
+  return q
+    .toLowerCase()
+    .split(/[^a-z0-9]+/i)
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+function matchesAllTokens(name: string, tokens: string[]): boolean {
+  const lower = name.toLowerCase();
+  return tokens.every((t) => lower.includes(t));
+}
+
+// A fan-upload/soundtrack-compilation account can clear LIVE_ARTIST_MIN_FANS
+// just fine ("One Piece OST": 2,126 fans) — verified live, that range
+// overlaps real niche artists too closely for a fan-count floor alone to
+// separate them (see MIN_ARTIST_CATALOG_POPULARITY's comment in
+// lib/catalog.ts). This name-pattern check is cheap and safe since no real
+// band names itself literally "X OST"/"X Soundtrack". The other half of that
+// fix — catching a BARE franchise-name account like "One Piece" itself — is
+// a cross-reference against our own catalog, which needs a DB call this
+// keyless adapter deliberately doesn't make; that part lives in
+// lib/sources/index.ts's liveArtistSearch instead.
+function looksLikeSoundtrackAccount(name: string): boolean {
+  return /\b(ost|soundtrack|original score|theme song)\b/i.test(name);
+}
+
 export async function searchDeezerArtists(q: string, limit = 15): Promise<DeezerArtist[]> {
   const data = await deezerGET<DeezerList<DeezerArtist>>(
     `/search/artist?q=${encodeURIComponent(q)}&limit=${limit}`
   );
+  const tokens = tokenize(q);
   // Portrait-less artists are skipped everywhere (same "must have art" bar
   // every other source applies via poster/cover checks — deezerArtistImage
   // also rejects Deezer's default placeholder portrait).
   return (data.data ?? [])
-    .filter((a) => deezerArtistImage(a) && (a.nb_fan ?? 0) >= LIVE_ARTIST_MIN_FANS)
+    .filter(
+      (a) =>
+        deezerArtistImage(a) &&
+        (a.nb_fan ?? 0) >= LIVE_ARTIST_MIN_FANS &&
+        matchesAllTokens(a.name, tokens) &&
+        !looksLikeSoundtrackAccount(a.name)
+    )
     .sort((a, b) => (b.nb_fan ?? 0) - (a.nb_fan ?? 0));
 }
 

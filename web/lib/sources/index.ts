@@ -1,9 +1,13 @@
 import type { MediaItem } from "@/lib/types";
-import { getCatalogItem, recentReleases, searchCatalog } from "@/lib/catalog";
-import { getUpcomingItem, upcomingTop } from "@/lib/upcoming";
+import { getCatalogItem, searchCatalog, existingMediaTitles, FRANCHISE_NAME_COLLISION_MIN_FANS } from "@/lib/catalog";
+import { getUpcomingItem } from "@/lib/upcoming";
+import { getUpcomingCalendarTop, getNewReleasesCalendarTop } from "@/lib/upcomingCalendar";
+import { DEFAULT_INTL_BAR_LEVEL, type IntlBarLevel } from "@/lib/intlBar";
+import { DEFAULT_GENERAL_BAR_LEVEL, type GeneralBarLevel } from "@/lib/generalBar";
 import { searchCatalogAndUpcoming } from "@/lib/search";
 import { attachTVAirtimes } from "@/lib/airtimes";
 import { trendingTop } from "@/lib/trending";
+import { getDiscoverSnapshot, setDiscoverSnapshot, type DiscoverPayload } from "@/lib/discoverSnapshot";
 import type { ContentCategory } from "@/lib/contentFilters";
 import { searchCollections, detailsCollection, discoverCollections } from "./collection";
 import { artistToMediaItem, searchDeezerArtists } from "./deezer";
@@ -34,11 +38,28 @@ function dedupeById(items: MediaItem[]): MediaItem[] {
 // thin — the common rich-catalog case never waits on Deezer at all.
 const LIVE_ARTIST_SEARCH_BUDGET_MS = 1200;
 
+// Deezer's own soundtrack-keyword filter (see deezer.ts) only catches an
+// account explicitly named "X OST" — it doesn't catch a fan-upload account
+// named EXACTLY after the franchise itself ("One Piece": 4,169 fans, no
+// "OST" in the name at all, verified live). Cross-referencing against our
+// own non-artist catalog is the other half of that fix (see
+// FRANCHISE_NAME_COLLISION_MIN_FANS's comment in lib/catalog.ts) — this
+// adapter is the DB-aware orchestration layer, so it's the right place for
+// it, not the keyless deezer.ts adapter.
+async function filterFranchiseNameCollisions(artists: DeezerArtist[]): Promise<DeezerArtist[]> {
+  if (artists.length === 0) return artists;
+  const collisions = await existingMediaTitles(artists.map((a) => a.name));
+  return artists.filter(
+    (a) => !collisions.has(a.name.toLowerCase()) || (a.nb_fan ?? 0) >= FRANCHISE_NAME_COLLISION_MIN_FANS
+  );
+}
+
 function liveArtistSearch(query: string, limit: number): Promise<MediaItem[]> {
   const timeout = new Promise<MediaItem[]>((resolve) =>
     setTimeout(() => resolve([]), LIVE_ARTIST_SEARCH_BUDGET_MS)
   );
   const live = searchDeezerArtists(query, limit)
+    .then((artists) => filterFranchiseNameCollisions(artists))
     .then((artists) => artists.map(artistToMediaItem))
     .catch(() => [] as MediaItem[]);
   return Promise.race([live, timeout]);
@@ -99,15 +120,27 @@ export async function search(query: string, type?: string | null, hidden: Conten
       // The live artist fallback starts in parallel but is only awaited
       // when the catalog produced NO artist at all (and music isn't
       // hidden) — a niche-artist query still finds them without slowing
-      // every ordinary movie/TV search down.
+      // every ordinary movie/TV search down. `mediaResults` never contains
+      // an artist (searchCatalogAndUpcoming below is scoped to
+      // movie/tvShow/game only), so this ALSO queries the artist catalog
+      // directly — cheap (well under 100ms, run in parallel with the other
+      // two) — otherwise "hasArtist" was always false and every single
+      // unscoped search paid the live Deezer round-trip regardless of the
+      // query, which was the actual cause of "search is slow" (verified
+      // live: the DB queries here run in 13-70ms, the Deezer call itself in
+      // 150-300ms — the tax was being paid on every search, not that any
+      // one call was slow).
       const livePromise = hidden.includes("music") ? null : liveArtistSearch(query, 5);
-      const [franchiseResults, mediaResults] = await Promise.all([
+      const [franchiseResults, mediaResults, catalogArtists] = await Promise.all([
         searchCollections(query),
         searchCatalogAndUpcoming(query, undefined, ["movie", "tvShow", "game"], hidden),
+        hidden.includes("music") ? Promise.resolve([]) : searchCatalog(query, "artist", 5, hidden),
       ]);
-      const hasArtist = mediaResults.some((i) => i.type === "artist");
-      const liveArtists = hasArtist || !livePromise ? [] : await livePromise;
-      return [...franchiseResults, ...slimForSearch(dedupeById([...mediaResults, ...liveArtists]))];
+      const liveArtists = catalogArtists.length > 0 || !livePromise ? [] : await livePromise;
+      return [
+        ...franchiseResults,
+        ...slimForSearch(dedupeById([...mediaResults, ...catalogArtists, ...liveArtists])),
+      ];
     }
   }
 }
@@ -153,16 +186,11 @@ export async function details(type: string, id: string): Promise<MediaItem> {
   return item;
 }
 
-export interface DiscoverPayload {
-  trendingMovies: MediaItem[];
-  trendingTV: MediaItem[];
-  trendingGames: MediaItem[];
-  trendingManga: MediaItem[];
-  trendingArtists: MediaItem[];
-  popularUpcoming: MediaItem[];
-  newReleases: MediaItem[];
-  featuredCollections: MediaItem[];
-}
+// Re-exported so existing `import type { DiscoverPayload } from "@/lib/sources"`
+// call sites (app/page.tsx) keep working — lib/discoverSnapshot.ts is the
+// canonical definition now (it needs the type and can't import this module
+// without a cycle, since this module calls INTO it).
+export type { DiscoverPayload };
 
 // Curated groupings for the Discover page — reads catalog_items/upcoming_items/
 // trending_items only, all of it refreshed by the daily cron
@@ -175,22 +203,61 @@ export interface DiscoverPayload {
 // Content filters selection (see lib/contentFilters.ts), applied
 // server-side so a hidden category is excluded from the query itself, not
 // just hidden in the UI.
-export async function discover(hidden: ContentCategory[] = []): Promise<DiscoverPayload> {
-  const [trendingMovies, trendingTV, trendingGames, trendingManga, trendingArtists, popularUpcoming, newReleases, featuredCollections] =
+export async function discover(
+  hidden: ContentCategory[] = [],
+  intlBar: IntlBarLevel = DEFAULT_INTL_BAR_LEVEL,
+  generalBar: GeneralBarLevel = DEFAULT_GENERAL_BAR_LEVEL
+): Promise<DiscoverPayload> {
+  // Manga trending intentionally omitted — see DiscoverPayload's comment.
+  const [trendingMovies, trendingTV, trendingGames, trendingArtists, popularUpcoming, newReleases, featuredCollections] =
     await Promise.all([
       trendingTop("movie", 20, hidden),
       trendingTop("tvShow", 20, hidden),
       trendingTop("game", 20, hidden),
-      trendingTop("manga", 20, hidden),
       trendingTop("artist", 20, hidden),
-      upcomingTop(["movie", "tvShow", "game"], 16, hidden),
-      recentReleases(["movie", "tvShow", "game", "manga"], 16, 30, hidden),
+      getUpcomingCalendarTop(["movie", "tvShow", "game"], 20, hidden, intlBar, generalBar),
+      getNewReleasesCalendarTop(["movie", "tvShow", "game"], 20, hidden, intlBar, generalBar),
       discoverCollections(true),
     ]);
-  return { trendingMovies, trendingTV, trendingGames, trendingManga, trendingArtists, popularUpcoming, newReleases, featuredCollections };
+  return { trendingMovies, trendingTV, trendingGames, trendingArtists, popularUpcoming, newReleases, featuredCollections };
+}
+
+// What /api/discover actually calls for the no-category request: the
+// precomputed snapshot when there's no hidden-category filter AND both bars
+// are at their defaults (see lib/discoverSnapshot.ts for why that's the
+// only case cached) and a snapshot exists yet — self-heals to a live
+// compute otherwise (first-ever run before any cron has fired, a snapshot
+// read failure, or a non-default bar setting), same "enhancement, never a
+// hard requirement" pattern as TV airtime caching.
+export async function discoverCached(
+  hidden: ContentCategory[] = [],
+  intlBar: IntlBarLevel = DEFAULT_INTL_BAR_LEVEL,
+  generalBar: GeneralBarLevel = DEFAULT_GENERAL_BAR_LEVEL
+): Promise<DiscoverPayload> {
+  if (hidden.length === 0 && intlBar === DEFAULT_INTL_BAR_LEVEL && generalBar === DEFAULT_GENERAL_BAR_LEVEL) {
+    const snapshot = await getDiscoverSnapshot();
+    if (snapshot) return snapshot;
+  }
+  return discover(hidden, intlBar, generalBar);
+}
+
+// Called once daily by /api/cron/daily, LAST — after trending_items,
+// upcoming_items, catalog_items, and collections have all been refreshed
+// that same run, so the snapshot reflects the freshest possible state
+// rather than racing ahead of the data it's built from. Always built with
+// BOTH bars at their defaults — that's the only variant discoverCached
+// serves from this snapshot; any other setting computes live.
+export async function refreshDiscoverSnapshot(): Promise<void> {
+  const payload = await discover([], DEFAULT_INTL_BAR_LEVEL, DEFAULT_GENERAL_BAR_LEVEL);
+  await setDiscoverSnapshot(payload);
 }
 
 // A single category, expanded (for "see all" drill-down on the Discover page).
+// NOTE: "upcoming" and "new-releases" are NOT handled here — both paginate
+// (see lib/upcomingCalendar.ts's getUpcomingCalendarPage/
+// getNewReleasesCalendarPage), intercepted directly in
+// app/api/discover/route.ts before this function is ever called for them.
+// "manga" is also gone — see DiscoverPayload's comment.
 export async function discoverCategory(category: string, hidden: ContentCategory[] = []): Promise<MediaItem[]> {
   switch (category) {
     case "movies":
@@ -199,18 +266,12 @@ export async function discoverCategory(category: string, hidden: ContentCategory
       return trendingTop("tvShow", 40, hidden);
     case "games":
       return trendingTop("game", 40, hidden);
-    case "manga":
-      return trendingTop("manga", 40, hidden);
     case "artists":
       return trendingTop("artist", 40, hidden);
     case "collections":
       // Curated list plus admin overrides — no TMDB/IGDB/MangaDex calls,
       // same as before.
       return await discoverCollections(false);
-    case "upcoming":
-      return upcomingTop(["movie", "tvShow", "game"], 40, hidden);
-    case "new-releases":
-      return recentReleases(["movie", "tvShow", "game", "manga"], 40, 30, hidden);
     default:
       throw new Error(`Unknown category: ${category}`);
   }

@@ -4,7 +4,10 @@ import type { FollowedItem } from "./library";
 // "New episode Friday", "Releases today", "Released yesterday". This is the
 // app's core value prop — not activity tracking, just "am I up to date".
 
-function daysBetween(date: Date, base: Date): number {
+// Exported for /api/poll's reminder trigger — the lead-time match must use
+// the exact same calendar-day math the feed uses, or a reminder could fire
+// on a different day than the badge it corresponds to.
+export function daysBetween(date: Date, base: Date): number {
   const d1 = new Date(date.getFullYear(), date.getMonth(), date.getDate());
   const d2 = new Date(base.getFullYear(), base.getMonth(), base.getDate());
   return Math.round((d1.getTime() - d2.getTime()) / 86_400_000);
