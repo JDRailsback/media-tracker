@@ -10,7 +10,7 @@ import { trendingTop } from "@/lib/trending";
 import { getDiscoverSnapshot, setDiscoverSnapshot, type DiscoverPayload } from "@/lib/discoverSnapshot";
 import type { ContentCategory } from "@/lib/contentFilters";
 import { searchCollections, detailsCollection, discoverCollections } from "./collection";
-import { artistToMediaItem, searchDeezerArtists } from "./deezer";
+import { artistToMediaItem, searchDeezerArtists, type DeezerArtist } from "./deezer";
 import { ARTIST_METADATA_VERSION, getArtistRowState, ingestArtist } from "./artist";
 
 // A catalog result and an upcoming-table result can never collide on id in

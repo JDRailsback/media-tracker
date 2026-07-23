@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { X, Play, Plus, Check, Star, Bell, BellOff } from "lucide-react";
 import type { MediaItem } from "@/lib/types";
+import type { DugoutStatus } from "@/lib/dugout";
 import { describeRelease, formatTime } from "@/lib/feed";
 import { getPreferredPlatforms, isPreferredProvider } from "@/lib/platformPrefs";
 import { fetchPrefs, setItemMuted } from "@/lib/push-client";
@@ -27,7 +28,61 @@ export default function DetailModal({
   // device — there's no subscription for a mute to act on).
   const [muted, setMuted] = useState<boolean | null>(null);
 
+  // Dugout ("what to watch next") is scoped to movie/tvShow only — games,
+  // manga, artists, and franchises have no such queue. Self-contained here
+  // (fetch + write directly), same pattern as the mute control above,
+  // rather than threading state through app/page.tsx — no other part of the
+  // app needs to know an item's Dugout status except this modal.
+  const dugoutEligible = item.type === "movie" || item.type === "tvShow";
+  const [dugoutStatus, setDugoutStatusState] = useState<DugoutStatus | null>(null);
+  const [dugoutBusy, setDugoutBusy] = useState(false);
+  const [dugoutError, setDugoutError] = useState<string | null>(null);
+
   useEffect(() => setPreferred(getPreferredPlatforms()), []);
+
+  useEffect(() => {
+    if (!dugoutEligible) return;
+    fetch(`/api/dugout?itemID=${encodeURIComponent(item.id)}`)
+      .then((r) => (r.ok ? r.json() : { status: null }))
+      .then((d: { status: DugoutStatus | null }) => setDugoutStatusState(d.status))
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [item.id]);
+
+  // Clicking the already-active pill clears it (removes from Dugout
+  // entirely) — same "tap to toggle off" convention as everything else in
+  // this modal (mute button, Follow). Optimistic on success only: a
+  // rejected add (On Deck already at 5) leaves the prior status showing,
+  // with the server's own message surfaced rather than a generic one.
+  async function handleDugoutClick(status: DugoutStatus) {
+    const next = dugoutStatus === status ? null : status;
+    setDugoutError(null);
+    setDugoutBusy(true);
+    try {
+      if (next === null) {
+        await fetch("/api/dugout", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ itemID: item.id }),
+        });
+      } else {
+        const res = await fetch("/api/dugout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ itemID: item.id, status: next }),
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.error || "Something went wrong");
+        }
+      }
+      setDugoutStatusState(next);
+    } catch (err) {
+      setDugoutError(err instanceof Error ? err.message : "Something went wrong");
+    } finally {
+      setDugoutBusy(false);
+    }
+  }
 
   useEffect(() => {
     if (!isFollowed) {
@@ -170,6 +225,37 @@ export default function DetailModal({
               </div>
             </div>
 
+            {dugoutEligible && (
+              <div className="mt-4">
+                <h2 className="mb-2 text-[12.5px] font-semibold uppercase tracking-wide text-subtle">
+                  Dugout
+                </h2>
+                <div className="flex flex-wrap gap-2">
+                  {full.type === "tvShow" && (
+                    <DugoutPill
+                      label="Currently watching"
+                      active={dugoutStatus === "currentlyWatching"}
+                      disabled={dugoutBusy}
+                      onClick={() => handleDugoutClick("currentlyWatching")}
+                    />
+                  )}
+                  <DugoutPill
+                    label="On Deck"
+                    active={dugoutStatus === "onDeck"}
+                    disabled={dugoutBusy}
+                    onClick={() => handleDugoutClick("onDeck")}
+                  />
+                  <DugoutPill
+                    label="Watchlist"
+                    active={dugoutStatus === "watchlist"}
+                    disabled={dugoutBusy}
+                    onClick={() => handleDugoutClick("watchlist")}
+                  />
+                </div>
+                {dugoutError && <p className="mt-2 text-[13px] text-red-500">{dugoutError}</p>}
+              </div>
+            )}
+
             {full.externalLinks && full.externalLinks.length > 0 && (
             <div className="mt-5">
               <h2 className="mb-2 text-[12.5px] font-semibold uppercase tracking-wide text-subtle">
@@ -262,5 +348,29 @@ export default function DetailModal({
         </div>
       </div>
     </div>
+  );
+}
+
+function DugoutPill({
+  label,
+  active,
+  disabled,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`rounded-full px-3 py-1.5 text-[13px] font-medium transition-colors duration-150 disabled:opacity-50 ${
+        active ? "bg-accent text-on-accent" : "bg-canvas text-subtle hover:text-ink"
+      }`}
+    >
+      {label}
+    </button>
   );
 }

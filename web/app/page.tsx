@@ -2,8 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Search as SearchIcon, Bell, Sparkles, ArrowLeft, Plus } from "lucide-react";
+import { Search as SearchIcon, Bell, Sparkles, ArrowLeft, Plus, X } from "lucide-react";
 import type { MediaItem } from "@/lib/types";
+import type { DugoutGroups } from "@/lib/dugout";
 import { addFollow, getFollowed, isFollowed, removeFollow, FollowedItem } from "@/lib/library";
 import { buildFeed, describeRelease, parseReleaseDay } from "@/lib/feed";
 import { currentSubscription, enablePush, fetchPrefs, syncFollow } from "@/lib/push-client";
@@ -81,7 +82,7 @@ interface NotificationEntry {
   createdAt: string;
 }
 
-const VALID_VIEWS = new Set<View>(["feed", "discover", "following", "notifications", "settings"]);
+const VALID_VIEWS = new Set<View>(["feed", "discover", "following", "dugout", "notifications", "settings"]);
 
 // Following page: grouped sections (in display order) and the sort applied
 // within each group. "Recently followed" (default) mirrors the old flat
@@ -191,6 +192,78 @@ export default function Home() {
   // the catalog — see the merge logic below).
   const [freshLoaded, setFreshLoaded] = useState(false);
   const [pushEnabled, setPushEnabled] = useState(false);
+
+  // Dugout — "what to watch next", movie/TV only. Server-backed (see
+  // lib/dugout.ts), so unlike Following/Discover there's no localStorage or
+  // once-per-session cache to hydrate from: it refetches every time the
+  // user visits the view or switches the Movies/TV toggle, and again after
+  // the detail modal closes (a status change made there wouldn't otherwise
+  // be reflected until the next full navigation). The dataset is small
+  // (a single-user queue capped at 5 On Deck + a modest watchlist), so
+  // there's no staleness-vs-cost tradeoff worth making here.
+  const [dugoutType, setDugoutType] = useState<"movie" | "tvShow">("movie");
+  const [dugoutData, setDugoutData] = useState<DugoutGroups | null>(null);
+  const [dugoutLoading, setDugoutLoading] = useState(false);
+
+  function refetchDugout() {
+    setDugoutLoading(true);
+    fetch(`/api/dugout?type=${dugoutType}`)
+      .then((r) => (r.ok ? r.json() : { onDeck: [], watchlist: [], currentlyWatching: [] }))
+      .then(setDugoutData)
+      .finally(() => setDugoutLoading(false));
+  }
+
+  useEffect(() => {
+    if (view !== "dugout") return;
+    refetchDugout();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, dugoutType]);
+
+  // Search directly from Dugout — a lighter-weight sibling of Discover's
+  // search (query/searchType/searchResults above), not a reuse of it:
+  // that state is tied to the Discover view's own render branch and
+  // persisted to sessionStorage as part of it, so sharing it would mean a
+  // Dugout search overwrites whatever the user had searched in Discover
+  // (and vice versa) the moment either view remounts. This only ever
+  // searches ONE type — whichever the Movies/TV toggle is currently on —
+  // so it skips the "All types" case and the cross-session cache entirely.
+  // A popup rather than a bar sitting permanently on the page — Dugout is
+  // meant to be a quick "what's queued up" glance, not another search
+  // surface competing with Discover's for space.
+  const [dugoutSearchOpen, setDugoutSearchOpen] = useState(false);
+  const [dugoutQuery, setDugoutQuery] = useState("");
+  const [dugoutSearchResults, setDugoutSearchResults] = useState<MediaItem[]>([]);
+  const [dugoutSearching, setDugoutSearching] = useState(false);
+  const dugoutSearchSeqRef = useRef(0);
+
+  function closeDugoutSearch() {
+    setDugoutSearchOpen(false);
+    setDugoutQuery(""); // next open starts fresh rather than showing a stale query/results
+  }
+
+  useEffect(() => {
+    if (!dugoutSearchOpen) return;
+    const trimmed = dugoutQuery.trim();
+    if (trimmed.length < MIN_SEARCH_CHARS) {
+      setDugoutSearchResults([]);
+      setDugoutSearching(false);
+      return;
+    }
+    const seq = ++dugoutSearchSeqRef.current;
+    const handle = setTimeout(async () => {
+      setDugoutSearching(true);
+      try {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(trimmed)}&type=${dugoutType}`);
+        const results: MediaItem[] = res.ok ? await res.json() : [];
+        if (seq !== dugoutSearchSeqRef.current) return; // a newer query superseded this one
+        setDugoutSearchResults(results);
+      } finally {
+        if (seq === dugoutSearchSeqRef.current) setDugoutSearching(false);
+      }
+    }, 300);
+    return () => clearTimeout(handle);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dugoutQuery, dugoutType, dugoutSearchOpen]);
 
   // Discover. Hydrated from last session's cache so the shelves render
   // instantly on the first visit this session instead of blanking behind
@@ -1072,6 +1145,67 @@ export default function Home() {
           </>
         )}
 
+        {view === "dugout" && (
+          <>
+            <div className="flex items-start justify-between gap-3">
+              <PageHeader title="Dugout" subtitle="Line up what you want to watch next." />
+              <button
+                onClick={() => setDugoutSearchOpen(true)}
+                aria-label={`Add a ${dugoutType === "movie" ? "movie" : "show"}`}
+                title={`Add a ${dugoutType === "movie" ? "movie" : "show"}`}
+                className="flex shrink-0 items-center justify-center rounded-full bg-accent p-2.5 text-on-accent transition-opacity hover:opacity-90"
+              >
+                <Plus size={18} strokeWidth={2.5} />
+              </button>
+            </div>
+            <div className="mb-8 flex gap-2">
+              {(["movie", "tvShow"] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setDugoutType(t)}
+                  className={`rounded-full px-3 py-1.5 text-[13px] font-medium transition-colors duration-150 ${
+                    dugoutType === t ? "bg-accent text-on-accent" : "bg-surface text-subtle hover:text-ink"
+                  }`}
+                >
+                  {t === "movie" ? "Movies" : "TV"}
+                </button>
+              ))}
+            </div>
+
+            {dugoutLoading && !dugoutData ? (
+              <p className="text-[13px] text-subtle">Loading…</p>
+            ) : (
+              dugoutData && (
+                <>
+                  {/* Section order intentionally leaves room to insert
+                      "Watched"/"Favorites" later as further static rows —
+                      each section here is independent, so adding one is
+                      purely additive, no restructuring needed. */}
+                  {dugoutType === "tvShow" && (
+                    <DugoutStaticRow
+                      title="Currently watching"
+                      items={dugoutData.currentlyWatching}
+                      onSelect={handleSelect}
+                      emptyText="Mark a show as currently watching from its detail page."
+                    />
+                  )}
+                  <DugoutStaticRow
+                    title="On Deck"
+                    items={dugoutData.onDeck}
+                    onSelect={handleSelect}
+                    emptyText={`Add up to 5 ${dugoutType === "movie" ? "movies" : "shows"} you want to watch next.`}
+                  />
+                  <ExpandableWatchlist
+                    title="Watchlist"
+                    items={dugoutData.watchlist}
+                    onSelect={handleSelect}
+                  />
+                </>
+              )
+            )}
+          </>
+        )}
+
         {view === "notifications" && (
           <>
             <PageHeader
@@ -1256,7 +1390,28 @@ export default function Home() {
           isFollowed={selectedFollowed}
           onFollow={handleFollow}
           onUnfollow={() => handleUnfollow(selected.id)}
-          onClose={() => setSelected(null)}
+          onClose={() => {
+            setSelected(null);
+            // A status change made in the modal (self-contained — see
+            // DetailModal.tsx) wouldn't otherwise be reflected in the
+            // already-fetched Dugout lists until the next navigation.
+            if (view === "dugout") refetchDugout();
+          }}
+        />
+      )}
+
+      {dugoutSearchOpen && (
+        <DugoutSearchModal
+          dugoutType={dugoutType}
+          query={dugoutQuery}
+          onQueryChange={setDugoutQuery}
+          results={dugoutSearchResults}
+          searching={dugoutSearching}
+          onSelect={(item) => {
+            closeDugoutSearch();
+            handleSelect(item);
+          }}
+          onClose={closeDugoutSearch}
         />
       )}
 
@@ -1279,6 +1434,173 @@ function PageHeader({ title, subtitle }: { title: string; subtitle?: string }) {
     <div className="mb-7 animate-fade-up">
       <h1 className="text-[28px] font-bold tracking-tight text-ink">{title}</h1>
       {subtitle && <p className="mt-1.5 text-[14px] text-subtle">{subtitle}</p>}
+    </div>
+  );
+}
+
+// A fixed, non-scrolling row — used for Dugout's On Deck (capped at 5) and
+// Currently Watching (uncapped, but realistically small) sections. Neither
+// needs Shelf.tsx's horizontal-scroll/arrow machinery (built for a "browse
+// dozens of items" shelf, not a short queue); flex-wrap keeps every item
+// visible at once regardless of count, wrapping to a second line rather
+// than requiring a scroll gesture.
+function DugoutStaticRow({
+  title,
+  items,
+  onSelect,
+  emptyText,
+}: {
+  title: string;
+  items: MediaItem[];
+  onSelect: (item: MediaItem) => void;
+  emptyText: string;
+}) {
+  return (
+    <section className="mb-9">
+      <h2 className="mb-3 text-[17px] font-bold text-ink">{title}</h2>
+      {items.length === 0 ? (
+        <p className="text-[13px] text-subtle">{emptyText}</p>
+      ) : (
+        <div className="flex flex-wrap gap-4">
+          {items.map((item, i) => (
+            <div key={item.id} className="w-32 shrink-0 sm:w-36">
+              <MediaCard item={item} index={i} onSelect={onSelect} />
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// Watchlist's "two-row shelf that expands into a page listing the entire
+// thing" — self-contained (owns its own expanded/collapsed state) rather
+// than hooking into the Discover category/back-button machinery, since all
+// of Watchlist's items are already fetched up front (unlike a Discover
+// shelf, which only ever fetches a preview slice) — expanding is purely a
+// display change, not a new fetch. previewCount picks roughly two rows at
+// the most common (4-column) breakpoint; it'll read as a bit more or less
+// than two full rows at the 2- and 3-column breakpoints, which isn't worth
+// a per-breakpoint calculation for a preview.
+function ExpandableWatchlist({
+  title,
+  items,
+  onSelect,
+}: {
+  title: string;
+  items: MediaItem[];
+  onSelect: (item: MediaItem) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const previewCount = 8;
+
+  return (
+    <section className="mb-9">
+      <div className="mb-3 flex items-center gap-3">
+        {expanded && (
+          <button
+            onClick={() => setExpanded(false)}
+            aria-label="Back"
+            className="rounded-full p-1 text-subtle transition-colors hover:text-ink"
+          >
+            <ArrowLeft size={18} />
+          </button>
+        )}
+        <h2 className="flex-1 text-[17px] font-bold text-ink">{title}</h2>
+        {!expanded && items.length > previewCount && (
+          <button
+            onClick={() => setExpanded(true)}
+            className="text-[13px] font-medium text-accent transition-opacity hover:opacity-70"
+          >
+            See all
+          </button>
+        )}
+      </div>
+      {items.length === 0 ? (
+        <p className="text-[13px] text-subtle">Nothing on your watchlist yet.</p>
+      ) : (
+        <div className="grid grid-cols-2 gap-x-5 gap-y-7 sm:grid-cols-3 lg:grid-cols-4">
+          {(expanded ? items : items.slice(0, previewCount)).map((item, i) => (
+            <MediaCard key={item.id} item={item} index={i} onSelect={onSelect} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// Opened from Dugout's "+" button rather than a permanent search bar sitting
+// on the page — same overlay shape as DetailModal (fixed, centered, click-
+// outside-to-close) so it reads as part of the same family of popups.
+// Selecting a result closes THIS modal and opens DetailModal for it (see the
+// onSelect wiring in the main component) — the actual "add to On Deck/
+// Watchlist" controls live there, already built; this modal only finds
+// things.
+function DugoutSearchModal({
+  dugoutType,
+  query,
+  onQueryChange,
+  results,
+  searching,
+  onSelect,
+  onClose,
+}: {
+  dugoutType: "movie" | "tvShow";
+  query: string;
+  onQueryChange: (q: string) => void;
+  results: MediaItem[];
+  searching: boolean;
+  onSelect: (item: MediaItem) => void;
+  onClose: () => void;
+}) {
+  const typeLabel = dugoutType === "movie" ? "movies" : "TV shows";
+
+  return (
+    <div
+      onClick={onClose}
+      className="fixed inset-0 z-30 flex animate-fade-in items-start justify-center bg-black/60 p-4 pt-20 backdrop-blur-sm"
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="relative flex max-h-[70vh] w-full max-w-lg animate-scale-in flex-col overflow-hidden rounded-2xl bg-surface shadow-2xl ring-1 ring-hairline"
+      >
+        <div className="flex items-center gap-2.5 border-b border-hairline/70 px-4 py-3">
+          <SearchIcon size={18} className="shrink-0 text-subtle" />
+          <input
+            autoFocus
+            value={query}
+            onChange={(e) => onQueryChange(e.target.value)}
+            placeholder={`Search ${typeLabel} to add…`}
+            className="w-full bg-transparent text-[15px] text-ink outline-none placeholder:text-subtle"
+          />
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            className="shrink-0 rounded-full p-1.5 text-subtle transition-colors hover:text-ink"
+          >
+            <X size={16} />
+          </button>
+        </div>
+        <div className="scrollbar-none flex-1 overflow-y-auto p-4">
+          {query.trim().length < MIN_SEARCH_CHARS ? (
+            <p className="py-6 text-center text-[13px] text-subtle">
+              Start typing to find {typeLabel} to add.
+            </p>
+          ) : searching ? (
+            <p className="py-6 text-center text-[13px] text-subtle">Searching…</p>
+          ) : results.length === 0 ? (
+            <p className="py-6 text-center text-[13px] text-subtle">
+              No results for &quot;{query.trim()}&quot;.
+            </p>
+          ) : (
+            <div className="grid grid-cols-3 gap-x-4 gap-y-6 sm:grid-cols-4">
+              {results.map((item, i) => (
+                <MediaCard key={item.id} item={item} index={i} onSelect={onSelect} />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

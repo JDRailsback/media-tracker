@@ -360,5 +360,27 @@ function buildSchema(): Promise<void> {
       // via ALTER, not the CREATE TABLE body above, since that statement is
       // a no-op once the table already exists on anyone's DB.
       await sql`ALTER TABLE new_releases_calendar ADD COLUMN IF NOT EXISTS franchise_pick BOOLEAN NOT NULL DEFAULT false`;
+
+      // "Dugout" — a user's watch queue, deliberately separate from
+      // followed_items (following = "tell me about release news"; this =
+      // "help me decide what to watch"). Global/single-row-per-item, same
+      // no-accounts shape as followed_items — this app has no per-user
+      // concept anywhere else either. `status` is the only place a title's
+      // list membership lives — an item is in exactly ONE of onDeck/
+      // watchlist/currentlyWatching at a time (moving to onDeck removes it
+      // from watchlist, not both at once), enforced at the application layer
+      // (lib/dugout.ts) rather than a CHECK constraint, since the "onDeck
+      // capped at 5 per type" rule needs a count query anyway. Any title can
+      // be added regardless of release status — an unreleased title is
+      // resolved via upcoming_items the same way followed_items already
+      // does (see lib/sources/index.ts's details()).
+      await sql`CREATE TABLE IF NOT EXISTS dugout_items (
+        id SERIAL PRIMARY KEY,
+        item_id TEXT UNIQUE NOT NULL,
+        type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        added_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`;
+      await sql`CREATE INDEX IF NOT EXISTS dugout_items_type_status_idx ON dugout_items (type, status)`;
   })();
 }

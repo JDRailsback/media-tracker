@@ -131,6 +131,19 @@ function toWriteRow(row: SourceUpcomingRow, rankScore: number): CalendarWriteRow
 // actually uses) — games DO get their AAA floor applied here since NO
 // other path needs to see sub-floor games (franchise picks are the one
 // exception, and they get their own separate low-floor-free game fetch).
+// The release_date >= today filter on every branch here is a defensive
+// check, not an optimization — verified live, upcoming_items itself can lag
+// behind on pruning a title the day it releases (found 32 stale rows sitting
+// in upcoming_items with a past release_date, including one that had ALSO
+// already separately graduated into catalog_items). Without this,
+// fetchRawUpcomingRows blindly trusts that upstream table to only ever hold
+// future titles, and a stale row gets re-admitted into upcoming_calendar on
+// every refresh even after graduateReleasedTitles already moved it into
+// new_releases_calendar — the exact "same title in both calendars at once"
+// bug this file already fixed once for a DIFFERENT cause (the inclusive
+// same-day TMDB/IGDB query). `>=` (not `>`) matches graduation's own
+// boundary: a title stays admissible here through its release day, then
+// graduates starting the day after (graduateReleasedTitles uses `<`).
 async function fetchRawUpcomingRows(): Promise<{
   movies: SourceUpcomingRow[];
   tv: SourceUpcomingRow[];
@@ -142,19 +155,19 @@ async function fetchRawUpcomingRows(): Promise<{
   const [movies, tv, games, allGames] = await Promise.all([
     sql`
       SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score
-      FROM upcoming_items WHERE type = 'movie' AND date_confirmed = true
+      FROM upcoming_items WHERE type = 'movie' AND date_confirmed = true AND release_date >= now()::date
     ` as unknown as Promise<SourceUpcomingRow[]>,
     sql`
       SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score
-      FROM upcoming_items WHERE type = 'tvShow' AND date_confirmed = true
+      FROM upcoming_items WHERE type = 'tvShow' AND date_confirmed = true AND release_date >= now()::date
     ` as unknown as Promise<SourceUpcomingRow[]>,
     sql`
       SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score
-      FROM upcoming_items WHERE type = 'game' AND date_confirmed = true AND popularity_score >= ${GAME_POPULARITY_FLOOR}
+      FROM upcoming_items WHERE type = 'game' AND date_confirmed = true AND release_date >= now()::date AND popularity_score >= ${GAME_POPULARITY_FLOOR}
     ` as unknown as Promise<SourceUpcomingRow[]>,
     sql`
       SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score
-      FROM upcoming_items WHERE type = 'game' AND date_confirmed = true
+      FROM upcoming_items WHERE type = 'game' AND date_confirmed = true AND release_date >= now()::date
     ` as unknown as Promise<SourceUpcomingRow[]>,
   ]);
   return { movies, tv, games, allGames };
@@ -435,12 +448,28 @@ export async function refreshUpcomingCalendar(): Promise<{ count: number }> {
   // rankScore rather than being silently downgraded to a franchise-pick
   // exemption it doesn't need.
   const seen = new Set<string>();
-  const rows: CalendarWriteRow[] = [];
+  const merged: CalendarWriteRow[] = [];
   for (const row of [...admittedRows, ...returningTV, ...franchisePicks]) {
     if (seen.has(row.id)) continue;
     seen.add(row.id);
-    rows.push(row);
+    merged.push(row);
   }
+
+  // A final, centralized "must still be in the future" guard across EVERY
+  // admission path at once, rather than trusting each path to police its own
+  // dates — verified live this was actually necessary, not just defensive:
+  // fetchRawUpcomingRows already has its own release_date >= today filter,
+  // but fetchReturningTVPremieres' nextSeasonPremiere (lib/catalog.ts) does
+  // its own future-date check using JS `new Date()`, and a stale premiere
+  // ("A Shop for Killers", dated the day before this exact run) still made
+  // it through — re-admitted into upcoming_calendar on the SAME run that
+  // graduateReleasedTitles had just correctly moved it out of, recreating
+  // the "same title in both calendars" bug via a path the earlier fix didn't
+  // cover. Using the DB's own now()::date (not JS's) keeps this consistent
+  // with graduateReleasedTitles/pruneOldReleases, which already anchor to
+  // Postgres' clock rather than the Node process's.
+  const [{ today }] = (await sql`SELECT now()::date::text AS today`) as unknown as { today: string }[];
+  const rows = merged.filter((r) => r.releaseDate >= today);
 
   for (let i = 0; i < rows.length; i += UPSERT_BATCH_SIZE) {
     const batch = rows.slice(i, i + UPSERT_BATCH_SIZE);
