@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { db, ensureSchema } from "@/lib/db";
+import { toISODate } from "@/lib/dbDate";
 
 // GET /api/notifications?ids=movie:603,artist:12246
 // -> [{ id, itemID, eventType, leadDays, releaseDate, title, subtitle, message, createdAt }]
@@ -26,7 +27,9 @@ interface HistoryRow {
   created_at: string | Date;
 }
 
-function toISO(value: string | Date): string {
+// created_at is a TIMESTAMPTZ (a real instant), unlike release_date's DATE —
+// .toISOString() is correct here and toISODate() would be the wrong helper.
+function toISOInstant(value: string | Date): string {
   return value instanceof Date ? value.toISOString() : value;
 }
 
@@ -57,15 +60,43 @@ export async function GET(request: Request) {
         itemID: r.item_id,
         eventType: r.event_type,
         leadDays: r.lead_days,
-        releaseDate: toISO(r.release_date).slice(0, 10),
+        releaseDate: toISODate(r.release_date),
         title: r.title,
         subtitle: r.subtitle ?? undefined,
         message: r.message,
-        createdAt: toISO(r.created_at),
+        createdAt: toISOInstant(r.created_at),
       }))
     );
   } catch (err) {
     console.error(err);
     return NextResponse.json([]);
+  }
+}
+
+// DELETE /api/notifications
+// Body: { id: number } to clear a single entry, or { ids: string[] } to
+// clear every history row for the given item ids (used by "clear all,"
+// which the client scopes to exactly the ids it's currently showing —
+// same trust model as GET, no auth, client-supplied id list only).
+export async function DELETE(request: Request) {
+  try {
+    const body = (await request.json()) as { id?: number; ids?: string[] };
+    await ensureSchema();
+    const sql = db();
+
+    if (typeof body.id === "number") {
+      await sql`DELETE FROM notification_history WHERE id = ${body.id}`;
+      return NextResponse.json({ ok: true });
+    }
+
+    if (Array.isArray(body.ids) && body.ids.length > 0) {
+      await sql`DELETE FROM notification_history WHERE item_id = ANY(${body.ids})`;
+      return NextResponse.json({ ok: true });
+    }
+
+    return NextResponse.json({ ok: false, error: "id or ids required" }, { status: 400 });
+  } catch (err) {
+    console.error(err);
+    return NextResponse.json({ ok: false }, { status: 500 });
   }
 }

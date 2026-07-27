@@ -2,6 +2,7 @@ import type { EpisodeInfo, ExternalLink, MediaItem, MediaType, ReleaseGroupInfo 
 import { db, ensureSchema } from "@/lib/db";
 import type { RankedItem } from "@/lib/sources/textMatch";
 import { excludeHiddenSQL, type ContentCategory } from "@/lib/contentFilters";
+import { toISODate } from "@/lib/dbDate";
 
 // Shared row shape for the bulk-populated catalog_items table (see
 // scripts/ingest-catalog.ts and lib/db.ts's ensureSchema). Distinct from
@@ -119,11 +120,6 @@ function parseJSON<T>(value: unknown, fallback: T): T {
   } catch {
     return fallback;
   }
-}
-
-function toISODate(value: string | Date | null): string | undefined {
-  if (!value) return undefined;
-  return value instanceof Date ? value.toISOString() : value;
 }
 
 interface CatalogSeasonMeta {

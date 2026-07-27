@@ -13,11 +13,39 @@ export function daysBetween(date: Date, base: Date): number {
   return Math.round((d1.getTime() - d2.getTime()) / 86_400_000);
 }
 
+// Monday-start week boundary — everything that reasons about "week" in this
+// file means the Mon-Sun sense most calendars use, not a rolling 7-day
+// window from today. `d` is assumed to already be truncated to a local
+// calendar day.
+function startOfWeek(d: Date): Date {
+  const day = d.getDay(); // 0=Sun, 1=Mon, ..., 6=Sat
+  const diffToMonday = day === 0 ? -6 : 1 - day;
+  const result = new Date(d);
+  result.setDate(result.getDate() + diffToMonday);
+  return result;
+}
+
+// The exclusive end of "next week" (the Monday after next) — shared by
+// relativeDay below and buildFeed's own bucketing, so a date's LABEL
+// ("Friday") and the GROUP it lands in ("Next week") always agree. These
+// used to drift: relativeDay switched to a weekday name only within a
+// rolling "diff <= 6" window, while buildFeed's bucket followed a full
+// calendar next-week — verified live, an item 8 days out (in the "Next
+// week" group) still showed a bare "Jul 31" instead of "Friday" because it
+// had fallen outside that old 6-day window. One function for both closes
+// that gap for good instead of just widening the magic number.
+function endOfNextWeek(now: Date): Date {
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const result = startOfWeek(today);
+  result.setDate(result.getDate() + 14);
+  return result;
+}
+
 function relativeDay(date: Date, now: Date): string {
   const diff = daysBetween(date, now);
   if (diff === 1) return "tomorrow";
   if (diff === -1) return "yesterday";
-  if (diff > 1 && diff <= 6) return date.toLocaleDateString(undefined, { weekday: "long" });
+  if (diff > 1 && date < endOfNextWeek(now)) return date.toLocaleDateString(undefined, { weekday: "long" });
   if (diff < -1 && diff >= -6) return `last ${date.toLocaleDateString(undefined, { weekday: "long" })}`;
   return date.toLocaleDateString(undefined, {
     month: "short",
@@ -122,7 +150,18 @@ export interface FeedGroup {
 // "Today" entries are deliberately NOT bucketed here — the Home page pulls
 // every today release out into its own hero treatment (see app/page.tsx)
 // before calling this, so by the time this runs there's normally nothing
-// left at diffDays === 0. The bucket stays as a defensive fallback only.
+// left at diffDays === 0.
+//
+// Buckets are calendar-aligned, not rolling windows: "This week"/"Next week"
+// are real Monday-Sunday weeks (so a release on Saturday reads as "this
+// week" even though it's only 2 days out, and a release next Monday reads
+// as "next week" even though it's only 3 days out) — explicit request, since
+// a rolling "next 7 days" window doesn't match how people actually think
+// about "this week" vs "next week". Beyond that, buckets are real calendar
+// months ("August", "September", ...) rather than a single catch-all
+// "Later" — groups are created lazily in the (already date-sorted) order
+// items are visited, so they naturally come out chronological with no
+// separate sort needed, and an empty bucket never gets created at all.
 export function buildFeed(followed: FollowedItem[], now: Date = new Date()): FeedGroup[] {
   const dated = followed
     .map((item) => ({ item, info: describeRelease(item, now) }))
@@ -130,19 +169,38 @@ export function buildFeed(followed: FollowedItem[], now: Date = new Date()): Fee
     .filter((x) => x.info.diffDays >= 0);
   dated.sort((a, b) => a.info.diffDays - b.info.diffDays);
 
-  const groups: FeedGroup[] = [
-    { key: "today", title: "Today", items: [] },
-    { key: "week", title: "This week", items: [] },
-    { key: "month", title: "This month", items: [] },
-    { key: "later", title: "Later", items: [] },
-  ];
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const afterNextWeekStart = endOfNextWeek(now);
+  const nextWeekStart = new Date(afterNextWeekStart);
+  nextWeekStart.setDate(nextWeekStart.getDate() - 7);
 
-  for (const { item, info } of dated) {
-    if (info.diffDays === 0) groups[0].items.push(item);
-    else if (info.diffDays <= 6) groups[1].items.push(item);
-    else if (info.diffDays <= 30) groups[2].items.push(item);
-    else groups[3].items.push(item);
+  function bucketFor(date: Date): { key: string; title: string } {
+    if (date < afterNextWeekStart) {
+      return date < nextWeekStart ? { key: "this-week", title: "This week" } : { key: "next-week", title: "Next week" };
+    }
+    return {
+      key: `${date.getFullYear()}-${date.getMonth()}`,
+      title: date.toLocaleDateString(undefined, {
+        month: "long",
+        year: date.getFullYear() !== now.getFullYear() ? "numeric" : undefined,
+      }),
+    };
   }
 
-  return groups.filter((g) => g.items.length > 0);
+  const groups: FeedGroup[] = [];
+  const indexByKey = new Map<string, number>();
+  for (const { item, info } of dated) {
+    const date = new Date(today);
+    date.setDate(date.getDate() + info.diffDays);
+    const { key, title } = bucketFor(date);
+    let idx = indexByKey.get(key);
+    if (idx === undefined) {
+      idx = groups.length;
+      groups.push({ key, title, items: [] });
+      indexByKey.set(key, idx);
+    }
+    groups[idx].items.push(item);
+  }
+
+  return groups;
 }

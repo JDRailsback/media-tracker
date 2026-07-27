@@ -7,6 +7,7 @@ import { DEFAULT_INTL_BAR_LEVEL, type IntlBarLevel } from "@/lib/intlBar";
 import { DEFAULT_GENERAL_BAR_LEVEL, type GeneralBarLevel } from "@/lib/generalBar";
 import { COLLECTIONS } from "@/lib/collections";
 import { deriveUpcomingKeywords } from "@/lib/collections-rebuild";
+import { toISODate } from "@/lib/dbDate";
 
 // "Popular upcoming"'s full release calendar (see lib/db.ts's ensureSchema
 // for the table) — a single flat, pre-merged table of every confirmed-date
@@ -63,10 +64,6 @@ function parseJSON<T>(value: unknown, fallback: T): T {
   }
 }
 
-function toISODate(value: string | Date): string {
-  return value instanceof Date ? value.toISOString() : value;
-}
-
 function calendarRowToMediaItem(row: CalendarDBRow): MediaItem {
   return {
     id: row.id,
@@ -114,7 +111,12 @@ function toWriteRow(row: SourceUpcomingRow, rankScore: number): CalendarWriteRow
     title: row.title,
     posterURL: row.poster_url ?? undefined,
     backdropURL: row.backdrop_url ?? undefined,
-    releaseDate: toISODate(row.release_date),
+    // Non-null assertion: row.release_date is never null/undefined here —
+    // SourceUpcomingRow's own type already guarantees it, and every query
+    // that produces these rows filters to date_confirmed = true. The shared
+    // toISODate's wider null-accepting signature is for its other callers,
+    // not this one.
+    releaseDate: toISODate(row.release_date)!,
     externalLinks: parseJSON<ExternalLink[]>(row.external_links, []),
     genres: parseJSON<string[]>(row.genres, []),
     originalLanguage: row.original_language ?? undefined,
@@ -699,6 +701,41 @@ export async function getUpcomingCalendarPage(
   generalBar: GeneralBarLevel = DEFAULT_GENERAL_BAR_LEVEL
 ): Promise<UpcomingPage> {
   return getCalendarPage("upcoming_calendar", "ASC", types, hidden, page, pageSize, intlBar, generalBar);
+}
+
+// The full Calendar page's month view — every admitted upcoming_calendar
+// row landing within one specific calendar month, for a real month-grid UI
+// (as opposed to getUpcomingCalendarPage's flat "soonest first" feed). Same
+// admission rules/bar filters as the rest of this file, so the calendar page
+// never shows anything the shelves/See-all page themselves wouldn't. `month`
+// is 1-indexed (July = 7) to match how callers naturally think about it;
+// the exclusive end bound is computed by handing that same 1-indexed value
+// to `Date`'s 0-indexed month slot, which lands on day 1 of the NEXT month —
+// deliberate, not an off-by-one.
+export async function getUpcomingCalendarMonth(
+  types: string[],
+  year: number,
+  month: number,
+  hidden: ContentCategory[] = [],
+  intlBar: IntlBarLevel = DEFAULT_INTL_BAR_LEVEL,
+  generalBar: GeneralBarLevel = DEFAULT_GENERAL_BAR_LEVEL
+): Promise<MediaItem[]> {
+  try {
+    await ensureSchema();
+    const sql = db();
+    const filterSQL = excludeHiddenSQL(hidden) + " " + intlBarSQL(intlBar) + " " + generalBarSQL(generalBar);
+    const start = `${year}-${String(month).padStart(2, "0")}-01`;
+    const endOfMonth = new Date(year, month, 1);
+    const end = `${endOfMonth.getFullYear()}-${String(endOfMonth.getMonth() + 1).padStart(2, "0")}-01`;
+    const rows = (await sql(
+      `SELECT * FROM upcoming_calendar WHERE type = ANY($1) AND release_date >= $2 AND release_date < $3 ${filterSQL}
+       ORDER BY release_date ASC, id ASC`,
+      [types, start, end]
+    )) as unknown as CalendarDBRow[];
+    return rows.map(calendarRowToMediaItem);
+  } catch {
+    return [];
+  }
 }
 
 // "New releases" — the same shelf-plus-full-page structure as "Popular

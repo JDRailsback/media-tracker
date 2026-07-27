@@ -1,5 +1,6 @@
 import type { ExternalLink, MediaItem, MediaType } from "@/lib/types";
 import { db, ensureSchema } from "@/lib/db";
+import { toISODate } from "@/lib/dbDate";
 
 // Row shape produced by the upcoming-releases fetchers (tmdb.ts/igdb.ts) and
 // stored in upcoming_items (see lib/db.ts's ensureSchema). Distinct from
@@ -44,11 +45,6 @@ export interface UpcomingDBRow {
   date_confirmed: boolean;
   popularity_score: number;
   external_links: unknown;
-}
-
-function toISODate(value: string | Date | null): string | undefined {
-  if (!value) return undefined;
-  return value instanceof Date ? value.toISOString() : value;
 }
 
 // Neon returns JSONB parsed in practice; guard against a raw string anyway
@@ -120,8 +116,34 @@ const BATCH_SIZE = 200;
 export async function upsertUpcoming(rows: UpcomingRow[]): Promise<void> {
   await ensureSchema();
   const sql = db();
-  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-    const batch = rows.slice(i, i + BATCH_SIZE);
+
+  // A title already in catalog_items has already released — it graduated
+  // out of upcoming_items the day it dropped (see the cron route's stage
+  // A/B comment) and must never come back, no matter what a source's
+  // discover feed claims. This guards against exactly the bug found live:
+  // TMDB's own top-level/primary_release_date for "One Piece: The Movie"
+  // (id movie:19576, real release 2000-03-04) reads 2026-09-17 because a
+  // Brazilian re-release listing (type 3 "Theatrical") is its only
+  // future-dated release_dates entry and TMDB's aggregate field picked it —
+  // with no US entry at all, the existing usTheatricalDate() correction in
+  // lib/sources/tmdb.ts has nothing to override it with, so the bad date
+  // flowed straight into upcoming_items and surfaced as the collection's
+  // "Up next." Catalog membership is the one signal that can't be spoofed
+  // by a bad regional release-date entry: it's already-ingested, confirmed
+  // history.
+  const ids = rows.map((r) => r.id);
+  const alreadyCatalogued =
+    ids.length === 0
+      ? new Set<string>()
+      : new Set(
+          (
+            (await sql`SELECT id FROM catalog_items WHERE id = ANY(${ids})`) as unknown as { id: string }[]
+          ).map((r) => r.id)
+        );
+  const filtered = alreadyCatalogued.size === 0 ? rows : rows.filter((r) => !alreadyCatalogued.has(r.id));
+
+  for (let i = 0; i < filtered.length; i += BATCH_SIZE) {
+    const batch = filtered.slice(i, i + BATCH_SIZE);
     if (batch.length === 0) continue;
     await sql`
       INSERT INTO upcoming_items (id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, first_seen_at, genres, original_language, external_links)

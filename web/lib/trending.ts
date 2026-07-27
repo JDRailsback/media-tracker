@@ -1,6 +1,7 @@
 import type { MediaItem, MediaType } from "@/lib/types";
 import { db, ensureSchema } from "@/lib/db";
 import { excludeHiddenSQL, type ContentCategory } from "@/lib/contentFilters";
+import { toISODate } from "@/lib/dbDate";
 
 // Genuinely-trending-right-now data — distinct from catalog_items'
 // popularity_score, which is an all-time cumulative signal (vote_count/
@@ -34,11 +35,6 @@ interface TrendingDBRow {
   backdrop_url: string | null;
   release_date: string | Date | null;
   rank: number;
-}
-
-function toISODate(value: string | Date | null): string | undefined {
-  if (!value) return undefined;
-  return value instanceof Date ? value.toISOString() : value;
 }
 
 function rowToMediaItem(row: TrendingDBRow): MediaItem {

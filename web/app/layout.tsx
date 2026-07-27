@@ -13,6 +13,12 @@ export const metadata: Metadata = {
   title: "Trackr",
   description: "Follow movies, shows, games, and manga — know the moment something new drops.",
   manifest: "/manifest.json",
+  // Placeholder mark (see public/*.png) — swap these three files for real
+  // brand art later, no other wiring changes needed.
+  icons: {
+    icon: "/favicon.png",
+    apple: "/apple-icon.png",
+  },
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",

@@ -2,9 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Search as SearchIcon, Bell, Sparkles, ArrowLeft, Plus, X } from "lucide-react";
+import { Search as SearchIcon, Bell, Sparkles, ArrowLeft, Plus, X, Calendar as CalendarIcon } from "lucide-react";
 import type { MediaItem } from "@/lib/types";
-import type { DugoutGroups } from "@/lib/dugout";
+import type { DugoutGroups, DugoutStatus } from "@/lib/dugout";
 import { addFollow, getFollowed, isFollowed, removeFollow, FollowedItem } from "@/lib/library";
 import { buildFeed, describeRelease, parseReleaseDay } from "@/lib/feed";
 import { currentSubscription, enablePush, fetchPrefs, syncFollow } from "@/lib/push-client";
@@ -20,7 +20,9 @@ import CollectionEditForm from "@/components/CollectionEditForm";
 import CollectionRow from "@/components/CollectionRow";
 import FeedRow from "@/components/FeedRow";
 import Shelf from "@/components/Shelf";
+import MonthCalendarGrid, { dayKey, type CalendarEntry } from "@/components/MonthCalendarGrid";
 import Sidebar, { View } from "@/components/Sidebar";
+import MobileNav from "@/components/MobileNav";
 import ThemeToggle from "@/components/ThemeToggle";
 import PlatformPrefs from "@/components/PlatformPrefs";
 import ContentFilters from "@/components/ContentFilters";
@@ -82,7 +84,7 @@ interface NotificationEntry {
   createdAt: string;
 }
 
-const VALID_VIEWS = new Set<View>(["feed", "discover", "following", "dugout", "notifications", "settings"]);
+const VALID_VIEWS = new Set<View>(["feed", "discover", "following", "calendar", "dugout", "notifications", "settings"]);
 
 // Following page: grouped sections (in display order) and the sort applied
 // within each group. "Recently followed" (default) mirrors the old flat
@@ -229,20 +231,54 @@ export default function Home() {
   // so it skips the "All types" case and the cross-session cache entirely.
   // A popup rather than a bar sitting permanently on the page — Dugout is
   // meant to be a quick "what's queued up" glance, not another search
-  // surface competing with Discover's for space.
-  const [dugoutSearchOpen, setDugoutSearchOpen] = useState(false);
+  // surface competing with Discover's for space. The target (which status a
+  // selected result gets added AS) is set by which section's "+" opened it
+  // — there's no separate "search, then choose" step: clicking a result
+  // adds it immediately (see handleDugoutSearchSelect below), unlike the
+  // DetailModal flow used everywhere else, which is deliberately a
+  // browse-first, add-second experience. Dugout's own search button is the
+  // one place "search" and "add" are meant to be the same click.
+  const [dugoutSearchTarget, setDugoutSearchTarget] = useState<DugoutStatus | null>(null);
   const [dugoutQuery, setDugoutQuery] = useState("");
   const [dugoutSearchResults, setDugoutSearchResults] = useState<MediaItem[]>([]);
   const [dugoutSearching, setDugoutSearching] = useState(false);
+  const [dugoutAdding, setDugoutAdding] = useState(false);
+  const [dugoutAddError, setDugoutAddError] = useState<string | null>(null);
   const dugoutSearchSeqRef = useRef(0);
 
   function closeDugoutSearch() {
-    setDugoutSearchOpen(false);
+    setDugoutSearchTarget(null);
     setDugoutQuery(""); // next open starts fresh rather than showing a stale query/results
+    setDugoutAddError(null);
+  }
+
+  async function handleDugoutSearchSelect(item: MediaItem) {
+    if (!dugoutSearchTarget) return;
+    setDugoutAddError(null);
+    setDugoutAdding(true);
+    try {
+      const res = await fetch("/api/dugout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ itemID: item.id, status: dugoutSearchTarget }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || "Something went wrong");
+      }
+      closeDugoutSearch();
+      refetchDugout();
+    } catch (err) {
+      // Left open on failure (e.g. On Deck already at 5) — the error shows
+      // inline so the user can pick something else or bail out themselves.
+      setDugoutAddError(err instanceof Error ? err.message : "Something went wrong");
+    } finally {
+      setDugoutAdding(false);
+    }
   }
 
   useEffect(() => {
-    if (!dugoutSearchOpen) return;
+    if (!dugoutSearchTarget) return;
     const trimmed = dugoutQuery.trim();
     if (trimmed.length < MIN_SEARCH_CHARS) {
       setDugoutSearchResults([]);
@@ -263,7 +299,7 @@ export default function Home() {
     }, 300);
     return () => clearTimeout(handle);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dugoutQuery, dugoutType, dugoutSearchOpen]);
+  }, [dugoutQuery, dugoutType, dugoutSearchTarget]);
 
   // Discover. Hydrated from last session's cache so the shelves render
   // instantly on the first visit this session instead of blanking behind
@@ -322,6 +358,12 @@ export default function Home() {
   const [searchLoading, setSearchLoading] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
   const [followSort, setFollowSort] = useState<FollowSort>("recent");
+  // Followed-items calendar (sidebar "Calendar" tab) — month displayed, not
+  // fetched: everything upcoming for a followed item comes from freshFollowed
+  // already in memory (see followedCalendarEntries below), so switching
+  // months is pure client-side filtering, no request.
+  const [calYear, setCalYear] = useState(() => new Date().getFullYear());
+  const [calMonth, setCalMonth] = useState(() => new Date().getMonth() + 1);
 
   // Spotlight hero pager (Home). heroPaused goes true the moment the user
   // picks a dot themselves — from then on the reel is theirs, no auto-flip
@@ -673,6 +715,29 @@ export default function Home() {
     }
   }
 
+  // Optimistic: drop from local state immediately, fire the DELETE without
+  // waiting — this is an inbox, not a record that needs strict consistency,
+  // and re-fetching on every clear would just add latency to a delete click.
+  function handleClearNotification(id: number) {
+    setNotifications((prev) => prev.filter((n) => n.id !== id));
+    fetch("/api/notifications", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    }).catch(() => {});
+  }
+
+  function handleClearAllNotifications() {
+    if (notifications.length === 0) return;
+    if (!window.confirm("Clear all notifications? This can't be undone.")) return;
+    setNotifications([]);
+    fetch("/api/notifications", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: followedIdsKey.split(",") }),
+    }).catch(() => {});
+  }
+
   const freshFollowed = followed.map((f) => {
     if (freshById[f.id]) return { ...f, ...freshById[f.id], followedAt: f.followedAt };
     // Tried to refresh and this id didn't come back — its catalog entry no
@@ -690,6 +755,73 @@ export default function Home() {
   // release — the feed is about individual titles you're tracking, not
   // franchise containers. Following (the full list) still shows them.
   const homeItems = freshFollowed.filter((f) => f.type !== "franchise");
+
+  // Sidebar "Calendar" tab: every followed item's upcoming release date(s),
+  // grouped by day — a flat one-entry-per-item map like the standalone
+  // /calendar page's, EXCEPT a followed TV show expands into one entry PER
+  // REMAINING EPISODE of its current/next season instead of a single "next
+  // episode" date. MediaItem.episodes already carries every known episode
+  // across every season (populated by catalogRowToMediaItem from TMDB's
+  // full per-season fetch — see lib/catalog.ts) — no extra request needed,
+  // this is the same freshFollowed data the Home feed already fetched.
+  // "Current/next season" = the highest season number with any known
+  // episode; a season TMDB hasn't announced yet simply isn't in the list.
+  const todayISO = new Date().toISOString().slice(0, 10);
+  const followedCalendarEntries = new Map<string, CalendarEntry[]>();
+  {
+    const push = (key: string, entry: CalendarEntry) => {
+      const list = followedCalendarEntries.get(key);
+      if (list) list.push(entry);
+      else followedCalendarEntries.set(key, [entry]);
+    };
+    for (const item of homeItems) {
+      if (item.type === "tvShow") {
+        const episodes = item.episodes ?? [];
+        if (episodes.length === 0) {
+          // Per-season data has a real gap for this show — verified live on
+          // "THE GHOST IN THE SHELL": its metadata.seasons came back with 0
+          // episodes for every season (a TMDB per-season fetch that came up
+          // empty at ingest time), so there's nothing to expand. Fall back
+          // to the single next-episode date catalogRowToMediaItem itself
+          // already resolved (via TMDB's own nextEpisodeToAir field — see
+          // lib/catalog.ts) rather than silently dropping the show from the
+          // calendar entirely; that fallback is exactly why item.releaseDate/
+          // subtitle are populated here even though item.episodes is empty.
+          if (item.releaseDate && item.releaseDate >= todayISO) {
+            push(dayKey(parseReleaseDay(item.releaseDate)), {
+              key: item.id,
+              title: item.title,
+              subtitle: item.subtitle ? `${item.title} — ${item.subtitle}` : undefined,
+              posterURL: item.posterURL,
+              type: "tvShow",
+              onSelect: () => handleSelect(item),
+            });
+          }
+          continue;
+        }
+        const currentSeason = Math.max(...episodes.map((e) => e.season));
+        for (const ep of episodes) {
+          if (ep.season !== currentSeason || !ep.airDate || ep.airDate < todayISO) continue;
+          push(dayKey(parseReleaseDay(ep.airDate)), {
+            key: `${item.id}:s${ep.season}e${ep.episode}`,
+            title: ep.title || item.title,
+            subtitle: `${item.title} — S${ep.season} E${ep.episode}`,
+            posterURL: item.posterURL,
+            type: "tvShow",
+            onSelect: () => handleSelect(item),
+          });
+        }
+      } else if (item.releaseDate && item.releaseDate >= todayISO) {
+        push(dayKey(parseReleaseDay(item.releaseDate)), {
+          key: item.id,
+          title: item.title,
+          posterURL: item.posterURL,
+          type: item.type,
+          onSelect: () => handleSelect(item),
+        });
+      }
+    }
+  }
 
   // The recap hero: EVERY item releasing today, or — when nothing is
   // releasing today — the single nearest upcoming release as an "Up next"
@@ -731,20 +863,33 @@ export default function Home() {
   return (
     <div className="relative min-h-screen bg-canvas">
       <AmbientBackground />
-      <Sidebar
-        active={view}
-        unreadCount={notifications.filter((n) => !readIds.includes(n.id)).length}
-        onChange={(v) => {
+      {(() => {
+        const handleNavChange = (v: View) => {
           // Clicking "Discover" again while already there clears any active
           // search/drill-down and returns to the landing shelves, instead of
           // doing nothing (React bails out on an unchanged state).
           if (v === "discover" && view === "discover") resetSearch();
           setView(v);
           setCategory(null);
-        }}
-      />
+        };
+        const unreadCount = notifications.filter((n) => !readIds.includes(n.id)).length;
+        return (
+          <>
+            <Sidebar active={view} unreadCount={unreadCount} onChange={handleNavChange} />
+            <MobileNav active={view} unreadCount={unreadCount} onChange={handleNavChange} />
+          </>
+        );
+      })()}
 
-      <main className="relative mx-auto max-w-4xl px-6 py-12 md:ml-64 md:px-12">
+      <main
+        className={`relative mx-auto px-6 pb-28 pt-12 md:ml-64 md:px-12 md:pb-12 ${
+          // Calendar gets a bounded, non-scrolling height (see
+          // components/MonthCalendarGrid.tsx's comment) — every other view
+          // keeps main's ordinary content-sized/scrollable flow, so this
+          // must stay scoped to just that one view's classes.
+          view === "calendar" ? "flex h-dvh max-w-7xl flex-col" : "max-w-4xl"
+        }`}
+      >
         {view === "feed" && (
           <>
             <PageHeader title="Home" subtitle="What's new with what you follow." />
@@ -974,6 +1119,15 @@ export default function Home() {
                 )}
                 {discoverData && (
                   <>
+                    <div className="mb-2 flex items-center justify-end">
+                      <button
+                        onClick={() => router.push("/calendar")}
+                        className="flex items-center gap-1 text-[13px] font-medium text-accent transition-opacity hover:opacity-70"
+                      >
+                        <CalendarIcon size={14} />
+                        Calendar view
+                      </button>
+                    </div>
                     <Shelf
                       title={CATEGORY_TITLE.upcoming}
                       items={discoverData.popularUpcoming}
@@ -1145,32 +1299,62 @@ export default function Home() {
           </>
         )}
 
+        {view === "calendar" && (
+          <>
+            <PageHeader
+              title="Calendar"
+              subtitle="Every release and episode you're following, laid out by month."
+            />
+            {homeItems.length === 0 ? (
+              <EmptyState
+                icon={<CalendarIcon size={22} className="text-subtle" />}
+                title="Nothing followed yet"
+                text="Find something in Discover and follow it to see it here."
+              />
+            ) : (
+              <div className="min-h-0 flex-1">
+                <MonthCalendarGrid
+                  year={calYear}
+                  month={calMonth}
+                  onMonthChange={(delta) => {
+                    const d = new Date(calYear, calMonth - 1 + delta, 1);
+                    setCalYear(d.getFullYear());
+                    setCalMonth(d.getMonth() + 1);
+                  }}
+                  onToday={() => {
+                    const now = new Date();
+                    setCalYear(now.getFullYear());
+                    setCalMonth(now.getMonth() + 1);
+                  }}
+                  entriesByDay={followedCalendarEntries}
+                  emptyMessage="Nothing releasing this month."
+                />
+              </div>
+            )}
+          </>
+        )}
+
         {view === "dugout" && (
           <>
-            <div className="flex items-start justify-between gap-3">
-              <PageHeader title="Dugout" subtitle="Line up what you want to watch next." />
-              <button
-                onClick={() => setDugoutSearchOpen(true)}
-                aria-label={`Add a ${dugoutType === "movie" ? "movie" : "show"}`}
-                title={`Add a ${dugoutType === "movie" ? "movie" : "show"}`}
-                className="flex shrink-0 items-center justify-center rounded-full bg-accent p-2.5 text-on-accent transition-opacity hover:opacity-90"
-              >
-                <Plus size={18} strokeWidth={2.5} />
-              </button>
+            <div className="mb-1 flex animate-fade-up items-center justify-between gap-3">
+              <h1 className="text-[30px] font-extrabold tracking-tight text-ink">
+                Dug<span className="text-accent">out</span>
+              </h1>
+              <div className="flex gap-2">
+                {(["movie", "tvShow"] as const).map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => setDugoutType(t)}
+                    className={`rounded-full px-3 py-1.5 text-[13px] font-medium transition-colors duration-150 ${
+                      dugoutType === t ? "bg-accent text-on-accent" : "bg-surface text-subtle hover:text-ink"
+                    }`}
+                  >
+                    {t === "movie" ? "Movies" : "TV"}
+                  </button>
+                ))}
+              </div>
             </div>
-            <div className="mb-8 flex gap-2">
-              {(["movie", "tvShow"] as const).map((t) => (
-                <button
-                  key={t}
-                  onClick={() => setDugoutType(t)}
-                  className={`rounded-full px-3 py-1.5 text-[13px] font-medium transition-colors duration-150 ${
-                    dugoutType === t ? "bg-accent text-on-accent" : "bg-surface text-subtle hover:text-ink"
-                  }`}
-                >
-                  {t === "movie" ? "Movies" : "TV"}
-                </button>
-              ))}
-            </div>
+            <p className="mb-8 animate-fade-up text-[14px] text-subtle">Line up what you want to watch next.</p>
 
             {dugoutLoading && !dugoutData ? (
               <p className="text-[13px] text-subtle">Loading…</p>
@@ -1189,16 +1373,18 @@ export default function Home() {
                       emptyText="Mark a show as currently watching from its detail page."
                     />
                   )}
-                  <DugoutStaticRow
+                  <DugoutTileGrid
                     title="On Deck"
                     items={dugoutData.onDeck}
                     onSelect={handleSelect}
+                    onAdd={() => setDugoutSearchTarget("onDeck")}
                     emptyText={`Add up to 5 ${dugoutType === "movie" ? "movies" : "shows"} you want to watch next.`}
                   />
                   <ExpandableWatchlist
                     title="Watchlist"
                     items={dugoutData.watchlist}
                     onSelect={handleSelect}
+                    onAdd={() => setDugoutSearchTarget("watchlist")}
                   />
                 </>
               )
@@ -1208,10 +1394,20 @@ export default function Home() {
 
         {view === "notifications" && (
           <>
-            <PageHeader
-              title="Notifications"
-              subtitle="Release changes and reminders for what you follow."
-            />
+            <div className="flex items-start justify-between gap-4">
+              <PageHeader
+                title="Notifications"
+                subtitle="Release changes and reminders for what you follow."
+              />
+              {notifications.length > 0 && (
+                <button
+                  onClick={handleClearAllNotifications}
+                  className="mt-1 shrink-0 text-[13px] font-medium text-subtle transition-colors hover:text-ink"
+                >
+                  Clear all
+                </button>
+              )}
+            </div>
             {notifications.length === 0 ? (
               <EmptyState
                 icon={<Bell size={22} className="text-subtle" />}
@@ -1228,46 +1424,57 @@ export default function Home() {
                   const unread = unreadAtOpenRef.current.has(n.id);
                   const isArtist = n.itemID.startsWith("artist:");
                   return (
-                    <button
+                    <div
                       key={n.id}
-                      onClick={() => live && handleSelect(live)}
-                      className="flex w-full animate-fade-up items-center gap-4 rounded-xl px-3 py-3.5 text-left transition-colors duration-200 hover:bg-surface/70"
+                      className="group flex w-full animate-fade-up items-center gap-4 rounded-xl px-3 py-3.5 transition-colors duration-200 hover:bg-surface/70"
                       style={{ animationDelay: `${Math.min(i, 12) * 30}ms` }}
                     >
-                      {live?.posterURL ? (
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img
-                          src={live.posterURL}
-                          alt=""
-                          loading="lazy"
-                          decoding="async"
-                          className={`shrink-0 object-cover ${
-                            isArtist ? "h-[52px] w-[52px] rounded-full" : "h-[64px] w-[44px] rounded-[8px]"
-                          }`}
-                        />
-                      ) : (
-                        <div
-                          className={`shrink-0 bg-surface ${
-                            isArtist ? "h-[52px] w-[52px] rounded-full" : "h-[64px] w-[44px] rounded-[8px]"
-                          }`}
-                        />
-                      )}
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <span className="truncate text-[14.5px] font-semibold text-ink">{n.title}</span>
-                          {n.eventType === "reminder" && (
-                            <span className="shrink-0 rounded-full bg-accent/12 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.06em] text-accent">
-                              Reminder
-                            </span>
-                          )}
+                      <button
+                        onClick={() => live && handleSelect(live)}
+                        className="flex min-w-0 flex-1 items-center gap-4 text-left"
+                      >
+                        {live?.posterURL ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img
+                            src={live.posterURL}
+                            alt=""
+                            loading="lazy"
+                            decoding="async"
+                            className={`shrink-0 object-cover ${
+                              isArtist ? "h-[52px] w-[52px] rounded-full" : "h-[64px] w-[44px] rounded-[8px]"
+                            }`}
+                          />
+                        ) : (
+                          <div
+                            className={`shrink-0 bg-surface ${
+                              isArtist ? "h-[52px] w-[52px] rounded-full" : "h-[64px] w-[44px] rounded-[8px]"
+                            }`}
+                          />
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="truncate text-[14.5px] font-semibold text-ink">{n.title}</span>
+                            {n.eventType === "reminder" && (
+                              <span className="shrink-0 rounded-full bg-accent/12 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.06em] text-accent">
+                                Reminder
+                              </span>
+                            )}
+                          </div>
+                          <div className="mt-1 line-clamp-1 text-[13px] text-subtle">{n.message}</div>
                         </div>
-                        <div className="mt-1 line-clamp-1 text-[13px] text-subtle">{n.message}</div>
-                      </div>
+                      </button>
                       <div className="flex shrink-0 flex-col items-end gap-1.5">
                         <span className="text-[11.5px] text-subtle">{timeAgo(n.createdAt)}</span>
                         {unread && <span className="h-2 w-2 rounded-full bg-accent" aria-label="Unread" />}
                       </div>
-                    </button>
+                      <button
+                        onClick={() => handleClearNotification(n.id)}
+                        aria-label="Clear notification"
+                        className="shrink-0 rounded-full p-1.5 text-subtle opacity-0 transition-opacity duration-150 hover:text-ink group-hover:opacity-100"
+                      >
+                        <X size={15} />
+                      </button>
+                    </div>
                   );
                 })}
               </div>
@@ -1400,17 +1607,17 @@ export default function Home() {
         />
       )}
 
-      {dugoutSearchOpen && (
+      {dugoutSearchTarget && (
         <DugoutSearchModal
           dugoutType={dugoutType}
+          target={dugoutSearchTarget}
           query={dugoutQuery}
           onQueryChange={setDugoutQuery}
           results={dugoutSearchResults}
           searching={dugoutSearching}
-          onSelect={(item) => {
-            closeDugoutSearch();
-            handleSelect(item);
-          }}
+          adding={dugoutAdding}
+          error={dugoutAddError}
+          onSelect={handleDugoutSearchSelect}
           onClose={closeDugoutSearch}
         />
       )}
@@ -1473,6 +1680,69 @@ function DugoutStaticRow({
   );
 }
 
+// On Deck's presentation — squarish tiles in one flush grid rather than
+// portrait poster cards in a row. Deliberate: On Deck is an UNORDERED set
+// capped at 5 (see lib/dugout.ts), and a horizontal row of cards reads as a
+// sequence whether or not one is intended (left-to-right implies "first,
+// second, third..."). A grid has no built-in reading direction the way a
+// row does, so this is the more honest presentation of "5 things, no
+// ranking" — confirmed against mockups, see the conversation that chose it.
+function DugoutTileGrid({
+  title,
+  items,
+  onSelect,
+  onAdd,
+  emptyText,
+}: {
+  title: string;
+  items: MediaItem[];
+  onSelect: (item: MediaItem) => void;
+  onAdd: () => void;
+  emptyText: string;
+}) {
+  return (
+    <section className="mb-9">
+      <div className="mb-3 flex items-center gap-2">
+        <h2 className="text-[17px] font-bold text-ink">{title}</h2>
+        <button
+          onClick={onAdd}
+          aria-label={`Add to ${title}`}
+          title={`Add to ${title}`}
+          className="flex items-center justify-center text-ink transition-opacity hover:opacity-70"
+        >
+          <Plus size={18} strokeWidth={2.5} />
+        </button>
+      </div>
+      {items.length === 0 ? (
+        <p className="text-[13px] text-subtle">{emptyText}</p>
+      ) : (
+        <div className="grid grid-cols-3 gap-3 sm:grid-cols-5">
+          {items.map((item) => (
+            <button key={item.id} onClick={() => onSelect(item)} className="group flex flex-col text-left">
+              <div className="relative aspect-square w-full overflow-hidden rounded-xl2 bg-surface ring-1 ring-hairline transition-transform duration-300 group-hover:-translate-y-1">
+                {item.posterURL ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={item.posterURL} alt="" loading="lazy" decoding="async" className="h-full w-full object-cover" />
+                ) : (
+                  <div className="flex h-full w-full items-center justify-center bg-surface text-[11px] text-subtle">
+                    No image
+                  </div>
+                )}
+              </div>
+              <div className="mt-2">
+                <div className="line-clamp-2 text-[12.5px] font-semibold leading-tight text-ink">{item.title}</div>
+                {item.releaseDate && (
+                  <div className="mt-0.5 text-[10.5px] text-subtle">{new Date(item.releaseDate).getFullYear()}</div>
+                )}
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 // Watchlist's "two-row shelf that expands into a page listing the entire
 // thing" — self-contained (owns its own expanded/collapsed state) rather
 // than hooking into the Discover category/back-button machinery, since all
@@ -1486,17 +1756,19 @@ function ExpandableWatchlist({
   title,
   items,
   onSelect,
+  onAdd,
 }: {
   title: string;
   items: MediaItem[];
   onSelect: (item: MediaItem) => void;
+  onAdd: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const previewCount = 8;
 
   return (
     <section className="mb-9">
-      <div className="mb-3 flex items-center gap-3">
+      <div className="mb-3 flex items-center gap-2">
         {expanded && (
           <button
             onClick={() => setExpanded(false)}
@@ -1506,7 +1778,16 @@ function ExpandableWatchlist({
             <ArrowLeft size={18} />
           </button>
         )}
-        <h2 className="flex-1 text-[17px] font-bold text-ink">{title}</h2>
+        <h2 className="text-[17px] font-bold text-ink">{title}</h2>
+        <button
+          onClick={onAdd}
+          aria-label={`Add to ${title}`}
+          title={`Add to ${title}`}
+          className="flex items-center justify-center text-ink transition-opacity hover:opacity-70"
+        >
+          <Plus size={18} strokeWidth={2.5} />
+        </button>
+        <div className="flex-1" />
         {!expanded && items.length > previewCount && (
           <button
             onClick={() => setExpanded(true)}
@@ -1536,20 +1817,38 @@ function ExpandableWatchlist({
 // onSelect wiring in the main component) — the actual "add to On Deck/
 // Watchlist" controls live there, already built; this modal only finds
 // things.
+const DUGOUT_STATUS_LABEL: Record<DugoutStatus, string> = {
+  onDeck: "On Deck",
+  watchlist: "Watchlist",
+  currentlyWatching: "Currently Watching",
+};
+
+// Unlike every other "select an item" surface in the app (which opens
+// DetailModal and leaves the actual add/remove decision to its pills), this
+// one adds on click — see handleDugoutSearchSelect. That's why it needs its
+// own busy/error handling instead of just handing off to onSelect and
+// closing: a click here has a real side effect (and a real failure mode —
+// On Deck at its cap) to surface, not just a navigation.
 function DugoutSearchModal({
   dugoutType,
+  target,
   query,
   onQueryChange,
   results,
   searching,
+  adding,
+  error,
   onSelect,
   onClose,
 }: {
   dugoutType: "movie" | "tvShow";
+  target: DugoutStatus;
   query: string;
   onQueryChange: (q: string) => void;
   results: MediaItem[];
   searching: boolean;
+  adding: boolean;
+  error: string | null;
   onSelect: (item: MediaItem) => void;
   onClose: () => void;
 }) {
@@ -1564,6 +1863,18 @@ function DugoutSearchModal({
         onClick={(e) => e.stopPropagation()}
         className="relative flex max-h-[70vh] w-full max-w-lg animate-scale-in flex-col overflow-hidden rounded-2xl bg-surface shadow-2xl ring-1 ring-hairline"
       >
+        <div className="flex items-center justify-between gap-2 border-b border-hairline/70 px-4 pt-3">
+          <span className="text-[12px] font-semibold uppercase tracking-wide text-subtle">
+            Add to {DUGOUT_STATUS_LABEL[target]}
+          </span>
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            className="shrink-0 rounded-full p-1.5 text-subtle transition-colors hover:text-ink"
+          >
+            <X size={16} />
+          </button>
+        </div>
         <div className="flex items-center gap-2.5 border-b border-hairline/70 px-4 py-3">
           <SearchIcon size={18} className="shrink-0 text-subtle" />
           <input
@@ -1573,15 +1884,11 @@ function DugoutSearchModal({
             placeholder={`Search ${typeLabel} to add…`}
             className="w-full bg-transparent text-[15px] text-ink outline-none placeholder:text-subtle"
           />
-          <button
-            onClick={onClose}
-            aria-label="Close"
-            className="shrink-0 rounded-full p-1.5 text-subtle transition-colors hover:text-ink"
-          >
-            <X size={16} />
-          </button>
         </div>
-        <div className="scrollbar-none flex-1 overflow-y-auto p-4">
+        {error && (
+          <p className="border-b border-hairline/70 bg-red-500/10 px-4 py-2 text-[12.5px] text-red-500">{error}</p>
+        )}
+        <div className={`scrollbar-none flex-1 overflow-y-auto p-4 ${adding ? "pointer-events-none opacity-60" : ""}`}>
           {query.trim().length < MIN_SEARCH_CHARS ? (
             <p className="py-6 text-center text-[13px] text-subtle">
               Start typing to find {typeLabel} to add.

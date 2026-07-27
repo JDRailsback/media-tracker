@@ -217,29 +217,78 @@ export async function discoverTMDBMovies(limit = 20): Promise<MediaItem[]> {
 const OFFICIAL_STATUS_CONCURRENCY = 50;
 const NON_OFFICIAL_STATUS = new Set(["Rumored", "Canceled"]);
 
-async function fetchStatus(kind: "movie" | "tv", id: number): Promise<string | undefined> {
+interface TMDBReleaseDateEntry {
+  type: number; // 1=Premiere, 2=Theatrical (limited), 3=Theatrical, 4=Digital, 5=Physical, 6=TV
+  release_date: string;
+}
+
+// TMDB's top-level movie.release_date is NOT reliably the US theatrical
+// date — verified live: "Spider-Man: Brand New Day" (id 969681) has a
+// top-level release_date of 2026-07-28, but its own /release_dates
+// sub-resource lists the real US theatrical release as 2026-07-31. The
+// top-level field appears to be whatever TMDB treats as the "primary"
+// release (sometimes an early/festival date, sometimes just unreconciled
+// with the region data), while /release_dates carries the actual
+// per-country dates people mean by "when does this come out". Prefers a
+// real theatrical release (type 2 or 3); falls back to the earliest US
+// entry of any type (e.g. a digital-only release) rather than nothing.
+function usTheatricalDate(releaseDatesResponse: unknown): string | undefined {
+  const results = (releaseDatesResponse as { results?: { iso_3166_1: string; release_dates: TMDBReleaseDateEntry[] }[] })
+    ?.results;
+  const us = results?.find((r) => r.iso_3166_1 === "US");
+  if (!us || us.release_dates.length === 0) return undefined;
+  const theatrical = us.release_dates.find((r) => r.type === 3) ?? us.release_dates.find((r) => r.type === 2);
+  const chosen = theatrical ?? [...us.release_dates].sort((a, b) => a.release_date.localeCompare(b.release_date))[0];
+  return chosen?.release_date?.slice(0, 10);
+}
+
+interface StatusResult {
+  status?: string;
+  // Movie-only — see usTheatricalDate. Corrects releaseDate on the calling
+  // row when present; undefined for TV (no equivalent field fetched) or
+  // when the movie has no US release_dates entry at all.
+  usReleaseDate?: string;
+}
+
+async function fetchStatus(kind: "movie" | "tv", id: number): Promise<StatusResult> {
   try {
     return await withRetries(async () => {
-      const res = await fetch(`https://api.themoviedb.org/3/${kind}/${id}?api_key=${key()}`, { cache: "no-store" });
+      // append_to_response costs nothing extra (one request either way) —
+      // this piggybacks the US-date correction onto the SAME per-item call
+      // filterOfficialOnly already makes for every upcoming movie, rather
+      // than adding a second round of requests.
+      const append = kind === "movie" ? "&append_to_response=release_dates" : "";
+      const res = await fetch(`https://api.themoviedb.org/3/${kind}/${id}?api_key=${key()}${append}`, {
+        cache: "no-store",
+      });
       if (!res.ok) throw new Error(`TMDB ${kind} status (${id}) failed: ${res.status}`);
       const d = await res.json();
-      return d.status as string | undefined;
+      return {
+        status: d.status as string | undefined,
+        usReleaseDate: kind === "movie" ? usTheatricalDate(d.release_dates) : undefined,
+      };
     });
   } catch {
-    // Unknown status on a persistent failure — don't let one flaky request
-    // silently exclude an otherwise-legitimate title.
-    return undefined;
+    // Unknown status/date on a persistent failure — don't let one flaky
+    // request silently exclude an otherwise-legitimate title or crash the
+    // date correction; the row just keeps its original release_date.
+    return {};
   }
 }
 
-async function filterOfficialOnly<T extends { id: string }>(
+async function filterOfficialOnly<T extends { id: string; releaseDate?: string }>(
   kind: "movie" | "tv",
   rows: T[]
 ): Promise<T[]> {
-  const statuses = await mapWithConcurrency(rows, OFFICIAL_STATUS_CONCURRENCY, (row) =>
+  const results = await mapWithConcurrency(rows, OFFICIAL_STATUS_CONCURRENCY, (row) =>
     fetchStatus(kind, Number(row.id.split(":")[1]))
   );
-  return rows.filter((_, i) => !NON_OFFICIAL_STATUS.has(statuses[i] ?? ""));
+  // Pair each row with its result BEFORE filtering — filtering first would
+  // shift indices in the surviving array out of sync with `results`.
+  return rows
+    .map((row, i) => ({ row, result: results[i] }))
+    .filter((x) => !NON_OFFICIAL_STATUS.has(x.result.status ?? ""))
+    .map((x) => (x.result.usReleaseDate ? { ...x.row, releaseDate: x.result.usReleaseDate } : x.row));
 }
 
 // TMDB discover pagination — 20 results/page. Fetches page 1 first to learn
@@ -685,8 +734,10 @@ function movieTags(d: {
 
 // Per-movie enrichment: runtime + provider search links + collection/studio/
 // keyword tags — none of this is in the discover response, needs one extra
-// request per movie.
-async function movieExtra(
+// request per movie. Exported (alongside tmdbGenreMap) so a one-off script
+// can hand-ingest a specific title the same way the bulk pipeline would,
+// without duplicating this logic — see scripts/ for an example.
+export async function movieExtra(
   id: number,
   title: string
 ): Promise<{ runtimeMinutes?: number; externalLinks: ExternalLink[]; tags: string[] }> {

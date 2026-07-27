@@ -20,7 +20,12 @@ export default function FeedRow({
 }) {
   const isToday = badge?.diffDays === 0;
   const isPast = (badge?.diffDays ?? 0) < 0;
-  const isSoon = !isToday && !isPast && (badge?.diffDays ?? 99) <= 6;
+  // Blue means "today or tomorrow" specifically, not "sometime this week" —
+  // used to be diffDays <= 6, which drifted out of sync once Home's own
+  // grouping (lib/feed.ts's buildFeed) became calendar-week-based: a title
+  // 5 days out could sit in the same "This week" section as one 2 days out
+  // yet only the closer one should read as urgent.
+  const isSoon = !isToday && !isPast && badge?.diffDays === 1;
 
   return (
     <button
