@@ -291,10 +291,16 @@ export default function MonthCalendarGrid({
                       alt=""
                       loading="lazy"
                       decoding="async"
-                      className="h-[48px] w-[34px] shrink-0 rounded-[6px] object-cover"
+                      // Same size as the Notifications row's thumbnail (see
+                      // app/page.tsx) — this panel's earlier 34x48 was the
+                      // smallest poster box anywhere in the app, small enough
+                      // that object-cover's ordinary crop read as posters
+                      // being cut off, especially next to a long, wrapping
+                      // subtitle.
+                      className="h-[64px] w-[44px] shrink-0 rounded-[8px] object-cover"
                     />
                   ) : (
-                    <div className="h-[48px] w-[34px] shrink-0 rounded-[6px] bg-panel" />
+                    <div className="h-[64px] w-[44px] shrink-0 rounded-[8px] bg-panel" />
                   )}
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-[13.5px] font-medium text-ink">{entry.title}</div>

@@ -1,6 +1,8 @@
-import type { ExternalLink, MediaItem, MediaType } from "@/lib/types";
+import type { EpisodeInfo, ExternalLink, MediaItem, MediaType } from "@/lib/types";
 import { db, ensureSchema } from "@/lib/db";
 import { toISODate } from "@/lib/dbDate";
+import { applyReleaseDateOverrides } from "@/lib/releaseDateOverrides";
+import { tvEpisodeCount } from "@/lib/catalog";
 
 // Row shape produced by the upcoming-releases fetchers (tmdb.ts/igdb.ts) and
 // stored in upcoming_items (see lib/db.ts's ensureSchema). Distinct from
@@ -32,6 +34,21 @@ export interface UpcomingRow {
   // (IGDB websites), the title's TMDB page for movies/TV — watch providers
   // don't exist before release, so an info link beats an empty section.
   externalLinks?: ExternalLink[];
+  // False ONLY when this row's date-correction fetch (see
+  // lib/sources/tmdb.ts's filterOfficialOnly/fetchStatus) failed outright
+  // this run — not when it succeeded but simply found nothing to correct.
+  // Defaults true (i.e. "trust this run's date") for every row that never
+  // sets it, which is every non-movie row plus movies whose fetch actually
+  // succeeded — see upsertUpcoming for how this gates the write.
+  dateVerified?: boolean;
+  // TV only, and only ever set by the cron's followed-upcoming-shows
+  // refresh (app/api/cron/daily) — { seasons, numberOfEpisodes, ... } same
+  // shape as CatalogRow's metadata, so a followed-but-unreleased show can
+  // show its full season schedule instead of just its premiere date.
+  // Omitted (not just empty) for every other writer, which is what lets
+  // upsertUpcoming's regression guard tell "this run didn't fetch episode
+  // data at all" apart from "this run confirmed there are none."
+  metadata?: Record<string, unknown>;
 }
 
 export interface UpcomingDBRow {
@@ -45,6 +62,7 @@ export interface UpcomingDBRow {
   date_confirmed: boolean;
   popularity_score: number;
   external_links: unknown;
+  metadata: unknown;
 }
 
 // Neon returns JSONB parsed in practice; guard against a raw string anyway
@@ -59,10 +77,43 @@ function parseLinks(value: unknown): ExternalLink[] {
   }
 }
 
+function parseMetadata(value: unknown): Record<string, unknown> {
+  if (value == null) return {};
+  if (typeof value !== "string") return value as Record<string, unknown>;
+  try {
+    return JSON.parse(value) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+interface UpcomingSeasonMeta {
+  seasonNumber: number;
+  episodes: { episode: number; title?: string; airDate?: string }[];
+}
+
 // Exported for lib/search.ts's combined catalog+upcoming query, which maps
 // each UNION branch through its own table's mapper.
 export function upcomingRowToMediaItem(row: UpcomingDBRow): MediaItem {
   const externalLinks = parseLinks(row.external_links);
+  const metadata = parseMetadata(row.metadata);
+
+  // Same split as catalogRowToMediaItem's tvShow branch: a followed but
+  // still-unreleased show only ever gets a full season schedule here when
+  // the cron's followed-upcoming-shows refresh has actually run for it
+  // (see app/api/cron/daily) — most upcoming TV rows never set this at
+  // all, which is fine, they just show their single premiere date.
+  let episodes: EpisodeInfo[] | undefined;
+  let episodeCount: number | undefined;
+  if (row.type === "tvShow") {
+    const seasons = (metadata.seasons as UpcomingSeasonMeta[] | undefined) ?? [];
+    const flattened = seasons.flatMap((s) =>
+      s.episodes.map((e) => ({ season: s.seasonNumber, episode: e.episode, title: e.title, airDate: e.airDate }))
+    );
+    episodes = flattened.length > 0 ? flattened : undefined;
+    episodeCount = (metadata.numberOfEpisodes as number | undefined) ?? (flattened.length || undefined);
+  }
+
   return {
     id: row.id,
     type: row.type as MediaType,
@@ -72,6 +123,8 @@ export function upcomingRowToMediaItem(row: UpcomingDBRow): MediaItem {
     backdropURL: row.backdrop_url ?? undefined,
     releaseDate: row.date_confirmed ? toISODate(row.release_date) : undefined,
     externalLinks: externalLinks.length > 0 ? externalLinks : undefined,
+    episodes,
+    episodeCount,
   };
 }
 
@@ -145,9 +198,31 @@ export async function upsertUpcoming(rows: UpcomingRow[]): Promise<void> {
   for (let i = 0; i < filtered.length; i += BATCH_SIZE) {
     const batch = filtered.slice(i, i + BATCH_SIZE);
     if (batch.length === 0) continue;
+
+    // Same episode-count regression guard as upsertCatalog, and for the
+    // same reason: most writers here (discoverTMDBUpcomingTV, the regular
+    // "upcoming" refresh) never set metadata at all — only the cron's
+    // followed-upcoming-shows refresh does. Without this, that stage's
+    // work would just get overwritten back to nothing the next time the
+    // regular refresh touches the same row.
+    const tvIds = batch.filter((r) => r.type === "tvShow" && r.metadata).map((r) => r.id);
+    const existingMetadata = new Map<string, Record<string, unknown>>();
+    if (tvIds.length > 0) {
+      const existing = (await sql`
+        SELECT id, metadata FROM upcoming_items WHERE id = ANY(${tvIds})
+      `) as unknown as { id: string; metadata: Record<string, unknown> }[];
+      for (const row of existing) existingMetadata.set(row.id, row.metadata);
+    }
+    const metadataFor = (r: UpcomingRow): Record<string, unknown> | null => {
+      if (!r.metadata) return null; // null, not {} — see ON CONFLICT below
+      const old = existingMetadata.get(r.id);
+      if (!old) return r.metadata;
+      return tvEpisodeCount(r.metadata) < tvEpisodeCount(old) ? old : r.metadata;
+    };
+
     await sql`
-      INSERT INTO upcoming_items (id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, first_seen_at, genres, original_language, external_links)
-      SELECT id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, COALESCE(announced_at, now()), genres, original_language, external_links
+      INSERT INTO upcoming_items (id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, first_seen_at, genres, original_language, external_links, date_verified, metadata)
+      SELECT id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, COALESCE(announced_at, now()), genres, original_language, external_links, date_verified, COALESCE(metadata, '{}'::jsonb)
       FROM UNNEST(
         ${batch.map((r) => r.id)}::text[],
         ${batch.map((r) => r.type)}::text[],
@@ -161,23 +236,37 @@ export async function upsertUpcoming(rows: UpcomingRow[]): Promise<void> {
         ${batch.map((r) => r.announcedAt ?? null)}::timestamptz[],
         ${batch.map((r) => JSON.stringify(r.genres ?? []))}::jsonb[],
         ${batch.map((r) => r.originalLanguage ?? null)}::text[],
-        ${batch.map((r) => JSON.stringify(r.externalLinks ?? []))}::jsonb[]
-      ) AS t(id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, announced_at, genres, original_language, external_links)
+        ${batch.map((r) => JSON.stringify(r.externalLinks ?? []))}::jsonb[],
+        ${batch.map((r) => r.dateVerified ?? true)}::boolean[],
+        ${batch.map((r) => {
+          const m = metadataFor(r);
+          return m ? JSON.stringify(m) : null;
+        })}::jsonb[]
+      ) AS t(id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, announced_at, genres, original_language, external_links, date_verified, metadata)
       ON CONFLICT (id) DO UPDATE SET
         title = excluded.title,
         overview = excluded.overview,
         poster_url = excluded.poster_url,
         -- COALESCE: same backdrop-preserving rule as upsertCatalog.
         backdrop_url = COALESCE(excluded.backdrop_url, upcoming_items.backdrop_url),
-        release_date = excluded.release_date,
-        date_confirmed = excluded.date_confirmed,
+        -- The actual regression guard: an unverified row (this run's
+        -- date-correction fetch failed outright) keeps whatever date was
+        -- already stored instead of overwriting it with this run's raw,
+        -- uncorrected one. A verified row always writes through as before.
+        release_date = CASE WHEN excluded.date_verified THEN excluded.release_date ELSE upcoming_items.release_date END,
+        date_confirmed = CASE WHEN excluded.date_verified THEN excluded.date_confirmed ELSE upcoming_items.date_confirmed END,
         popularity_score = excluded.popularity_score,
         genres = excluded.genres,
         original_language = excluded.original_language,
         external_links = excluded.external_links,
+        date_verified = excluded.date_verified,
+        -- NULL (this run never touched episode data) keeps whatever was
+        -- already stored instead of wiping it back to '{}'.
+        metadata = COALESCE(excluded.metadata, upcoming_items.metadata),
         updated_at = now()
     `;
   }
+  await applyReleaseDateOverrides();
 }
 
 // Removes rows of `type` that weren't part of the just-finished run — a

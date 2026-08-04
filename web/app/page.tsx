@@ -2,15 +2,18 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { useSession } from "next-auth/react";
 import { Search as SearchIcon, Bell, Sparkles, ArrowLeft, Plus, X, Calendar as CalendarIcon } from "lucide-react";
 import type { MediaItem } from "@/lib/types";
-import type { DugoutGroups, DugoutStatus } from "@/lib/dugout";
-import { addFollow, getFollowed, isFollowed, removeFollow, FollowedItem } from "@/lib/library";
+import type { DugoutGroups, DugoutStatus, DugoutType } from "@/lib/dugout";
+import { addFollow, getFollowed, isFollowed, removeFollow, replaceFollowed, FollowedItem } from "@/lib/library";
 import { buildFeed, describeRelease, parseReleaseDay } from "@/lib/feed";
-import { currentSubscription, enablePush, fetchPrefs, syncFollow } from "@/lib/push-client";
+import { currentSubscription, disablePush, enablePush, fetchPrefs, syncFollow } from "@/lib/push-client";
 import { getReadIds, markRead, timeAgo } from "@/lib/notificationHistory";
 import { LEAD_TIME_OPTIONS } from "@/lib/notificationPrefs";
 import TypeMutes from "@/components/TypeMutes";
+import CalendarSync from "@/components/CalendarSync";
+import AccountSettings from "@/components/AccountSettings";
 import type { DiscoverPayload } from "@/lib/sources";
 import DetailModal from "@/components/DetailModal";
 import MediaCard from "@/components/MediaCard";
@@ -21,8 +24,10 @@ import CollectionRow from "@/components/CollectionRow";
 import FeedRow from "@/components/FeedRow";
 import Shelf from "@/components/Shelf";
 import MonthCalendarGrid, { dayKey, type CalendarEntry } from "@/components/MonthCalendarGrid";
+import { releaseEntriesFor } from "@/lib/releaseEntries";
 import Sidebar, { View } from "@/components/Sidebar";
 import MobileNav from "@/components/MobileNav";
+import AccountCorner from "@/components/AccountCorner";
 import ThemeToggle from "@/components/ThemeToggle";
 import PlatformPrefs from "@/components/PlatformPrefs";
 import ContentFilters from "@/components/ContentFilters";
@@ -36,11 +41,12 @@ import { getGeneralBarLevel, type GeneralBarLevel } from "@/lib/generalBar";
 import { getFreshCache, setFreshCache } from "@/lib/freshCache";
 import { getDiscoverCache, setDiscoverCache } from "@/lib/discoverCache";
 
-// Manga is intentionally absent — removed from Discover/Search site-wide for
-// now (explicit request, flagged as something to potentially re-add later;
-// see lib/discoverSnapshot.ts's DiscoverPayload comment). Existing followed
-// manga items still render fine in Following (FOLLOW_GROUP_ORDER/TITLE
-// below) — that's untouched, only the discovery/search surfaces are off.
+// Manga is intentionally absent site-wide (explicit request, flagged as
+// something to potentially re-add later; see lib/discoverSnapshot.ts's
+// DiscoverPayload comment) — Discover/Search, Following (FOLLOW_GROUP_ORDER/
+// TITLE below), and Settings (contentFilters/notificationPrefs/
+// platformPrefs) all exclude it now. A followed manga item from before this
+// simply won't have a section to render into anymore.
 const CATEGORY_TITLE: Record<string, string> = {
   movies: "Trending movies",
   tv: "Trending TV",
@@ -89,15 +95,51 @@ const VALID_VIEWS = new Set<View>(["feed", "discover", "following", "calendar", 
 // Following page: grouped sections (in display order) and the sort applied
 // within each group. "Recently followed" (default) mirrors the old flat
 // list's implicit order; Title/Release date are opt-in.
-const FOLLOW_GROUP_ORDER = ["movie", "tvShow", "game", "manga", "artist", "franchise"] as const;
+const FOLLOW_GROUP_ORDER = ["movie", "tvShow", "game", "artist", "franchise"] as const;
 const FOLLOW_GROUP_TITLE: Record<(typeof FOLLOW_GROUP_ORDER)[number], string> = {
   movie: "Movies",
   tvShow: "TV",
   game: "Games",
-  manga: "Manga",
   artist: "Music",
   franchise: "Collections",
 };
+// Dugout: per-type tab label, "on deck" copy noun, and the verb used in
+// the page subtitle — "watch"/"play"/"listen to" reads more natural than a
+// one-size-fits-all "watch" once games and music are in the mix.
+const DUGOUT_TYPES = ["movie", "tvShow", "game", "artist"] as const;
+const DUGOUT_TYPE_LABEL: Record<DugoutType, string> = {
+  movie: "Movies",
+  tvShow: "TV",
+  game: "Games",
+  artist: "Music",
+};
+const DUGOUT_TYPE_NOUN: Record<DugoutType, string> = {
+  movie: "movies",
+  tvShow: "shows",
+  game: "games",
+  artist: "artists",
+};
+// Same nouns, spelled out for the search modal's "Search for ___" copy,
+// where "shows" alone reads ambiguous.
+const DUGOUT_TYPE_SEARCH_NOUN: Record<DugoutType, string> = {
+  movie: "movies",
+  tvShow: "TV shows",
+  game: "games",
+  artist: "artists",
+};
+const DUGOUT_TYPE_VERB: Record<DugoutType, string> = {
+  movie: "watch",
+  tvShow: "watch",
+  game: "play",
+  artist: "listen to",
+};
+// Only tvShow and game have a meaningful "currently in progress" state —
+// see lib/dugout.ts's DugoutGroups comment.
+const DUGOUT_IN_PROGRESS_LABEL: Partial<Record<DugoutType, string>> = {
+  tvShow: "Currently watching",
+  game: "Currently playing",
+};
+
 type FollowSort = "recent" | "title" | "release";
 const FOLLOW_SORTS: { value: FollowSort; label: string }[] = [
   { value: "recent", label: "Recently followed" },
@@ -176,6 +218,8 @@ interface PersistedState {
 
 export default function Home() {
   const router = useRouter();
+  const { data: session, status: sessionStatus } = useSession();
+  const isAdmin = !!session?.user?.isAdmin;
   const [view, setView] = useState<View>("feed");
   const [selected, setSelected] = useState<MediaItem | null>(null);
   const [followed, setFollowed] = useState<FollowedItem[]>([]);
@@ -203,7 +247,7 @@ export default function Home() {
   // be reflected until the next full navigation). The dataset is small
   // (a single-user queue capped at 5 On Deck + a modest watchlist), so
   // there's no staleness-vs-cost tradeoff worth making here.
-  const [dugoutType, setDugoutType] = useState<"movie" | "tvShow">("movie");
+  const [dugoutType, setDugoutType] = useState<DugoutType>("movie");
   const [dugoutData, setDugoutData] = useState<DugoutGroups | null>(null);
   const [dugoutLoading, setDugoutLoading] = useState(false);
 
@@ -380,8 +424,13 @@ export default function Home() {
   const [notifications, setNotifications] = useState<NotificationEntry[]>([]);
   const [readIds, setReadIds] = useState<number[]>([]);
   const unreadAtOpenRef = useRef<Set<number>>(new Set());
+  // Guards the mark-read effect below so it only snapshots/marks once per
+  // *visit* to the view, not on every notifications-array change while
+  // already there (e.g. clearing one entry) — see that effect's comment.
+  const notificationsMarkedRef = useRef(false);
   // null = push not enabled on this device (controls show their hint state).
   const [leadTime, setLeadTime] = useState<number | null>(null);
+  const [pushError, setPushError] = useState<string | null>(null);
 
   useEffect(() => {
     setFollowed(getFollowed());
@@ -392,6 +441,24 @@ export default function Home() {
     // the seconds the refresh took, then popped in (verified live).
     setFreshById(getFreshCache());
   }, []);
+
+  // Once signed in, the account's server-side follows replace whatever's
+  // local (see lib/library.ts's replaceFollowed) — the account becomes the
+  // source of truth, localStorage its synced cache. Runs once per sign-in
+  // (gated on sessionStatus transitioning to "authenticated"), not on every
+  // render, so it doesn't stomp on follows made during the same session.
+  useEffect(() => {
+    if (sessionStatus !== "authenticated") return;
+    fetch("/api/followed/mine")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((items: FollowedItem[] | null) => {
+        if (!items) return;
+        replaceFollowed(items);
+        setFollowed(getFollowed());
+      })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionStatus]);
 
   const followedIdsKey = followed.map((f) => f.id).join(",");
   useEffect(() => {
@@ -424,7 +491,7 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [followedIdsKey]);
 
-  useEffect(() => {
+  function refreshNotifications() {
     setReadIds(getReadIds());
     if (!followedIdsKey) {
       setNotifications([]);
@@ -434,13 +501,41 @@ export default function Home() {
       .then((r) => (r.ok ? r.json() : []))
       .then((rows: NotificationEntry[]) => setNotifications(rows))
       .catch(() => {});
+  }
+
+  useEffect(() => {
+    refreshNotifications();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [followedIdsKey]);
+
+  // Returning to the tab (e.g. the daily poll ran while it was in the
+  // background) previously never refreshed notifications on its own — only
+  // a change to the follow list did, so the badge/list could sit stale for
+  // an entire session. This keeps them current without a manual reload.
+  useEffect(() => {
+    function onVisible() {
+      if (document.visibilityState === "visible") refreshNotifications();
+    }
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [followedIdsKey]);
 
   // Opening the Notifications view marks everything read (clears the
   // badge) — after snapshotting what WAS unread so the in-list dots
-  // survive the visit.
+  // survive the visit. Gated on notificationsMarkedRef, not just
+  // `notifications.length > 0`, so this runs exactly ONCE per visit — it
+  // used to depend on the `notifications` array directly, which meant
+  // clearing a single entry (a new array reference) re-ran this, recomputed
+  // "unread" from the now-all-read localStorage state, and silently wiped
+  // the unread dots for every OTHER still-unread row in the list mid-visit.
   useEffect(() => {
-    if (view !== "notifications" || notifications.length === 0) return;
+    if (view !== "notifications") {
+      notificationsMarkedRef.current = false;
+      return;
+    }
+    if (notificationsMarkedRef.current || notifications.length === 0) return;
+    notificationsMarkedRef.current = true;
     const read = new Set(getReadIds());
     unreadAtOpenRef.current = new Set(notifications.filter((n) => !read.has(n.id)).map((n) => n.id));
     markRead(notifications.map((n) => n.id));
@@ -693,12 +788,31 @@ export default function Home() {
     setFollowed(getFollowed());
   }
 
-  async function handleEnablePush() {
-    const ok = await enablePush();
-    setPushEnabled(ok);
-    // A brand-new subscription starts with default prefs — hydrate the
-    // lead-time control so it goes live without a reload.
-    if (ok) fetchPrefs().then((p) => p && setLeadTime(p.leadTimeDays));
+  // Was enable-only forever — clicking "Enabled" again just silently
+  // re-subscribed with the same endpoint. Now a real toggle, and errors
+  // (permission denied, unsupported browser, missing VAPID key) surface
+  // instead of leaving the button stuck on "Enable" with no explanation.
+  async function handleTogglePush() {
+    setPushError(null);
+    if (pushEnabled) {
+      await disablePush();
+      setPushEnabled(false);
+      setLeadTime(null);
+      return;
+    }
+    try {
+      const ok = await enablePush();
+      setPushEnabled(ok);
+      if (ok) {
+        // A brand-new subscription starts with default prefs — hydrate the
+        // lead-time control so it goes live without a reload.
+        fetchPrefs().then((p) => p && setLeadTime(p.leadTimeDays));
+      } else {
+        setPushError("Notifications permission was denied, or this browser doesn't support push.");
+      }
+    } catch (err) {
+      setPushError(err instanceof Error ? err.message : "Couldn't enable notifications.");
+    }
   }
 
   // Collections and artists open their own dedicated pages, not the generic
@@ -718,24 +832,40 @@ export default function Home() {
   // Optimistic: drop from local state immediately, fire the DELETE without
   // waiting — this is an inbox, not a record that needs strict consistency,
   // and re-fetching on every clear would just add latency to a delete click.
+  // Rolled back on failure instead of just swallowing the error, so a
+  // dropped request doesn't leave the row permanently (and silently) gone
+  // from this session's view. itemID rides along because the server now
+  // requires it — see app/api/notifications' DELETE comment.
   function handleClearNotification(id: number) {
+    const removed = notifications.find((n) => n.id === id);
     setNotifications((prev) => prev.filter((n) => n.id !== id));
     fetch("/api/notifications", {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id }),
-    }).catch(() => {});
+      body: JSON.stringify({ id, itemID: removed?.itemID }),
+    })
+      .then((r) => {
+        if (!r.ok && removed) setNotifications((prev) => [...prev, removed].sort((a, b) => b.id - a.id));
+      })
+      .catch(() => {
+        if (removed) setNotifications((prev) => [...prev, removed].sort((a, b) => b.id - a.id));
+      });
   }
 
   function handleClearAllNotifications() {
     if (notifications.length === 0) return;
     if (!window.confirm("Clear all notifications? This can't be undone.")) return;
+    const previous = notifications;
     setNotifications([]);
     fetch("/api/notifications", {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ids: followedIdsKey.split(",") }),
-    }).catch(() => {});
+    })
+      .then((r) => {
+        if (!r.ok) setNotifications(previous);
+      })
+      .catch(() => setNotifications(previous));
   }
 
   const freshFollowed = followed.map((f) => {
@@ -756,17 +886,11 @@ export default function Home() {
   // franchise containers. Following (the full list) still shows them.
   const homeItems = freshFollowed.filter((f) => f.type !== "franchise");
 
-  // Sidebar "Calendar" tab: every followed item's upcoming release date(s),
-  // grouped by day — a flat one-entry-per-item map like the standalone
-  // /calendar page's, EXCEPT a followed TV show expands into one entry PER
-  // REMAINING EPISODE of its current/next season instead of a single "next
-  // episode" date. MediaItem.episodes already carries every known episode
-  // across every season (populated by catalogRowToMediaItem from TMDB's
-  // full per-season fetch — see lib/catalog.ts) — no extra request needed,
-  // this is the same freshFollowed data the Home feed already fetched.
-  // "Current/next season" = the highest season number with any known
-  // episode; a season TMDB hasn't announced yet simply isn't in the list.
-  const todayISO = new Date().toISOString().slice(0, 10);
+  // Sidebar "Calendar" tab: every followed item's release date(s), past and
+  // future, grouped by day. releaseEntriesFor (lib/releaseEntries.ts) is
+  // the shared source of truth for "what dates does this item actually
+  // have" — same function the ICS feed (app/api/calendar/feed.ics) uses, so
+  // the in-app calendar and the exported calendar can never drift apart.
   const followedCalendarEntries = new Map<string, CalendarEntry[]>();
   {
     const push = (key: string, entry: CalendarEntry) => {
@@ -775,46 +899,11 @@ export default function Home() {
       else followedCalendarEntries.set(key, [entry]);
     };
     for (const item of homeItems) {
-      if (item.type === "tvShow") {
-        const episodes = item.episodes ?? [];
-        if (episodes.length === 0) {
-          // Per-season data has a real gap for this show — verified live on
-          // "THE GHOST IN THE SHELL": its metadata.seasons came back with 0
-          // episodes for every season (a TMDB per-season fetch that came up
-          // empty at ingest time), so there's nothing to expand. Fall back
-          // to the single next-episode date catalogRowToMediaItem itself
-          // already resolved (via TMDB's own nextEpisodeToAir field — see
-          // lib/catalog.ts) rather than silently dropping the show from the
-          // calendar entirely; that fallback is exactly why item.releaseDate/
-          // subtitle are populated here even though item.episodes is empty.
-          if (item.releaseDate && item.releaseDate >= todayISO) {
-            push(dayKey(parseReleaseDay(item.releaseDate)), {
-              key: item.id,
-              title: item.title,
-              subtitle: item.subtitle ? `${item.title} — ${item.subtitle}` : undefined,
-              posterURL: item.posterURL,
-              type: "tvShow",
-              onSelect: () => handleSelect(item),
-            });
-          }
-          continue;
-        }
-        const currentSeason = Math.max(...episodes.map((e) => e.season));
-        for (const ep of episodes) {
-          if (ep.season !== currentSeason || !ep.airDate || ep.airDate < todayISO) continue;
-          push(dayKey(parseReleaseDay(ep.airDate)), {
-            key: `${item.id}:s${ep.season}e${ep.episode}`,
-            title: ep.title || item.title,
-            subtitle: `${item.title} — S${ep.season} E${ep.episode}`,
-            posterURL: item.posterURL,
-            type: "tvShow",
-            onSelect: () => handleSelect(item),
-          });
-        }
-      } else if (item.releaseDate && item.releaseDate >= todayISO) {
-        push(dayKey(parseReleaseDay(item.releaseDate)), {
-          key: item.id,
-          title: item.title,
+      for (const entry of releaseEntriesFor(item)) {
+        push(dayKey(parseReleaseDay(entry.date)), {
+          key: entry.uidSuffix ? `${item.id}:${entry.uidSuffix}` : item.id,
+          title: entry.title,
+          subtitle: entry.subtitle,
           posterURL: item.posterURL,
           type: item.type,
           onSelect: () => handleSelect(item),
@@ -823,19 +912,15 @@ export default function Home() {
     }
   }
 
-  // The recap hero: EVERY item releasing today, or — when nothing is
-  // releasing today — the single nearest upcoming release as an "Up next"
-  // preview. Pulled OUT of the schedule below so nothing is shown twice.
-  const upcoming = homeItems
+  // The recap hero: EVERY item releasing today, and nothing else — no
+  // "nearest upcoming" fallback when nothing's releasing today; the hero
+  // simply doesn't render (see heroItems.length > 0 checks below). Pulled
+  // OUT of the schedule below so nothing is shown twice.
+  const heroItems = homeItems
     .map((item) => ({ item, info: describeRelease(item) }))
     .filter((x): x is { item: FollowedItem; info: NonNullable<ReturnType<typeof describeRelease>> } =>
-      x.info !== null && x.info.diffDays >= 0
+      x.info !== null && x.info.diffDays === 0
     );
-  const releasingToday = upcoming.filter((x) => x.info.diffDays === 0);
-  const heroItems =
-    releasingToday.length > 0
-      ? releasingToday
-      : upcoming.filter((x) => x.info.diffDays > 0).sort((a, b) => a.info.diffDays - b.info.diffDays).slice(0, 1);
   const heroIds = new Set(heroItems.map((x) => x.item.id));
 
   const feed = buildFeed(homeItems.filter((f) => !heroIds.has(f.id)));
@@ -877,6 +962,7 @@ export default function Home() {
           <>
             <Sidebar active={view} unreadCount={unreadCount} onChange={handleNavChange} />
             <MobileNav active={view} unreadCount={unreadCount} onChange={handleNavChange} />
+            <AccountCorner onOpenAccount={() => handleNavChange("settings")} />
           </>
         );
       })()}
@@ -916,7 +1002,7 @@ export default function Home() {
                       <section className="animate-fade-up">
                         <div className="flex items-center">
                           <div className="text-[10.5px] font-extrabold uppercase tracking-[0.2em] text-accent">
-                            {info.diffDays === 0 ? "Today" : "Up next"}
+                            Today
                           </div>
                           {heroItems.length > 1 && (
                             <span className="ml-3 text-[12px] font-bold text-subtle">
@@ -1146,15 +1232,17 @@ export default function Home() {
                         <MediaCard item={item} index={i} onSelect={handleSelect} dateLabel={shelfDateLabel(item)} />
                       )}
                     />
-                    <div className="mb-2 flex items-center justify-end">
-                      <button
-                        onClick={() => setCreatingCollection(true)}
-                        className="flex items-center gap-1 text-[13px] font-medium text-accent transition-opacity hover:opacity-70"
-                      >
-                        <Plus size={14} />
-                        New collection
-                      </button>
-                    </div>
+                    {isAdmin && (
+                      <div className="mb-2 flex items-center justify-end">
+                        <button
+                          onClick={() => setCreatingCollection(true)}
+                          className="flex items-center gap-1 text-[13px] font-medium text-accent transition-opacity hover:opacity-70"
+                        >
+                          <Plus size={14} />
+                          New collection
+                        </button>
+                      </div>
+                    )}
                     <Shelf
                       title="Collections"
                       items={discoverData.featuredCollections}
@@ -1205,7 +1293,7 @@ export default function Home() {
             </button>
             <div className="mb-4 flex items-center justify-between">
               <PageHeader title={CATEGORY_TITLE[category] ?? category} />
-              {category === "collections" && (
+              {category === "collections" && isAdmin && (
                 <button
                   onClick={() => setCreatingCollection(true)}
                   className="flex shrink-0 items-center gap-1 text-[13px] font-medium text-accent transition-opacity hover:opacity-70"
@@ -1341,7 +1429,7 @@ export default function Home() {
                 Dug<span className="text-accent">out</span>
               </h1>
               <div className="flex gap-2">
-                {(["movie", "tvShow"] as const).map((t) => (
+                {DUGOUT_TYPES.map((t) => (
                   <button
                     key={t}
                     onClick={() => setDugoutType(t)}
@@ -1349,12 +1437,14 @@ export default function Home() {
                       dugoutType === t ? "bg-accent text-on-accent" : "bg-surface text-subtle hover:text-ink"
                     }`}
                   >
-                    {t === "movie" ? "Movies" : "TV"}
+                    {DUGOUT_TYPE_LABEL[t]}
                   </button>
                 ))}
               </div>
             </div>
-            <p className="mb-8 animate-fade-up text-[14px] text-subtle">Line up what you want to watch next.</p>
+            <p className="mb-8 animate-fade-up text-[14px] text-subtle">
+              Line up what you want to {DUGOUT_TYPE_VERB[dugoutType]} next.
+            </p>
 
             {dugoutLoading && !dugoutData ? (
               <p className="text-[13px] text-subtle">Loading…</p>
@@ -1365,12 +1455,14 @@ export default function Home() {
                       "Watched"/"Favorites" later as further static rows —
                       each section here is independent, so adding one is
                       purely additive, no restructuring needed. */}
-                  {dugoutType === "tvShow" && (
+                  {DUGOUT_IN_PROGRESS_LABEL[dugoutType] && (
                     <DugoutStaticRow
-                      title="Currently watching"
+                      title={DUGOUT_IN_PROGRESS_LABEL[dugoutType]!}
                       items={dugoutData.currentlyWatching}
                       onSelect={handleSelect}
-                      emptyText="Mark a show as currently watching from its detail page."
+                      emptyText={`Mark a ${dugoutType === "game" ? "game" : "show"} as ${DUGOUT_IN_PROGRESS_LABEL[
+                        dugoutType
+                      ]!.toLowerCase()} from its detail page.`}
                     />
                   )}
                   <DugoutTileGrid
@@ -1378,7 +1470,7 @@ export default function Home() {
                     items={dugoutData.onDeck}
                     onSelect={handleSelect}
                     onAdd={() => setDugoutSearchTarget("onDeck")}
-                    emptyText={`Add up to 5 ${dugoutType === "movie" ? "movies" : "shows"} you want to watch next.`}
+                    emptyText={`Add up to 5 ${DUGOUT_TYPE_NOUN[dugoutType]} you want to ${DUGOUT_TYPE_VERB[dugoutType]} next.`}
                   />
                   <ExpandableWatchlist
                     title="Watchlist"
@@ -1397,7 +1489,7 @@ export default function Home() {
             <div className="flex items-start justify-between gap-4">
               <PageHeader
                 title="Notifications"
-                subtitle="Release changes and reminders for what you follow."
+                subtitle="Release-day alerts and reminders for what you follow."
               />
               {notifications.length > 0 && (
                 <button
@@ -1412,7 +1504,7 @@ export default function Home() {
               <EmptyState
                 icon={<Bell size={22} className="text-subtle" />}
                 title="Nothing yet"
-                text="When a followed title's release date is set, changed, or coming up, it shows up here."
+                text="When something you follow releases, or a reminder you set is coming up, it shows up here."
               />
             ) : (
               <div>
@@ -1431,7 +1523,11 @@ export default function Home() {
                     >
                       <button
                         onClick={() => live && handleSelect(live)}
-                        className="flex min-w-0 flex-1 items-center gap-4 text-left"
+                        disabled={!live}
+                        title={live ? undefined : "No longer available"}
+                        className={`flex min-w-0 flex-1 items-center gap-4 text-left ${
+                          live ? "" : "cursor-default opacity-50"
+                        }`}
                       >
                         {live?.posterURL ? (
                           // eslint-disable-next-line @next/next/no-img-element
@@ -1454,7 +1550,13 @@ export default function Home() {
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-2">
                             <span className="truncate text-[14.5px] font-semibold text-ink">{n.title}</span>
-                            {n.eventType === "reminder" && (
+                            {/* eventType is always "reminder" server-side — leadDays is what
+                                actually distinguishes "out today" from an advance heads-up. */}
+                            {n.leadDays === 0 ? (
+                              <span className="shrink-0 rounded-full bg-green-500/12 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.06em] text-green-500">
+                                Out now
+                              </span>
+                            ) : (
                               <span className="shrink-0 rounded-full bg-accent/12 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.06em] text-accent">
                                 Reminder
                               </span>
@@ -1486,18 +1588,30 @@ export default function Home() {
           <>
             <PageHeader title="Settings" />
             <div className="space-y-4">
+              <SettingsRow label="Account">
+                <AccountSettings />
+              </SettingsRow>
               <SettingsRow label="Appearance">
                 <ThemeToggle />
               </SettingsRow>
               <SettingsRow label="Notifications">
                 <button
-                  onClick={handleEnablePush}
-                  className="flex items-center gap-2 rounded-full bg-accent px-3.5 py-1.5 text-[13px] font-semibold text-on-accent transition-all duration-200 hover:brightness-110 active:scale-95"
+                  onClick={handleTogglePush}
+                  className={
+                    pushEnabled
+                      ? "flex items-center gap-2 rounded-full bg-surface px-3.5 py-1.5 text-[13px] font-medium text-ink ring-1 ring-hairline transition-colors hover:bg-panel"
+                      : "flex items-center gap-2 rounded-full bg-accent px-3.5 py-1.5 text-[13px] font-semibold text-on-accent transition-all duration-200 hover:brightness-110 active:scale-95"
+                  }
                 >
                   <Bell size={14} />
-                  {pushEnabled ? "Enabled" : "Enable"}
+                  {pushEnabled ? "Disable" : "Enable"}
                 </button>
               </SettingsRow>
+              {pushError && <p className="-mt-2 px-1 text-[12.5px] text-red-400">{pushError}</p>}
+              <p className="-mt-2 px-1 text-[12.5px] text-subtle">
+                You&rsquo;ll always be notified the day something you follow releases. The option below adds an
+                optional heads-up before that too.
+              </p>
               <SettingsRow label="Release reminders">
                 {leadTime === null ? (
                   <span className="text-[13px] text-subtle">Enable notifications first</span>
@@ -1529,6 +1643,17 @@ export default function Home() {
                 {/* Keyed on push state so enabling push swaps the hint for
                     the live controls without a reload. */}
                 <TypeMutes key={String(pushEnabled)} />
+              </div>
+              <div className="rounded-2xl bg-surface px-5 py-4 ring-1 ring-hairline">
+                <div className="mb-3">
+                  <span className="text-[15px] font-medium text-ink">Calendar sync</span>
+                  <p className="mt-0.5 text-[13px] text-subtle">
+                    Subscribe to this URL in Google Calendar, Apple Calendar, or Outlook to see every followed
+                    release on your own calendar — updates automatically as you follow new things, no need to
+                    re-copy the link.
+                  </p>
+                </div>
+                <CalendarSync />
               </div>
               <div className="rounded-2xl bg-surface px-5 py-4 ring-1 ring-hairline">
                 <div className="mb-3">
@@ -1841,7 +1966,7 @@ function DugoutSearchModal({
   onSelect,
   onClose,
 }: {
-  dugoutType: "movie" | "tvShow";
+  dugoutType: DugoutType;
   target: DugoutStatus;
   query: string;
   onQueryChange: (q: string) => void;
@@ -1852,7 +1977,7 @@ function DugoutSearchModal({
   onSelect: (item: MediaItem) => void;
   onClose: () => void;
 }) {
-  const typeLabel = dugoutType === "movie" ? "movies" : "TV shows";
+  const typeLabel = DUGOUT_TYPE_SEARCH_NOUN[dugoutType];
 
   return (
     <div

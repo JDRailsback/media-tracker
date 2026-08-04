@@ -248,6 +248,19 @@ interface StatusResult {
   // row when present; undefined for TV (no equivalent field fetched) or
   // when the movie has no US release_dates entry at all.
   usReleaseDate?: string;
+  // True whenever this fetch actually completed (whether or not a US entry
+  // existed to correct with) — false ONLY on the catch path below, i.e. the
+  // request itself failed after retries. Deliberately NOT the same signal
+  // as "usReleaseDate is present": a foreign film can legitimately have no
+  // US release_dates entry at all, which is a successful fetch that simply
+  // found nothing to correct, not a failure. Conflating the two used to mean
+  // a single flaky request for one movie (out of thousands, once) fell back
+  // to that run's raw, uncorrected discover-endpoint date and got WRITTEN
+  // OVER an already-correct stored date — verified live on "Spider-Man:
+  // Brand New Day," which reverted from its correct 2026-07-31 back to the
+  // wrong 2026-07-28 this way. See filterOfficialOnly/upsertUpcoming for how
+  // this flag now guards against that instead of just hoping retries win.
+  fetchOk: boolean;
 }
 
 async function fetchStatus(kind: "movie" | "tv", id: number): Promise<StatusResult> {
@@ -266,17 +279,20 @@ async function fetchStatus(kind: "movie" | "tv", id: number): Promise<StatusResu
       return {
         status: d.status as string | undefined,
         usReleaseDate: kind === "movie" ? usTheatricalDate(d.release_dates) : undefined,
+        fetchOk: true,
       };
     });
   } catch {
     // Unknown status/date on a persistent failure — don't let one flaky
     // request silently exclude an otherwise-legitimate title or crash the
-    // date correction; the row just keeps its original release_date.
-    return {};
+    // date correction; the row just keeps its original release_date this
+    // run, but fetchOk: false stops that unverified value from ever being
+    // written over a previously-good one (see upsertUpcoming).
+    return { fetchOk: false };
   }
 }
 
-async function filterOfficialOnly<T extends { id: string; releaseDate?: string }>(
+async function filterOfficialOnly<T extends { id: string; releaseDate?: string; dateVerified?: boolean }>(
   kind: "movie" | "tv",
   rows: T[]
 ): Promise<T[]> {
@@ -288,7 +304,11 @@ async function filterOfficialOnly<T extends { id: string; releaseDate?: string }
   return rows
     .map((row, i) => ({ row, result: results[i] }))
     .filter((x) => !NON_OFFICIAL_STATUS.has(x.result.status ?? ""))
-    .map((x) => (x.result.usReleaseDate ? { ...x.row, releaseDate: x.result.usReleaseDate } : x.row));
+    .map((x) => ({
+      ...x.row,
+      ...(x.result.usReleaseDate ? { releaseDate: x.result.usReleaseDate } : {}),
+      dateVerified: x.result.fetchOk,
+    }));
 }
 
 // TMDB discover pagination — 20 results/page. Fetches page 1 first to learn
@@ -468,8 +488,16 @@ async function allEpisodes(
   seasons: { season_number: number }[] | undefined
 ): Promise<EpisodeInfo[]> {
   if (!seasons || seasons.length === 0) return [];
+  // Season 0 ("Specials") is bonus/spinoff material — OVAs, recaps,
+  // companion shorts — not real episode releases; TMDB's own
+  // number_of_episodes already excludes it. Verified live on Re:ZERO,
+  // whose Season 0 is a weekly companion mini-series airing right
+  // alongside each real episode, which made every real episode look like
+  // it had two calendar entries once every season (including 0) was
+  // included here.
+  const realSeasons = seasons.filter((s) => s.season_number !== 0);
   const results = await Promise.allSettled(
-    seasons.map((s) =>
+    realSeasons.map((s) =>
       fetch(
         `https://api.themoviedb.org/3/tv/${id}/season/${s.season_number}?api_key=${key()}`,
         { cache: "no-store" }
@@ -483,7 +511,7 @@ async function allEpisodes(
     const season = r.value as TMDBSeason;
     for (const ep of season.episodes ?? []) {
       episodes.push({
-        season: seasons[i].season_number,
+        season: realSeasons[i].season_number,
         episode: ep.episode_number,
         title: ep.name,
         airDate: ep.air_date,
@@ -673,14 +701,44 @@ interface TMDBDiscoverMovie extends TMDBMovie {
 // not a guaranteed exact-title deep link. Ordered so a more specific brand
 // (e.g. "Paramount+ Amazon Channel") matches its own rule before falling
 // through to a more generic one that happens to share a word ("Amazon").
+// Named/branded services all come before the generic reseller platforms
+// (apple/google play/youtube/amazon) at the bottom — those four are also
+// the most common CHANNEL-BUNDLE suffix ("Crunchyroll Amazon Channel",
+// "Starz Apple TV Channel", ...), so if they matched first every bundled
+// service would get mislabeled as whichever storefront resold it instead
+// of its real name. Verified against real TMDB watch/providers responses,
+// not guessed — see the account/notes around this file for the sampled
+// titles this was checked against.
 const PROVIDER_SEARCH_RULES: { pattern: string; provider: string; searchURL: (title: string) => string }[] = [
+  { pattern: "crunchyroll", provider: "Crunchyroll", searchURL: (t) => `https://www.crunchyroll.com/search?q=${encodeURIComponent(t)}` },
   { pattern: "paramount", provider: "Paramount+", searchURL: (t) => `https://www.paramountplus.com/search/?query=${encodeURIComponent(t)}` },
   { pattern: "disney", provider: "Disney+", searchURL: (t) => `https://www.disneyplus.com/search?q=${encodeURIComponent(t)}` },
   { pattern: "peacock", provider: "Peacock", searchURL: (t) => `https://www.peacocktv.com/search?q=${encodeURIComponent(t)}` },
   { pattern: "netflix", provider: "Netflix", searchURL: (t) => `https://www.netflix.com/search?q=${encodeURIComponent(t)}` },
   { pattern: "hulu", provider: "Hulu", searchURL: (t) => `https://www.hulu.com/search?q=${encodeURIComponent(t)}` },
-  { pattern: "apple", provider: "Apple TV", searchURL: (t) => `https://tv.apple.com/search?term=${encodeURIComponent(t)}` },
   { pattern: "max", provider: "Max", searchURL: (t) => `https://play.max.com/search?q=${encodeURIComponent(t)}` },
+  { pattern: "starz", provider: "Starz", searchURL: (t) => `https://www.starz.com/us/en/search?q=${encodeURIComponent(t)}` },
+  { pattern: "showtime", provider: "Showtime", searchURL: (t) => `https://www.showtime.com/search?q=${encodeURIComponent(t)}` },
+  { pattern: "mgm", provider: "MGM+", searchURL: (t) => `https://www.mgmplus.com/search?q=${encodeURIComponent(t)}` },
+  { pattern: "amc", provider: "AMC+", searchURL: (t) => `https://www.amcplus.com/search?q=${encodeURIComponent(t)}` },
+  { pattern: "discovery", provider: "Discovery+", searchURL: (t) => `https://www.discoveryplus.com/search?q=${encodeURIComponent(t)}` },
+  { pattern: "espn", provider: "ESPN+", searchURL: (t) => `https://www.espn.com/watch/search?q=${encodeURIComponent(t)}` },
+  { pattern: "tubi", provider: "Tubi", searchURL: (t) => `https://tubitv.com/search/${encodeURIComponent(t)}` },
+  { pattern: "pluto", provider: "Pluto TV", searchURL: () => `https://pluto.tv/` },
+  { pattern: "roku channel", provider: "The Roku Channel", searchURL: (t) => `https://therokuchannel.roku.com/search/${encodeURIComponent(t)}` },
+  { pattern: "fandango", provider: "Fandango At Home", searchURL: (t) => `https://www.fandangoathome.com/search/${encodeURIComponent(t)}` },
+  { pattern: "plex", provider: "Plex", searchURL: (t) => `https://watch.plex.tv/search?query=${encodeURIComponent(t)}` },
+  { pattern: "shudder", provider: "Shudder", searchURL: (t) => `https://www.shudder.com/search?q=${encodeURIComponent(t)}` },
+  { pattern: "britbox", provider: "BritBox", searchURL: (t) => `https://www.britbox.com/us/search/${encodeURIComponent(t)}` },
+  { pattern: "acorn", provider: "Acorn TV", searchURL: (t) => `https://acorn.tv/search/?q=${encodeURIComponent(t)}` },
+  { pattern: "fubo", provider: "fuboTV", searchURL: (t) => `https://www.fubo.tv/search?q=${encodeURIComponent(t)}` },
+  { pattern: "sling", provider: "Sling TV", searchURL: () => `https://www.sling.com/` },
+  { pattern: "philo", provider: "Philo", searchURL: () => `https://www.philo.com/` },
+  { pattern: "criterion", provider: "Criterion Channel", searchURL: (t) => `https://www.criterionchannel.com/search?q=${encodeURIComponent(t)}` },
+  { pattern: "kanopy", provider: "Kanopy", searchURL: (t) => `https://www.kanopy.com/en/search?query=${encodeURIComponent(t)}` },
+  { pattern: "hoopla", provider: "Hoopla", searchURL: (t) => `https://www.hoopladigital.com/search?q=${encodeURIComponent(t)}` },
+  { pattern: "hidive", provider: "HIDIVE", searchURL: (t) => `https://www.hidive.com/search?q=${encodeURIComponent(t)}` },
+  { pattern: "apple", provider: "Apple TV+", searchURL: (t) => `https://tv.apple.com/search?term=${encodeURIComponent(t)}` },
   { pattern: "google play", provider: "Google Play Movies", searchURL: (t) => `https://play.google.com/store/search?q=${encodeURIComponent(t)}&c=movies` },
   { pattern: "youtube", provider: "YouTube", searchURL: (t) => `https://www.youtube.com/results?search_query=${encodeURIComponent(t)}` },
   { pattern: "amazon", provider: "Amazon Video", searchURL: (t) => `https://www.amazon.com/s?k=${encodeURIComponent(t)}&i=instant-video` },
@@ -740,10 +798,25 @@ function movieTags(d: {
 export async function movieExtra(
   id: number,
   title: string
-): Promise<{ runtimeMinutes?: number; externalLinks: ExternalLink[]; tags: string[] }> {
+): Promise<{
+  runtimeMinutes?: number;
+  externalLinks: ExternalLink[];
+  tags: string[];
+  // Same correction/verification pair as fetchStatus's usReleaseDate/fetchOk
+  // (see that function's comment) — this is the OTHER place a movie's raw
+  // TMDB release_date needs correcting: any movie ingested straight into
+  // catalog_items (discoverTMDBRecentMovies below, or the bulk ingest via
+  // paginatedTMDBMovies) went through this function, which never fetched
+  // release_dates at all until now, so a graduated movie could carry a wrong
+  // date with literally no correction attempted, not just an occasional
+  // failed-fetch regression. Piggybacks on this same per-movie request —
+  // zero extra TMDB calls.
+  usReleaseDate?: string;
+  fetchOk: boolean;
+}> {
   try {
     return await withRetries(async () => {
-      const url = `https://api.themoviedb.org/3/movie/${id}?api_key=${key()}&append_to_response=watch/providers,keywords`;
+      const url = `https://api.themoviedb.org/3/movie/${id}?api_key=${key()}&append_to_response=watch/providers,keywords,release_dates`;
       const res = await fetch(url, { cache: "no-store" });
       if (!res.ok) throw new Error(`TMDB movie details (${id}) failed: ${res.status}`);
       const d = await res.json();
@@ -751,10 +824,12 @@ export async function movieExtra(
         runtimeMinutes: typeof d.runtime === "number" ? d.runtime : undefined,
         externalLinks: providerSearchLinks(d["watch/providers"]?.results?.US, title),
         tags: movieTags(d),
+        usReleaseDate: usTheatricalDate(d.release_dates),
+        fetchOk: true,
       };
     });
   } catch {
-    return { externalLinks: [], tags: [] };
+    return { externalLinks: [], tags: [], fetchOk: false };
   }
 }
 
@@ -810,6 +885,8 @@ async function enrichMovieRows(rows: CatalogRow[], onEnrich?: (done: number, tot
     row.metadata = { runtimeMinutes: extra.runtimeMinutes };
     row.externalLinks = extra.externalLinks;
     row.tags = extra.tags;
+    if (extra.usReleaseDate) row.releaseDate = extra.usReleaseDate;
+    row.dateVerified = extra.fetchOk;
     done++;
     onEnrich?.(done, rows.length);
   });
@@ -864,9 +941,21 @@ function tvTags(d: {
 // provider search links + network/studio/keyword tags. One request for the
 // show itself, plus one more PER SEASON — far more expensive than the movie
 // case, since a show's episode data isn't on the show-level response at all.
-const SEASON_CONCURRENCY = 5;
+// Combined with SHOW_DETAIL_CONCURRENCY below, this stacks: with both at
+// their old values (8 shows x 5 seasons) TMDB could see 40 simultaneous
+// requests — verified live this reliably triggered empty-but-200 season
+// responses across many shows in one run, and the SAME shows failed again
+// even after lowering this to 3 (15 peak concurrent) with longer retry
+// backoff — confirmed via an isolated single-show fetch (no concurrency at
+// all) that the data and endpoint are fine, so this really is a load
+// problem, not a per-show data gap. Serial per-show (1) keeps peak
+// concurrent season requests capped at SHOW_DETAIL_CONCURRENCY.
+const SEASON_CONCURRENCY = 1;
 
-async function tvExtra(
+// Exported so the daily cron's followed-show refresh (app/api/cron/daily)
+// can hand-refresh one show's season/episode data the same way the bulk
+// recent-releases pass does, same precedent as movieExtra above.
+export async function tvExtra(
   id: number,
   title: string
 ): Promise<{
@@ -909,22 +998,38 @@ async function tvExtra(
         external_ids?: { imdb_id?: string | null };
       };
 
-      const seasonSummaries = d.seasons ?? [];
+      // Season 0 ("Specials") is bonus/spinoff material, not real episode
+      // releases — see allEpisodes' identical filter above for the Re:ZERO
+      // case this was verified against (a companion mini-series bundled as
+      // Season 0, airing right alongside each real episode).
+      const seasonSummaries = (d.seasons ?? []).filter((s) => s.season_number !== 0);
       const seasons = await mapWithConcurrency(seasonSummaries, SEASON_CONCURRENCY, async (s) => {
         try {
-          const seasonRes = await fetch(
-            `https://api.themoviedb.org/3/tv/${id}/season/${s.season_number}?api_key=${key()}`,
-            { cache: "no-store" }
-          );
-          if (!seasonRes.ok) return { seasonNumber: s.season_number, name: s.name, episodes: [] };
-          const seasonData = await seasonRes.json();
-          const episodes = (seasonData.episodes as TMDBSeasonEpisode[] | undefined ?? []).map((e) => ({
-            episode: e.episode_number,
-            title: e.name || undefined,
-            airDate: e.air_date || undefined,
-            runtimeMinutes: e.runtime ?? undefined,
-          }));
-          return { seasonNumber: s.season_number, name: s.name, episodes };
+          // Retried like every other TMDB call here — a non-ok response now
+          // THROWS (instead of silently resolving to "no episodes") so
+          // withRetries actually gets a chance to recover a transient
+          // failure before this season falls back to empty. Longer backoff
+          // than the default (4 attempts, 900ms base — ~900/1800/3600ms
+          // between tries) since the actual failure mode observed live was
+          // rate-limiting under concurrent load, which needs more time to
+          // clear than a single quick retry gives it.
+          return await withRetries(async () => {
+            const seasonRes = await fetch(
+              `https://api.themoviedb.org/3/tv/${id}/season/${s.season_number}?api_key=${key()}`,
+              { cache: "no-store" }
+            );
+            if (!seasonRes.ok) {
+              throw new Error(`TMDB season fetch (${id}/${s.season_number}) failed: ${seasonRes.status}`);
+            }
+            const seasonData = await seasonRes.json();
+            const episodes = (seasonData.episodes as TMDBSeasonEpisode[] | undefined ?? []).map((e) => ({
+              episode: e.episode_number,
+              title: e.name || undefined,
+              airDate: e.air_date || undefined,
+              runtimeMinutes: e.runtime ?? undefined,
+            }));
+            return { seasonNumber: s.season_number, name: s.name, episodes };
+          }, 4, 900);
         } catch {
           return { seasonNumber: s.season_number, name: s.name, episodes: [] };
         }
@@ -956,7 +1061,8 @@ async function tvExtra(
   }
 }
 
-const SHOW_DETAIL_CONCURRENCY = 8;
+// Paired with SEASON_CONCURRENCY's own comment — was 8, lowered alongside it.
+const SHOW_DETAIL_CONCURRENCY = 5;
 
 export async function paginatedTMDBTV(
   targetCount: number,

@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { Plus_Jakarta_Sans } from "next/font/google";
 import { THEME_INIT_SCRIPT } from "@/lib/theme";
+import AuthProvider from "@/components/AuthProvider";
 import "./globals.css";
 
 const jakarta = Plus_Jakarta_Sans({
@@ -11,7 +12,7 @@ const jakarta = Plus_Jakarta_Sans({
 
 export const metadata: Metadata = {
   title: "Trackr",
-  description: "Follow movies, shows, games, and manga — know the moment something new drops.",
+  description: "Follow movies, shows, games, and music — know the moment something new drops.",
   manifest: "/manifest.json",
   // Placeholder mark (see public/*.png) — swap these three files for real
   // brand art later, no other wiring changes needed.
@@ -40,7 +41,7 @@ export default function RootLayout({
     <html lang="en" className={jakarta.variable} suppressHydrationWarning>
       <body className="bg-canvas font-sans text-ink">
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
-        {children}
+        <AuthProvider>{children}</AuthProvider>
       </body>
     </html>
   );

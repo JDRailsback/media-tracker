@@ -9,9 +9,10 @@ import type { MediaItem } from "@/lib/types";
 // than layering on top of it (an explicit, simpler-than-the-alternative
 // design choice — see the conversation that scoped this feature).
 export type DugoutStatus = "onDeck" | "watchlist" | "currentlyWatching";
-export type DugoutType = "movie" | "tvShow";
+export type DugoutType = "movie" | "tvShow" | "game" | "artist";
 
-// Per type (movies and TV each get their own 5, not a shared pool).
+// Per type (movies, TV, games, and artists each get their own 5, not a
+// shared pool).
 const ON_DECK_LIMIT = 5;
 
 interface DugoutRow {
@@ -23,7 +24,10 @@ interface DugoutRow {
 export interface DugoutGroups {
   onDeck: MediaItem[];
   watchlist: MediaItem[];
-  // Only ever populated for type "tvShow" — movies have no such status.
+  // Only ever populated for types "tvShow" and "game" — an ongoing
+  // "currently in progress" state makes sense for those two (an episode
+  // count/playtime to work through) but not for a movie (one sitting) or
+  // an artist (there's no single thing being "currently listened to").
   currentlyWatching: MediaItem[];
 }
 
@@ -32,19 +36,35 @@ function splitItemId(itemId: string): { type: string; rawId: string } {
   return { type: itemId.slice(0, idx), rawId: itemId.slice(idx + 1) };
 }
 
+// userId is null for an anonymous (signed-out) caller — every function here
+// takes it explicitly rather than reaching for a session itself, so this
+// stays a plain data-access module with no framework/auth dependency of its
+// own. null routes to the exact global-table queries this app always ran;
+// a real id scopes to that account instead. See lib/db.ts's schema comment
+// on dugout_items.user_id and the two unique indexes (composite for owned
+// rows, partial WHERE user_id IS NULL for anonymous ones) this all depends on.
+
 // Resolves every stored id to a live MediaItem the same way /api/followed
 // does (details() checks catalog_items first, then upcoming_items) — a
 // title can sit in Dugout before it's even released. A row whose title no
 // longer resolves (extremely unlikely — nothing here ever deletes catalog/
 // upcoming rows) is silently dropped rather than surfacing a broken card.
-export async function getDugout(type: DugoutType): Promise<DugoutGroups> {
+export async function getDugout(type: DugoutType, userId: number | null): Promise<DugoutGroups> {
   await ensureSchema();
   const sql = db();
-  const rows = (await sql`
-    SELECT item_id, type, status FROM dugout_items
-    WHERE type = ${type}
-    ORDER BY added_at DESC
-  `) as unknown as DugoutRow[];
+  const rows = (
+    userId === null
+      ? await sql`
+          SELECT item_id, type, status FROM dugout_items
+          WHERE type = ${type} AND user_id IS NULL
+          ORDER BY added_at DESC
+        `
+      : await sql`
+          SELECT item_id, type, status FROM dugout_items
+          WHERE type = ${type} AND user_id = ${userId}
+          ORDER BY added_at DESC
+        `
+  ) as unknown as DugoutRow[];
 
   const settled = await Promise.allSettled(
     rows.map(async (row) => {
@@ -65,7 +85,11 @@ export async function getDugout(type: DugoutType): Promise<DugoutGroups> {
 // Throws a plain Error with a user-facing message when onDeck is already at
 // its cap — this is an expected, actionable rejection (the API route
 // surfaces err.message as-is), not a real failure worth a generic 500.
-export async function setDugoutStatus(itemId: string, status: DugoutStatus): Promise<void> {
+export async function setDugoutStatus(
+  itemId: string,
+  status: DugoutStatus,
+  userId: number | null
+): Promise<void> {
   await ensureSchema();
   const sql = db();
   const { type } = splitItemId(itemId);
@@ -73,34 +97,56 @@ export async function setDugoutStatus(itemId: string, status: DugoutStatus): Pro
   if (status === "onDeck") {
     // Excludes the item itself so re-selecting "On Deck" on something
     // already there isn't rejected as if it were a 6th addition.
-    const [{ count }] = (await sql`
-      SELECT count(*)::int AS count FROM dugout_items
-      WHERE type = ${type} AND status = 'onDeck' AND item_id != ${itemId}
-    `) as unknown as { count: number }[];
-    if (count >= ON_DECK_LIMIT) {
+    const countRows = (
+      userId === null
+        ? await sql`
+            SELECT count(*)::int AS count FROM dugout_items
+            WHERE type = ${type} AND status = 'onDeck' AND item_id != ${itemId} AND user_id IS NULL
+          `
+        : await sql`
+            SELECT count(*)::int AS count FROM dugout_items
+            WHERE type = ${type} AND status = 'onDeck' AND item_id != ${itemId} AND user_id = ${userId}
+          `
+    ) as unknown as { count: number }[];
+    if (countRows[0].count >= ON_DECK_LIMIT) {
       throw new Error("On Deck is full — remove something first.");
     }
   }
 
-  await sql`
-    INSERT INTO dugout_items (item_id, type, status)
-    VALUES (${itemId}, ${type}, ${status})
-    ON CONFLICT (item_id) DO UPDATE SET status = excluded.status
-  `;
+  if (userId === null) {
+    await sql`
+      INSERT INTO dugout_items (item_id, type, status)
+      VALUES (${itemId}, ${type}, ${status})
+      ON CONFLICT (item_id) WHERE user_id IS NULL DO UPDATE SET status = excluded.status
+    `;
+  } else {
+    await sql`
+      INSERT INTO dugout_items (item_id, type, status, user_id)
+      VALUES (${itemId}, ${type}, ${status}, ${userId})
+      ON CONFLICT (user_id, item_id) DO UPDATE SET status = excluded.status
+    `;
+  }
 }
 
-export async function removeDugoutItem(itemId: string): Promise<void> {
+export async function removeDugoutItem(itemId: string, userId: number | null): Promise<void> {
   await ensureSchema();
   const sql = db();
-  await sql`DELETE FROM dugout_items WHERE item_id = ${itemId}`;
+  if (userId === null) {
+    await sql`DELETE FROM dugout_items WHERE item_id = ${itemId} AND user_id IS NULL`;
+  } else {
+    await sql`DELETE FROM dugout_items WHERE item_id = ${itemId} AND user_id = ${userId}`;
+  }
 }
 
 // Used by DetailModal to show the item's current status (if any) without a
 // separate round trip per open — cheap single-row lookup by primary key.
-export async function getDugoutStatus(itemId: string): Promise<DugoutStatus | null> {
+export async function getDugoutStatus(itemId: string, userId: number | null): Promise<DugoutStatus | null> {
   await ensureSchema();
   const sql = db();
-  const rows = (await sql`SELECT status FROM dugout_items WHERE item_id = ${itemId}`) as unknown as
-    { status: DugoutStatus }[];
+  const rows = (
+    userId === null
+      ? await sql`SELECT status FROM dugout_items WHERE item_id = ${itemId} AND user_id IS NULL`
+      : await sql`SELECT status FROM dugout_items WHERE item_id = ${itemId} AND user_id = ${userId}`
+  ) as unknown as { status: DugoutStatus }[];
   return rows[0]?.status ?? null;
 }

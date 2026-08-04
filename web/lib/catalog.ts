@@ -3,6 +3,7 @@ import { db, ensureSchema } from "@/lib/db";
 import type { RankedItem } from "@/lib/sources/textMatch";
 import { excludeHiddenSQL, type ContentCategory } from "@/lib/contentFilters";
 import { toISODate } from "@/lib/dbDate";
+import { applyReleaseDateOverrides } from "@/lib/releaseDateOverrides";
 
 // Shared row shape for the bulk-populated catalog_items table (see
 // scripts/ingest-catalog.ts and lib/db.ts's ensureSchema). Distinct from
@@ -33,6 +34,13 @@ export interface CatalogRow {
   // lib/contentFilters.ts (e.g. "anime" = Animation genre + "ja"), never
   // shown in the UI.
   originalLanguage?: string;
+  // False ONLY when this row's movie-detail re-fetch (movieExtra, which also
+  // carries the release_dates date-correction — see lib/sources/tmdb.ts)
+  // failed outright this run. Defaults true for every row that never sets
+  // it (TV/game/manga/artist, and movies whose fetch succeeded) — see
+  // upsertCatalog for how this guards release_date against being overwritten
+  // by a bad/unverified value.
+  dateVerified?: boolean;
 }
 
 // ---------- Write path: shared by the manual ingest script and the daily cron ----------
@@ -44,14 +52,46 @@ export interface CatalogRow {
 // prune.
 const UPSERT_BATCH_SIZE = 200;
 
+// A show's real episode count only ever grows or holds steady — it never
+// legitimately shrinks. Used by the regression guard below, and by
+// lib/upcoming.ts's identical guard for unreleased-but-followed shows.
+export function tvEpisodeCount(metadata: Record<string, unknown> | null | undefined): number {
+  const seasons = (metadata?.seasons as { episodes?: unknown[] }[] | undefined) ?? [];
+  return seasons.reduce((sum, s) => sum + (s.episodes?.length ?? 0), 0);
+}
+
 export async function upsertCatalog(rows: CatalogRow[], onBatch?: (done: number, total: number) => void): Promise<void> {
   await ensureSchema();
   const sql = db();
   for (let i = 0; i < rows.length; i += UPSERT_BATCH_SIZE) {
     const batch = rows.slice(i, i + UPSERT_BATCH_SIZE);
     if (batch.length === 0) continue;
+
+    // Regression guard for TV season/episode data — the per-season TMDB
+    // fetch (lib/sources/tmdb.ts's tvExtra) has no equivalent to movies'
+    // date_verified: a request can come back 200 OK with a genuinely empty
+    // episode list due to a transient TMDB hiccup, which withRetries can't
+    // catch (it only retries actual failures). Verified live: "THE GHOST
+    // IN THE SHELL"'s Season 1 — 10 real, currently-airing episodes — came
+    // back as 0 on one run and silently overwrote the good data. If this
+    // run's episode count for a show is LOWER than what's already stored,
+    // keep the old metadata instead of the fresh (incomplete) one.
+    const tvIds = batch.filter((r) => r.type === "tvShow").map((r) => r.id);
+    const existingMetadata = new Map<string, Record<string, unknown>>();
+    if (tvIds.length > 0) {
+      const existing = (await sql`
+        SELECT id, metadata FROM catalog_items WHERE id = ANY(${tvIds})
+      `) as unknown as { id: string; metadata: Record<string, unknown> }[];
+      for (const row of existing) existingMetadata.set(row.id, row.metadata);
+    }
+    const metadataFor = (r: CatalogRow): Record<string, unknown> => {
+      const old = r.type === "tvShow" ? existingMetadata.get(r.id) : undefined;
+      if (!old) return r.metadata ?? {};
+      return tvEpisodeCount(r.metadata) < tvEpisodeCount(old) ? old : r.metadata ?? {};
+    };
+
     await sql`
-      INSERT INTO catalog_items (id, type, title, overview, poster_url, backdrop_url, release_date, popularity_score, genres, external_links, metadata, tags, original_language)
+      INSERT INTO catalog_items (id, type, title, overview, poster_url, backdrop_url, release_date, popularity_score, genres, external_links, metadata, tags, original_language, date_verified)
       SELECT * FROM UNNEST(
         ${batch.map((r) => r.id)}::text[],
         ${batch.map((r) => r.type)}::text[],
@@ -63,9 +103,10 @@ export async function upsertCatalog(rows: CatalogRow[], onBatch?: (done: number,
         ${batch.map((r) => r.popularityScore)}::int[],
         ${batch.map((r) => JSON.stringify(r.genres))}::jsonb[],
         ${batch.map((r) => JSON.stringify(r.externalLinks ?? []))}::jsonb[],
-        ${batch.map((r) => JSON.stringify(r.metadata ?? {}))}::jsonb[],
+        ${batch.map((r) => JSON.stringify(metadataFor(r)))}::jsonb[],
         ${batch.map((r) => JSON.stringify(r.tags ?? []))}::jsonb[],
-        ${batch.map((r) => r.originalLanguage ?? null)}::text[]
+        ${batch.map((r) => r.originalLanguage ?? null)}::text[],
+        ${batch.map((r) => r.dateVerified ?? true)}::boolean[]
       )
       ON CONFLICT (id) DO UPDATE SET
         title = excluded.title,
@@ -74,17 +115,23 @@ export async function upsertCatalog(rows: CatalogRow[], onBatch?: (done: number,
         -- COALESCE: a refresh that didn't carry a backdrop (older write path,
         -- source omitted it this run) must not wipe one captured earlier.
         backdrop_url = COALESCE(excluded.backdrop_url, catalog_items.backdrop_url),
-        release_date = excluded.release_date,
+        -- Same regression guard as upsertUpcoming: an unverified row (this
+        -- run's movieExtra/release_dates fetch failed outright) keeps
+        -- whatever release_date was already stored instead of overwriting it
+        -- with this run's raw, unconfirmed one.
+        release_date = CASE WHEN excluded.date_verified THEN excluded.release_date ELSE catalog_items.release_date END,
         popularity_score = excluded.popularity_score,
         genres = excluded.genres,
         external_links = excluded.external_links,
         metadata = excluded.metadata,
         tags = excluded.tags,
         original_language = excluded.original_language,
+        date_verified = excluded.date_verified,
         updated_at = now()
     `;
     onBatch?.(Math.min(i + UPSERT_BATCH_SIZE, rows.length), rows.length);
   }
+  await applyReleaseDateOverrides();
 }
 
 // ---------- Read path: the app's ONLY source of search/discover/details data ----------

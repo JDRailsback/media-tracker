@@ -38,3 +38,14 @@ export function addFollow(item: MediaItem): void {
 export function removeFollow(id: string): void {
   save(getFollowed().filter((i) => i.id !== id));
 }
+
+// Overwrites the local list wholesale with an account's server-side follows
+// (see /api/followed/mine) — called once on sign-in. The account becomes
+// the source of truth at that point, so this replaces rather than merges;
+// anonymous follows made in this same browser before signing in are not
+// carried over (the one-time legacy-data claim already covers the actual
+// case that matters: this app's original single-user data becoming the
+// first account's data).
+export function replaceFollowed(items: FollowedItem[]): void {
+  save(items);
+}

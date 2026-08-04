@@ -28,12 +28,14 @@ export default function DetailModal({
   // device — there's no subscription for a mute to act on).
   const [muted, setMuted] = useState<boolean | null>(null);
 
-  // Dugout ("what to watch next") is scoped to movie/tvShow only — games,
-  // manga, artists, and franchises have no such queue. Self-contained here
-  // (fetch + write directly), same pattern as the mute control above,
-  // rather than threading state through app/page.tsx — no other part of the
-  // app needs to know an item's Dugout status except this modal.
-  const dugoutEligible = item.type === "movie" || item.type === "tvShow";
+  // Dugout ("what to watch/play/listen to next") is scoped to
+  // movie/tvShow/game/artist — manga and franchises have no such queue.
+  // Self-contained here (fetch + write directly), same pattern as the mute
+  // control above, rather than threading state through app/page.tsx — no
+  // other part of the app needs to know an item's Dugout status except
+  // this modal.
+  const dugoutEligible =
+    item.type === "movie" || item.type === "tvShow" || item.type === "game" || item.type === "artist";
   const [dugoutStatus, setDugoutStatusState] = useState<DugoutStatus | null>(null);
   const [dugoutBusy, setDugoutBusy] = useState(false);
   const [dugoutError, setDugoutError] = useState<string | null>(null);
@@ -231,9 +233,9 @@ export default function DetailModal({
                   Dugout
                 </h2>
                 <div className="flex flex-wrap gap-2">
-                  {full.type === "tvShow" && (
+                  {(full.type === "tvShow" || full.type === "game") && (
                     <DugoutPill
-                      label="Currently watching"
+                      label={full.type === "tvShow" ? "Currently watching" : "Currently playing"}
                       active={dugoutStatus === "currentlyWatching"}
                       disabled={dugoutBusy}
                       onClick={() => handleDugoutClick("currentlyWatching")}
@@ -351,7 +353,10 @@ export default function DetailModal({
   );
 }
 
-function DugoutPill({
+// Exported so app/artist/[id]/page.tsx (which doesn't use DetailModal at
+// all — see handleSelect in app/page.tsx) can render the same pills for
+// its own, separately-wired Dugout controls.
+export function DugoutPill({
   label,
   active,
   disabled,

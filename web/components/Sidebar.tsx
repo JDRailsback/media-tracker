@@ -1,10 +1,16 @@
 "use client";
 
-import { Home, Compass, Bookmark, CalendarDays, ListChecks, Bell, Settings } from "lucide-react";
+import Link from "next/link";
+import { useSession, signOut } from "next-auth/react";
+import { Home, Compass, Bookmark, CalendarDays, ListChecks, Bell, Settings, User, LogOut } from "lucide-react";
 
 export type View = "feed" | "discover" | "following" | "calendar" | "dugout" | "notifications" | "settings";
 
-const ITEMS: { id: View; label: string; icon: typeof Home }[] = [
+// Exported so MobileNav can use the exact same list instead of maintaining
+// its own copy — the two used to be hand-kept in sync by convention only
+// (same items/order/icons duplicated in both files), which is exactly the
+// kind of thing that silently drifts the moment one gets edited alone.
+export const NAV_ITEMS: { id: View; label: string; icon: typeof Home }[] = [
   { id: "feed", label: "Home", icon: Home },
   { id: "discover", label: "Discover", icon: Compass },
   { id: "following", label: "Following", icon: Bookmark },
@@ -28,6 +34,8 @@ export default function Sidebar({
   // the Notifications item; hidden at zero.
   unreadCount?: number;
 }) {
+  const { data: session, status } = useSession();
+
   return (
     <aside className="fixed inset-y-0 left-0 z-20 hidden w-64 flex-col border-r border-hairline/70 px-4 py-5 md:flex">
       <div className="px-3 pb-5 text-[42px] font-extrabold uppercase tracking-[0.14em] text-ink">
@@ -35,7 +43,7 @@ export default function Sidebar({
       </div>
 
       <nav className="flex flex-col gap-0.5">
-        {ITEMS.map(({ id, label, icon: Icon }) => {
+        {NAV_ITEMS.map(({ id, label, icon: Icon }) => {
           const isActive = active === id;
           return (
             <button
@@ -58,6 +66,34 @@ export default function Sidebar({
           );
         })}
       </nav>
+
+      {/* Pinned to the bottom, visible on every view — signing in
+          shouldn't be something you have to go dig for in Settings. Bigger
+          than the nav icons/labels above (this is an anchor, not another
+          tab) and doesn't navigate anywhere on click — sign-out lives
+          right here instead. Changing the username itself is in Settings. */}
+      {status !== "loading" && (
+        <div className="mt-auto border-t border-hairline/70 px-3 pt-4">
+          {session ? (
+            <div className="flex items-center gap-3 py-1">
+              <User size={20} strokeWidth={1.9} className="shrink-0 text-subtle" />
+              <span className="flex-1 truncate text-[15px] text-ink">{session.user?.username}</span>
+              <button
+                onClick={() => signOut({ callbackUrl: "/" })}
+                aria-label="Sign out"
+                className="shrink-0 text-subtle transition-colors hover:text-ink"
+              >
+                <LogOut size={17} strokeWidth={1.9} />
+              </button>
+            </div>
+          ) : (
+            <Link href="/signin" className="flex items-center gap-3 py-1 text-[15px] text-subtle hover:text-ink">
+              <User size={20} strokeWidth={1.9} />
+              Sign in
+            </Link>
+          )}
+        </div>
+      )}
     </aside>
   );
 }

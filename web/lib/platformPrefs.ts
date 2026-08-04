@@ -2,28 +2,40 @@
 // on the detail card's "Available on" section. Stored locally — this is a
 // display preference, not something that needs to live on a server.
 
+// Kept to EXACTLY the provider strings the app actually ever produces (see
+// lib/sources/tmdb.ts's PROVIDER_SEARCH_RULES, lib/sources/igdb.ts's
+// STORE_DOMAINS, lib/sources/artist.ts's artistPlatformLinks) — a picker
+// full of platforms that can never match a real "Available on" link isn't
+// a preference, it's a decoy. Verified live: the old list had "Disney
+// Plus"/"Paramount Plus"/"Amazon Prime Video" entries that silently never
+// matched the real "Disney+"/"Paramount+"/"Amazon Video" strings
+// (isPreferredProvider's substring check). This list should stay in sync
+// with PROVIDER_SEARCH_RULES — adding a service there without adding it
+// here just means it'll show up in "Available on" but can never be marked
+// preferred, and vice versa a name added only here can never match anything.
+// No Manga group — manga is hidden site-wide (see lib/contentFilters.ts).
 export const KNOWN_PLATFORMS: { group: string; names: string[] }[] = [
   {
     group: "Streaming",
     names: [
       "Netflix",
-      "Disney Plus",
+      "Disney+",
       "Hulu",
       "Max",
-      "Amazon Prime Video",
-      "Apple TV",
+      "Amazon Video",
+      "Apple TV+",
       "Crunchyroll",
       "Peacock",
-      "Paramount Plus",
+      "Paramount+",
       "Starz",
       "Showtime",
-      "MGM Plus",
-      "AMC Plus",
+      "MGM+",
+      "AMC+",
+      "Discovery+",
+      "ESPN+",
       "Tubi",
       "Pluto TV",
       "The Roku Channel",
-      "Freevee",
-      "Vudu",
       "Fandango At Home",
       "YouTube",
       "Google Play Movies",
@@ -31,8 +43,6 @@ export const KNOWN_PLATFORMS: { group: string; names: string[] }[] = [
       "Shudder",
       "BritBox",
       "Acorn TV",
-      "Discovery Plus",
-      "ESPN Plus",
       "fuboTV",
       "Sling TV",
       "Philo",
@@ -40,40 +50,15 @@ export const KNOWN_PLATFORMS: { group: string; names: string[] }[] = [
       "Kanopy",
       "Hoopla",
       "HIDIVE",
-      "VRV",
     ],
   },
   {
     group: "Game stores",
-    names: [
-      "Steam",
-      "Epic Games Store",
-      "PlayStation Store",
-      "Xbox",
-      "Nintendo eShop",
-      "GOG",
-      "itch.io",
-      "Humble Bundle",
-      "Battle.net",
-      "Ubisoft Connect",
-      "EA App",
-      "Amazon Luna",
-      "Apple Arcade",
-      "Google Play Games",
-    ],
+    names: ["Steam", "Epic Games Store", "PlayStation Store", "Xbox", "Nintendo eShop", "GOG"],
   },
   {
-    group: "Manga",
-    names: [
-      "Official (English)",
-      "BookWalker",
-      "Amazon",
-      "Manga Plus",
-      "VIZ",
-      "ComiXology",
-      "Google Play Books",
-      "Kindle",
-    ],
+    group: "Music",
+    names: ["Spotify", "Apple Music", "YouTube Music", "Deezer"],
   },
 ];
 

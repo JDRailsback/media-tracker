@@ -42,6 +42,44 @@ export function ensureSchema(): Promise<void> {
 function buildSchema(): Promise<void> {
   return (async () => {
       const sql = db();
+      // Accounts — the app has no concept of "user" anywhere else in this
+      // schema (followed_items/dugout_items were single global lists,
+      // implicitly one person). This table exists purely so those tables
+      // below can gain a user_id: see the ALTER statements near the end of
+      // this function, and lib/claimLegacyData.ts for how the one person
+      // who's been using this app all along keeps their existing
+      // follows/queue the moment they create the first account.
+      // password_hash is NULL for an account that only ever signed in with
+      // Google. calendar_token is a capability token for the ICS feed (see
+      // app/api/calendar/feed.ics) — generated in application code
+      // (crypto.randomUUID()), not a DB default, so it doesn't depend on any
+      // Postgres extension being enabled.
+      await sql`CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT,
+        name TEXT,
+        image TEXT,
+        calendar_token TEXT UNIQUE NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`;
+      // Nullable — added after the first real account already existed, so
+      // there was no clean backfill value for it. Display code falls back
+      // to an email-derived name when this is null (see auth.ts's session
+      // callback) rather than forcing a migration prompt.
+      await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT`;
+      // Usernames keep whatever casing was chosen (for display) but must be
+      // unique case-insensitively — a bare UNIQUE on the column would let
+      // "Foo" and "foo" both exist, which is the exact confusing-duplicate
+      // problem this is meant to prevent (see lib/username.ts).
+      await sql`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_username_key`;
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx ON users (LOWER(username))`;
+      // Gates the collection editor (PUT/DELETE /api/collection/[slug]) —
+      // found live wide open with no auth check at all: any visitor could
+      // edit or delete any curated collection, including the 24 IP ones.
+      // No signup flow sets this; it's granted by hand (see the account's
+      // own row) to whoever actually maintains the catalog.
+      await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false`;
       await sql`CREATE TABLE IF NOT EXISTS followed_items (
         id SERIAL PRIMARY KEY,
         item_id TEXT UNIQUE NOT NULL,
@@ -159,6 +197,34 @@ function buildSchema(): Promise<void> {
       // scripts/rebuild-collections.ts), not shown in the UI the way genres
       // are. Existing rows get this backfilled by re-running `npm run ingest`.
       await sql`ALTER TABLE catalog_items ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'`;
+      // Same write-time regression guard as upcoming_items.date_verified
+      // (see that column's comment) — extended here because the identical
+      // bug was found live on the CATALOG side too: a movie's raw TMDB
+      // release_date can be wrong (see lib/sources/tmdb.ts's
+      // usTheatricalDate), and any movie that "graduates" from upcoming_items
+      // into catalog_items (discoverTMDBRecentMovies, once it's actually
+      // released) was going through movieExtra, which never fetched
+      // release_dates or applied this correction AT ALL until now — so a
+      // graduated movie could carry the wrong date with no guard whatsoever,
+      // not just an occasional flaky-fetch regression.
+      await sql`ALTER TABLE catalog_items ADD COLUMN IF NOT EXISTS date_verified BOOLEAN NOT NULL DEFAULT true`;
+      // date_verified only guards against a FAILED fetch overwriting a good
+      // date — it can't catch a fetch that SUCCEEDS but returns incomplete
+      // data, which TMDB's release_dates does routinely right around a
+      // movie's actual release (verified live: "Spider-Man: Brand New Day"
+      // reverted from the correct 2026-07-31 back to 2026-07-28 because that
+      // day's successful fetch had no US theatrical (type 2/3) entry yet,
+      // only a premiere listing, so the correction had nothing to override
+      // with and the raw/unreliable date flowed through as "verified"). This
+      // table is the actual fix: a manually-pinned date that always wins,
+      // applied as the last step of every ingest (see lib/releaseDateOverrides.ts),
+      // regardless of what any future run's fetch returns.
+      await sql`CREATE TABLE IF NOT EXISTS release_date_overrides (
+        id TEXT PRIMARY KEY,
+        release_date DATE NOT NULL,
+        note TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`;
       // Precomputed collection membership — replaces resolving a
       // collection's contents via a live search on every page load (see
       // resolveCollection in lib/sources/collection.ts). Populated by
@@ -227,6 +293,20 @@ function buildSchema(): Promise<void> {
       // had this column from the start; upcoming_items simply never did, so
       // an upcoming title's detail card had nothing to link to.
       await sql`ALTER TABLE upcoming_items ADD COLUMN IF NOT EXISTS external_links JSONB NOT NULL DEFAULT '[]'`;
+      // Write-time-only guard against exactly the bug found live for
+      // "Spider-Man: Brand New Day": TMDB's top-level movie.release_date is
+      // unreliable, so lib/sources/tmdb.ts's filterOfficialOnly fetches
+      // /release_dates per movie and overlays the real US theatrical date —
+      // but a single flaky fetch (one movie out of thousands, one bad
+      // network blip) used to fall back to THIS run's raw, uncorrected date,
+      // silently reverting a previously-correct release_date the moment
+      // that one request failed. date_verified defaults true (existing
+      // rows, and every non-movie row, are never gated by it) and is only
+      // ever set false by upsertUpcoming when a movie's date-correction
+      // fetch itself failed this run — see the ON CONFLICT clause there,
+      // which then keeps the OLD stored release_date instead of overwriting
+      // it with an unverified one.
+      await sql`ALTER TABLE upcoming_items ADD COLUMN IF NOT EXISTS date_verified BOOLEAN NOT NULL DEFAULT true`;
       // Notification history — one GLOBAL row per logged event (mirrors
       // followed_items' one-row-per-item model, not per-subscriber), written
       // only by /api/poll, read by /api/notifications filtered to the ids
@@ -234,13 +314,19 @@ function buildSchema(): Promise<void> {
       // as /api/followed). title/subtitle/message are FROZEN at log time so
       // history reads correctly even after the item's data changes.
       //
-      // lead_days uses a -1 sentinel for 'change' rows instead of NULL on
-      // purpose: Postgres UNIQUE treats NULLs as always-distinct, which
-      // would silently defeat the idempotency constraint below (two
-      // identical 'change' rows could both insert). Don't "simplify" it
-      // back to nullable. Keying the constraint on release_date (not the
-      // log date) is also load-bearing: a rescheduled release gets a fresh
-      // reminder for its new date instead of staying suppressed.
+      // event_type is currently always 'reminder' — a former 'change' type
+      // (the release date being set or moved) was removed as noisy/
+      // repetitive (see app/api/poll's own comment); lead_days is what
+      // actually distinguishes the two live cases: 0 = release day
+      // (unconditional for every follow), >0 = an advance heads-up someone
+      // configured. lead_days is NOT NULL on purpose — Postgres UNIQUE
+      // treats NULLs as always-distinct, which would defeat the idempotency
+      // constraint below (duplicate rows could both insert). The DEFAULT -1
+      // is unreachable in practice (every insert sets lead_days explicitly)
+      // but harmless to leave rather than risk a migration for no behavior
+      // change. Keying the constraint on release_date (not the log date) is
+      // load-bearing: a rescheduled release gets a fresh reminder for its
+      // new date instead of staying suppressed.
       await sql`CREATE TABLE IF NOT EXISTS notification_history (
         id SERIAL PRIMARY KEY,
         followed_item_id INTEGER NOT NULL REFERENCES followed_items(id) ON DELETE CASCADE,
@@ -382,5 +468,47 @@ function buildSchema(): Promise<void> {
         added_at TIMESTAMPTZ NOT NULL DEFAULT now()
       )`;
       await sql`CREATE INDEX IF NOT EXISTS dugout_items_type_status_idx ON dugout_items (type, status)`;
+
+      // Account scoping — additive, nullable. An anonymous (signed-out)
+      // request never sets user_id, so every row written before accounts
+      // existed (and every row written by someone who never signs in) just
+      // keeps behaving exactly as it always has; see each route's own
+      // session-or-fall-through logic (app/api/follow, /unfollow, /dugout,
+      // /mute, /subscribe, /prefs).
+      await sql`ALTER TABLE followed_items ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id)`;
+      // /api/unfollow has never deleted the row (notification_history's FK
+      // means deleting it would erase that item's history) — "active" is
+      // the account path's own clean "is this currently followed" signal,
+      // independent of that legacy history-preserving quirk.
+      await sql`ALTER TABLE followed_items ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT true`;
+      // The old bare UNIQUE(item_id) would stop a second account from ever
+      // following something the first account already follows — needs to
+      // become "unique per account" instead of "unique globally." Split into
+      // two indexes rather than one: a plain composite (user_id, item_id)
+      // for signed-in rows, PLUS a partial one scoped to user_id IS NULL
+      // that exactly reproduces the old constraint for anonymous rows — the
+      // existing anonymous-path upserts (app/api/follow, lib/dugout.ts) use
+      // a bare `ON CONFLICT (item_id)`, which only works when a unique
+      // index with precisely that key still exists; NULL isn't equal to
+      // NULL for uniqueness purposes, so the composite index alone would
+      // silently let duplicate anonymous rows through instead.
+      await sql`ALTER TABLE followed_items DROP CONSTRAINT IF EXISTS followed_items_item_id_key`;
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS followed_items_user_item_idx ON followed_items (user_id, item_id)`;
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS followed_items_anon_item_idx ON followed_items (item_id) WHERE user_id IS NULL`;
+      // Never existed before accounts — nothing needed a per-item follow
+      // timestamp until /api/followed/mine had to reconstruct localStorage's
+      // FollowedItem.followedAt for cross-browser hydration.
+      await sql`ALTER TABLE followed_items ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now()`;
+
+      await sql`ALTER TABLE dugout_items ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id)`;
+      await sql`ALTER TABLE dugout_items DROP CONSTRAINT IF EXISTS dugout_items_item_id_key`;
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS dugout_items_user_item_idx ON dugout_items (user_id, item_id)`;
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS dugout_items_anon_item_idx ON dugout_items (item_id) WHERE user_id IS NULL`;
+
+      // Ties a device's push registration to an account once it's signed
+      // in, so every device signed into the account is eligible for
+      // notifications about everything the account follows — see
+      // app/api/follow and /subscribe.
+      await sql`ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id)`;
   })();
 }

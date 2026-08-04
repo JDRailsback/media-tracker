@@ -21,11 +21,13 @@ export interface CollectionFormData {
   excludeIds: string[];
 }
 
+// No manga entry — the collection page never renders a manga section
+// anymore (see app/collection/[slug]/page.tsx's SECTION_TITLE), so a manga
+// query tab here would just be dead input nobody would ever see the effect of.
 const PART_TYPES: { key: Exclude<MediaType, "franchise">; label: string }[] = [
   { key: "movie", label: "Movies" },
   { key: "tvShow", label: "TV" },
   { key: "game", label: "Games" },
-  { key: "manga", label: "Manga" },
 ];
 
 function rgbToHex(triplet: string): string {

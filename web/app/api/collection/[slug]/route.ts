@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { auth } from "@/auth";
 import { resolveCollection } from "@/lib/sources/collection";
 import {
   deleteCollectionOverride,
@@ -40,7 +41,6 @@ export async function GET(
     includeOverrides: resolved.def.includeOverrides,
     excludeIds: resolved.def.excludeIds,
     isCustom: resolved.def.isCustom,
-    collectionType: resolved.def.collectionType ?? null,
     parts: resolved.parts,
     mostPopular: resolved.mostPopular,
     nextRelease: resolved.nextRelease,
@@ -50,8 +50,14 @@ export async function GET(
 
 // PUT /api/collection/star-wars — save an edit. Works the same whether the
 // slug is one of the curated defaults (creates/updates its override row) or
-// already a custom collection (updates it in place).
+// already a custom collection (updates it in place). Admin-only: this had
+// NO auth check at all until now — any visitor could edit or delete any
+// collection, curated or custom.
 export async function PUT(request: Request, { params }: { params: { slug: string } }) {
+  const session = await auth();
+  if (!session?.user?.isAdmin) {
+    return NextResponse.json({ error: "Not authorized" }, { status: 403 });
+  }
   const input = validateCollectionInput(await request.json().catch(() => null));
   if (!input) {
     return NextResponse.json({ error: "Invalid collection data" }, { status: 400 });
@@ -67,7 +73,12 @@ export async function PUT(request: Request, { params }: { params: { slug: string
 
 // DELETE /api/collection/star-wars — for a curated collection, reverts to the
 // static default; for a custom one (no default to revert to), deletes it.
+// Admin-only — see PUT above.
 export async function DELETE(_request: Request, { params }: { params: { slug: string } }) {
+  const session = await auth();
+  if (!session?.user?.isAdmin) {
+    return NextResponse.json({ error: "Not authorized" }, { status: 403 });
+  }
   await deleteCollectionOverride(params.slug);
   return NextResponse.json({ ok: true, revertedToDefault: isCuratedSlug(params.slug) });
 }

@@ -17,13 +17,16 @@
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.9.4",
+    "bcryptjs": "^3.0.3",
     "lucide-react": "^0.400.0",
     "next": "^14.2.5",
+    "next-auth": "^5.0.0-beta.32",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "web-push": "^3.6.7"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
     "@types/node": "^20.14.0",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",

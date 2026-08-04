@@ -13,12 +13,12 @@ export const LEAD_TIME_OPTIONS: { value: number; label: string }[] = [
 ];
 
 // Every followable type (labels match components/TypeTag.tsx). "franchise"
-// is included — collections are followable via their own page.
+// is included — collections are followable via their own page. Manga is
+// deliberately absent — hidden site-wide (see lib/contentFilters.ts).
 export const MUTABLE_TYPES: { type: MediaType; label: string }[] = [
   { type: "movie", label: "Movies" },
   { type: "tvShow", label: "TV" },
   { type: "game", label: "Games" },
-  { type: "manga", label: "Manga" },
   { type: "artist", label: "Music" },
   { type: "franchise", label: "Collections" },
 ];

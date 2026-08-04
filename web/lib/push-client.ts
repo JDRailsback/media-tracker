@@ -46,14 +46,34 @@ export async function currentSubscription(): Promise<PushSubscription | null> {
   return (await reg?.pushManager.getSubscription()) ?? null;
 }
 
-// Sync a follow/unfollow to the server. Follows ALWAYS post, subscription or
-// not — the server needs the followed_items row to log notification history
-// even for push-less devices (see /api/follow). Unfollow without a
-// subscription stays a no-op: there's no subscription link to remove, and
-// the global followed_items row may still serve other devices.
+// The missing counterpart to enablePush() — previously there was no way to
+// turn push off from within the app at all, short of revoking the
+// browser's notification permission manually. Unsubscribes locally first
+// (so the browser stops holding the subscription regardless of whether the
+// server call succeeds) then tells the server to forget this device.
+export async function disablePush(): Promise<void> {
+  const sub = await currentSubscription();
+  if (!sub) return;
+  const endpoint = sub.endpoint;
+  await sub.unsubscribe();
+  await fetch("/api/subscribe", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ endpoint }),
+  }).catch(() => {});
+}
+
+// Sync a follow/unfollow to the server — ALWAYS posts now, subscription or
+// not. Follows always needed to (the server needs the followed_items row to
+// log notification history even for push-less devices — see /api/follow).
+// Unfollow used to skip the call entirely without a subscription (nothing
+// to remove in the old global-table model), but a signed-in account's
+// active flag needs that same request to ever flip to false — skipping it
+// left an unfollow-while-signed-in-without-push invisible to every other
+// device on the account. The subscription is still sent along when one
+// exists; /api/unfollow just no longer requires it.
 export async function syncFollow(itemID: string, following: boolean): Promise<void> {
   const sub = await currentSubscription();
-  if (!following && !sub) return;
   await fetch(following ? "/api/follow" : "/api/unfollow", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

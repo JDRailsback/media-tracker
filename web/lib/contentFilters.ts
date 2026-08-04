@@ -13,11 +13,13 @@
 //   asian-drama  = TV, original_language ko/zh/ja/th, NOT genre "Animation"
 //                  (the NOT keeps anime and Asian drama mutually exclusive)
 //   indie-games  = game, genre "Indie"
-//   manga        = type = manga (already a first-class type, no heuristic needed)
-export type ContentCategory = "manga" | "anime" | "asian-drama" | "indie-games" | "music";
+// No manga category — manga is already excluded from Discover/Search
+// site-wide at the source (see lib/sources/index.ts's search() and
+// lib/discoverSnapshot.ts), so a "hide manga" toggle would be hiding
+// something that never appears here in the first place.
+export type ContentCategory = "anime" | "asian-drama" | "indie-games" | "music";
 
 export const CONTENT_CATEGORIES: { key: ContentCategory; label: string; description: string }[] = [
-  { key: "manga", label: "Manga", description: "Hide all manga." },
   { key: "anime", label: "Anime", description: "Hide Japanese-language animated movies and shows." },
   { key: "asian-drama", label: "Asian dramas", description: "Hide Korean, Japanese, Chinese, and Thai-language TV dramas." },
   { key: "indie-games", label: "Indie games", description: "Hide games tagged Indie." },
@@ -34,7 +36,6 @@ const KNOWN_CATEGORIES = new Set<string>(CONTENT_CATEGORIES.map((c) => c.key));
 // (see parseHiddenCategories) — so this is safe against injection despite
 // not being parameterized.
 const CATEGORY_SQL: Record<ContentCategory, string> = {
-  manga: `type = 'manga'`,
   anime: `type IN ('movie','tvShow') AND original_language = 'ja' AND genres @> '["Animation"]'::jsonb`,
   "asian-drama": `type = 'tvShow' AND original_language = ANY(ARRAY['ko','zh','ja','th']) AND NOT (genres @> '["Animation"]'::jsonb)`,
   "indie-games": `type = 'game' AND genres @> '["Indie"]'::jsonb`,

@@ -7,10 +7,13 @@ self.addEventListener("push", (event) => {
   } catch (e) {
     data = {};
   }
-  const title = data.title || "Media Tracker";
+  const title = data.title || "Trackr";
   const options = {
     body: data.body || "",
-    icon: "/icon-192.png",
+    // The followed title's own poster (see app/api/poll/route.ts) — falls
+    // back to the app icon only when a title has none (e.g. no artwork on
+    // file yet).
+    icon: data.icon || "/icon-192.png",
     data: { url: data.url || "/" },
   };
   event.waitUntil(self.registration.showNotification(title, options));

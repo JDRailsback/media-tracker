@@ -7,6 +7,7 @@ import { ArrowLeft, Check, Plus, Pencil } from "lucide-react";
 import type { MediaItem } from "@/lib/types";
 import type { CollectionQueries } from "@/lib/collections";
 import type { IncludedPart } from "@/lib/sources/collection";
+import { useSession } from "next-auth/react";
 import { addFollow, removeFollow, isFollowed as checkFollowed } from "@/lib/library";
 import { syncFollow } from "@/lib/push-client";
 import DetailModal from "@/components/DetailModal";
@@ -27,18 +28,20 @@ interface CollectionPayload {
   includeOverrides: IncludedPart[];
   excludeIds: string[];
   isCustom: boolean;
-  collectionType: "thematic" | null;
   parts: { movie: MediaItem[]; tvShow: MediaItem[]; game: MediaItem[]; manga: MediaItem[] };
   mostPopular: MediaItem[];
   nextRelease: { date: string; title: string; posterURL?: string } | null;
   resolvedBannerURL?: string;
 }
 
-const SECTION_TITLE: Record<keyof CollectionPayload["parts"], string> = {
+// Deliberately missing a "manga" entry even though CollectionPayload.parts
+// still has one (the API always returns it, possibly empty) — sections
+// below is built from THIS object's keys, not parts', so manga can never
+// render here regardless of what the API sends. Manga is hidden site-wide.
+const SECTION_TITLE: Record<Exclude<keyof CollectionPayload["parts"], "manga">, string> = {
   movie: "Movies",
   tvShow: "TV",
   game: "Games",
-  manga: "Manga",
 };
 
 function formatDate(iso: string) {
@@ -53,6 +56,8 @@ export default function CollectionPage({ params }: { params: { slug: string } })
   const { slug } = params;
   const router = useRouter();
   const collectionID = `franchise:${slug}`;
+  const { data: session } = useSession();
+  const isAdmin = !!session?.user?.isAdmin;
 
   const [data, setData] = useState<CollectionPayload | null>(null);
   const [loading, setLoading] = useState(true);
@@ -113,7 +118,7 @@ export default function CollectionPage({ params }: { params: { slug: string } })
     setFollowVersion((v) => v + 1);
   }
 
-  const sections = (Object.keys(SECTION_TITLE) as (keyof CollectionPayload["parts"])[]).filter(
+  const sections = (Object.keys(SECTION_TITLE) as Exclude<keyof CollectionPayload["parts"], "manga">[]).filter(
     (key) => data.parts[key].length > 0
   );
 
@@ -133,13 +138,15 @@ export default function CollectionPage({ params }: { params: { slug: string } })
         <ArrowLeft size={16} />
         Back
       </Link>
-      <button
-        onClick={() => setEditing(true)}
-        className="inline-flex items-center gap-2 rounded-full px-5 py-2.5 text-[15px] font-medium text-subtle transition-colors hover:bg-surface hover:text-ink"
-      >
-        <Pencil size={15} />
-        Edit
-      </button>
+      {isAdmin && (
+        <button
+          onClick={() => setEditing(true)}
+          className="inline-flex items-center gap-2 rounded-full px-5 py-2.5 text-[15px] font-medium text-subtle transition-colors hover:bg-surface hover:text-ink"
+        >
+          <Pencil size={15} />
+          Edit
+        </button>
+      )}
     </div>
   );
 
@@ -168,13 +175,15 @@ export default function CollectionPage({ params }: { params: { slug: string } })
         <ArrowLeft size={14} />
         Back
       </Link>
-      <button
-        onClick={() => setEditing(true)}
-        className="inline-flex items-center gap-1 rounded-full px-2.5 py-1.5 text-[13px] font-medium text-subtle transition-colors hover:bg-surface hover:text-ink"
-      >
-        <Pencil size={13} />
-        Edit
-      </button>
+      {isAdmin && (
+        <button
+          onClick={() => setEditing(true)}
+          className="inline-flex items-center gap-1 rounded-full px-2.5 py-1.5 text-[13px] font-medium text-subtle transition-colors hover:bg-surface hover:text-ink"
+        >
+          <Pencil size={13} />
+          Edit
+        </button>
+      )}
     </div>
   );
 

@@ -48,9 +48,6 @@ export interface EffectiveCollection {
   includeOverrides: IncludedPart[];
   excludeIds: string[];
   isCustom: boolean;
-  // Mirrors CollectionDef.collectionType — preserved from the static seed
-  // even when a DB override row exists (see getEffectiveCollection).
-  collectionType?: "thematic";
 }
 
 interface OverrideRow {
@@ -92,7 +89,6 @@ function defToEffective(def: CollectionDef): EffectiveCollection {
     queries: def.queries,
     movieCollectionId: def.movieCollectionId,
     featured: !!def.featured,
-    collectionType: def.collectionType,
     includeOverrides: [],
     excludeIds: [],
     isCustom: false,
@@ -162,14 +158,7 @@ async function loadAllOverrides(): Promise<OverrideRow[]> {
 
 export async function getEffectiveCollection(slug: string): Promise<EffectiveCollection | null> {
   const row = await loadOverrideRow(slug);
-  if (row) {
-    const effective = rowToEffective(row);
-    // collectionType is a static property of the seed data, not an editable
-    // field — preserve it from the static def even when a DB override exists.
-    const staticDef = getCollection(slug);
-    if (staticDef?.collectionType) effective.collectionType = staticDef.collectionType;
-    return effective;
-  }
+  if (row) return rowToEffective(row);
   const def = getCollection(slug);
   return def ? defToEffective(def) : null;
 }

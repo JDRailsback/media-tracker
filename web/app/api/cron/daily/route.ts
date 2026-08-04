@@ -6,6 +6,7 @@ import {
   discoverTMDBRecentTV,
   discoverTMDBTrendingMovies,
   discoverTMDBTrendingTV,
+  tvExtra,
 } from "@/lib/sources/tmdb";
 import { discoverIGDBUpcoming, discoverIGDBRecent, discoverIGDBTrending } from "@/lib/sources/igdb";
 // Manga ingestion paused — see the comment above the Promise.allSettled call
@@ -21,6 +22,7 @@ import type { TrendingRow } from "@/lib/trending";
 import { rebuildAllCollections } from "@/lib/collections-rebuild";
 import { refreshDiscoverSnapshot } from "@/lib/sources";
 import { refreshUpcomingCalendar } from "@/lib/upcomingCalendar";
+import { toISODate } from "@/lib/dbDate";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -113,6 +115,136 @@ async function refreshArtistDiscographies(): Promise<number> {
   return rows.length;
 }
 
+// Same "followed items always get refreshed" principle as artists above,
+// for a real gap TV shows didn't have at all: discoverTMDBRecentTV's
+// popularity/date-window admission (stage B) only revisits a show while
+// it's popular/recent enough to qualify — a followed show that's neither
+// (a lower-profile currently-airing series, or one whose air-date has
+// aged out of the ~30-45 day window) never gets touched again, so a
+// one-time bad fetch (or a show ingested before its episodes existed)
+// stays wrong forever. Verified live: "Witch Hat Atelier" — a real,
+// currently-followed, currently-airing show — sat at 0 fetched episodes
+// (TMDB has 13) because it simply never qualified for stage B's list.
+// Small, uncapped list in practice (a personal follow list, not the whole
+// catalog) — sequential for the same reason artists are: no shared rate
+// limit to parallelize around, and it's a handful of shows at most.
+async function refreshFollowedTVShows(): Promise<number> {
+  await ensureSchema();
+  const sql = db();
+  const rows = (await sql`
+    SELECT c.id, c.title, c.overview, c.poster_url, c.backdrop_url, c.release_date,
+           c.popularity_score, c.genres, c.original_language
+    FROM catalog_items c
+    JOIN followed_items f ON f.item_id = c.id
+    WHERE c.type = 'tvShow' AND f.active = true
+    GROUP BY c.id
+  `) as unknown as {
+    id: string;
+    title: string;
+    overview: string | null;
+    poster_url: string | null;
+    backdrop_url: string | null;
+    release_date: string | null;
+    popularity_score: number;
+    genres: string[];
+    original_language: string | null;
+  }[];
+
+  const catalogRows: CatalogRow[] = [];
+  for (const row of rows) {
+    const tmdbId = Number(row.id.split(":")[1]);
+    const extra = await tvExtra(tmdbId, row.title);
+    catalogRows.push({
+      id: row.id,
+      type: "tvShow",
+      title: row.title,
+      overview: row.overview ?? undefined,
+      posterURL: row.poster_url ?? undefined,
+      backdropURL: row.backdrop_url ?? undefined,
+      releaseDate: row.release_date ?? undefined,
+      popularityScore: row.popularity_score,
+      genres: row.genres ?? [],
+      externalLinks: extra.externalLinks,
+      metadata: {
+        status: extra.status,
+        numberOfSeasons: extra.numberOfSeasons,
+        numberOfEpisodes: extra.numberOfEpisodes,
+        seasons: extra.seasons,
+        nextEpisodeToAir: extra.nextEpisodeToAir,
+        imdbId: extra.imdbId,
+        networks: extra.networks,
+      },
+      tags: extra.tags,
+      originalLanguage: row.original_language ?? undefined,
+    });
+  }
+  await upsertCatalog(catalogRows);
+  return catalogRows.length;
+}
+
+// The unreleased counterpart of refreshFollowedTVShows above. upcoming_items
+// has no episode data at all by default (discoverTMDBUpcomingTV is
+// deliberately cheap — up to ~1000 shows, list-endpoint only, no per-item
+// detail fetch) — a followed-but-unreleased show only ever showed its
+// single premiere date, even when TMDB already has the full season
+// schedule (verified live: "Lanterns" and "Carrie," both fully scheduled on
+// TMDB, showed only their premiere). upsertUpcoming's own regression guard
+// (see there) protects this from being wiped by the regular stage A refresh.
+async function refreshFollowedUpcomingTVShows(): Promise<number> {
+  await ensureSchema();
+  const sql = db();
+  const rows = (await sql`
+    SELECT u.id, u.title, u.overview, u.poster_url, u.backdrop_url, u.release_date,
+           u.date_confirmed, u.popularity_score, u.genres, u.original_language
+    FROM upcoming_items u
+    JOIN followed_items f ON f.item_id = u.id
+    WHERE u.type = 'tvShow' AND f.active = true
+    GROUP BY u.id
+  `) as unknown as {
+    id: string;
+    title: string;
+    overview: string | null;
+    poster_url: string | null;
+    backdrop_url: string | null;
+    release_date: string | Date | null;
+    date_confirmed: boolean;
+    popularity_score: number;
+    genres: string[];
+    original_language: string | null;
+  }[];
+
+  const upcomingRows: UpcomingRow[] = [];
+  for (const row of rows) {
+    const tmdbId = Number(row.id.split(":")[1]);
+    const extra = await tvExtra(tmdbId, row.title);
+    upcomingRows.push({
+      id: row.id,
+      type: "tvShow",
+      title: row.title,
+      overview: row.overview ?? undefined,
+      posterURL: row.poster_url ?? undefined,
+      backdropURL: row.backdrop_url ?? undefined,
+      releaseDate: toISODate(row.release_date),
+      dateConfirmed: row.date_confirmed,
+      popularityScore: row.popularity_score,
+      genres: row.genres ?? [],
+      originalLanguage: row.original_language ?? undefined,
+      externalLinks: extra.externalLinks,
+      metadata: {
+        status: extra.status,
+        numberOfSeasons: extra.numberOfSeasons,
+        numberOfEpisodes: extra.numberOfEpisodes,
+        seasons: extra.seasons,
+        nextEpisodeToAir: extra.nextEpisodeToAir,
+        imdbId: extra.imdbId,
+        networks: extra.networks,
+      },
+    });
+  }
+  await upsertUpcoming(upcomingRows);
+  return upcomingRows.length;
+}
+
 function settled(r: PromiseSettledResult<number>): number | { error: string } {
   return r.status === "fulfilled" ? r.value : { error: String(r.reason) };
 }
@@ -137,7 +269,21 @@ export async function GET(request: Request) {
   // matching destructure/response entries), and re-add manga back into
   // Discover (see lib/sources/index.ts's discover(), lib/discoverSnapshot.ts's
   // DiscoverPayload).
-  const [upMovie, upTV, upGame, recMovie, recTV, recGame, trendMovie, trendTV, trendGame, trendArtist, artistsRefreshed] = (
+  const [
+    upMovie,
+    upTV,
+    upGame,
+    recMovie,
+    recTV,
+    recGame,
+    trendMovie,
+    trendTV,
+    trendGame,
+    trendArtist,
+    artistsRefreshed,
+    followedTVRefreshed,
+    followedUpcomingTVRefreshed,
+  ] = (
     await Promise.allSettled([
       refreshUpcoming("movie", discoverTMDBUpcomingMovies),
       refreshUpcoming("tvShow", discoverTMDBUpcomingTV),
@@ -150,6 +296,8 @@ export async function GET(request: Request) {
       refreshTrending("game", discoverIGDBTrending),
       refreshTrending("artist", discoverDeezerTrendingArtists),
       refreshArtistDiscographies(),
+      refreshFollowedTVShows(),
+      refreshFollowedUpcomingTVShows(),
     ])
   ).map(settled);
 
@@ -191,6 +339,8 @@ export async function GET(request: Request) {
     recent: { movie: recMovie, tvShow: recTV, game: recGame },
     trending: { movie: trendMovie, tvShow: trendTV, game: trendGame, artist: trendArtist },
     artistsRefreshed,
+    followedTVRefreshed,
+    followedUpcomingTVRefreshed,
     collections,
     upcomingCalendar,
     discoverSnapshot,

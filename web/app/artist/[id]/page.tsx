@@ -2,12 +2,15 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowLeft, Check, Plus, Play, Bell, BellOff } from "lucide-react";
+import { ArrowLeft, Check, Plus, Play, Star, Bell, BellOff } from "lucide-react";
 import type { MediaItem, ReleaseGroupInfo } from "@/lib/types";
 import { addFollow, removeFollow, isFollowed as checkFollowed } from "@/lib/library";
 import { fetchPrefs, setItemMuted, syncFollow } from "@/lib/push-client";
 import { parseReleaseDay } from "@/lib/feed";
+import { getPreferredPlatforms, isPreferredProvider } from "@/lib/platformPrefs";
 import CollectionRow from "@/components/CollectionRow";
+import { DugoutPill } from "@/components/DetailModal";
+import type { DugoutStatus } from "@/lib/dugout";
 
 // Dedicated artist profile page — the music counterpart of
 // /collection/[slug], replacing the generic DetailModal for artists
@@ -41,6 +44,19 @@ export default function ArtistPage({ params }: { params: { id: string } }) {
   // null = mute control hidden (not followed, or push never enabled on this
   // device — there's no subscription for a mute to act on).
   const [muted, setMuted] = useState<boolean | null>(null);
+  // Same self-contained fetch/write pattern as DetailModal's Dugout
+  // controls (see there) — no "currently listening" pill, unlike
+  // tvShow/game: there's no single thing being "currently" listened to
+  // the way there's a show/game in progress (see lib/dugout.ts).
+  const [dugoutStatus, setDugoutStatus] = useState<DugoutStatus | null>(null);
+  const [dugoutBusy, setDugoutBusy] = useState(false);
+  const [dugoutError, setDugoutError] = useState<string | null>(null);
+  // Was never wired in here at all — the external links below rendered
+  // identically regardless of Settings' Preferred Platforms picks, unlike
+  // DetailModal's own "Available on" section (see there for the same logic).
+  const [preferred, setPreferred] = useState<string[]>([]);
+
+  useEffect(() => setPreferred(getPreferredPlatforms()), []);
 
   useEffect(() => {
     setLoading(true);
@@ -63,6 +79,43 @@ export default function ArtistPage({ params }: { params: { id: string } }) {
     }
     fetchPrefs().then((p) => setMuted(p ? p.mutedItemIds.includes(artistID) : null));
   }, [artistID, followVersion]);
+
+  useEffect(() => {
+    fetch(`/api/dugout?itemID=${encodeURIComponent(artistID)}`)
+      .then((r) => (r.ok ? r.json() : { status: null }))
+      .then((d: { status: DugoutStatus | null }) => setDugoutStatus(d.status))
+      .catch(() => {});
+  }, [artistID]);
+
+  async function handleDugoutClick(status: DugoutStatus) {
+    const next = dugoutStatus === status ? null : status;
+    setDugoutError(null);
+    setDugoutBusy(true);
+    try {
+      if (next === null) {
+        await fetch("/api/dugout", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ itemID: artistID }),
+        });
+      } else {
+        const res = await fetch("/api/dugout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ itemID: artistID, status: next }),
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.error || "Something went wrong");
+        }
+      }
+      setDugoutStatus(next);
+    } catch (err) {
+      setDugoutError(err instanceof Error ? err.message : "Something went wrong");
+    } finally {
+      setDugoutBusy(false);
+    }
+  }
 
   if (notFound) {
     return (
@@ -177,18 +230,54 @@ export default function ArtistPage({ params }: { params: { id: string } }) {
               {muted ? <BellOff size={15} /> : <Bell size={15} />}
             </button>
           )}
-          {(item.externalLinks ?? []).map((l) => (
-            <a
-              key={l.url}
-              href={l.url}
-              target="_blank"
-              rel="noreferrer"
-              className="flex items-center gap-1.5 rounded-full bg-surface px-4 py-2 text-[13px] font-medium text-ink transition-colors hover:bg-hairline/60"
-            >
-              <Play size={12} className="fill-ink text-ink" />
-              {l.provider}
-            </a>
-          ))}
+          {[...(item.externalLinks ?? [])]
+            .sort((a, b) => {
+              const aPref = isPreferredProvider(a.provider, preferred);
+              const bPref = isPreferredProvider(b.provider, preferred);
+              return aPref === bPref ? 0 : aPref ? -1 : 1;
+            })
+            .map((l) => {
+              const isPreferred = isPreferredProvider(l.provider, preferred);
+              return (
+                <a
+                  key={l.url}
+                  href={l.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className={`flex items-center gap-1.5 rounded-full px-4 py-2 text-[13px] font-medium transition-all duration-200 hover:-translate-y-0.5 ${
+                    isPreferred
+                      ? "bg-accent/12 text-accent ring-1 ring-accent/40 hover:bg-accent/18"
+                      : "bg-surface text-ink hover:bg-hairline/60"
+                  }`}
+                >
+                  {isPreferred ? (
+                    <Star size={12} className="fill-accent text-accent" />
+                  ) : (
+                    <Play size={12} className="fill-ink text-ink" />
+                  )}
+                  {l.provider}
+                </a>
+              );
+            })}
+        </div>
+
+        <div className="mt-4">
+          <h2 className="mb-2 text-[12.5px] font-semibold uppercase tracking-wide text-subtle">Dugout</h2>
+          <div className="flex flex-wrap gap-2">
+            <DugoutPill
+              label="On Deck"
+              active={dugoutStatus === "onDeck"}
+              disabled={dugoutBusy}
+              onClick={() => handleDugoutClick("onDeck")}
+            />
+            <DugoutPill
+              label="Watchlist"
+              active={dugoutStatus === "watchlist"}
+              disabled={dugoutBusy}
+              onClick={() => handleDugoutClick("watchlist")}
+            />
+          </div>
+          {dugoutError && <p className="mt-2 text-[13px] text-red-500">{dugoutError}</p>}
         </div>
 
         {/* ── Next release, called out above the discography ── */}

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { db, ensureSchema } from "@/lib/db";
+import { auth } from "@/auth";
 
 // POST /api/prefs  { subscription, mutedTypes?, leadTimeDays? }
 // -> { mutedTypes, leadTimeDays, mutedItemIds }
@@ -7,7 +8,11 @@ import { db, ensureSchema } from "@/lib/db";
 // One route for both reading and updating this device's notification
 // preferences: with no update fields it just returns the current state.
 // Deliberately POST-only (no GET ?endpoint=...) — a push endpoint is a
-// capability URL, and query strings end up in server/proxy logs.
+// capability URL, and query strings end up in server/proxy logs. These
+// preferences stay per-DEVICE even with accounts (a phone and a laptop can
+// reasonably want different mute settings) — only the account link on
+// push_subscriptions itself is new here, via the same COALESCE pattern
+// every other push_subscriptions upsert uses (see /api/follow, /subscribe).
 export async function POST(request: Request) {
   const { subscription, mutedTypes, leadTimeDays } = await request.json();
   if (!subscription?.endpoint || !subscription?.keys) {
@@ -16,11 +21,16 @@ export async function POST(request: Request) {
 
   await ensureSchema();
   const sql = db();
+  const session = await auth();
+  const userId = session?.user?.id ? Number(session.user.id) : null;
 
   const subRows = await sql`
-    INSERT INTO push_subscriptions (endpoint, p256dh, auth)
-    VALUES (${subscription.endpoint}, ${subscription.keys.p256dh}, ${subscription.keys.auth})
-    ON CONFLICT (endpoint) DO UPDATE SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth
+    INSERT INTO push_subscriptions (endpoint, p256dh, auth, user_id)
+    VALUES (${subscription.endpoint}, ${subscription.keys.p256dh}, ${subscription.keys.auth}, ${userId})
+    ON CONFLICT (endpoint) DO UPDATE SET
+      p256dh = EXCLUDED.p256dh,
+      auth = EXCLUDED.auth,
+      user_id = COALESCE(EXCLUDED.user_id, push_subscriptions.user_id)
     RETURNING id, muted_types, lead_time_days`;
   const subscriptionId = subRows[0].id;
 

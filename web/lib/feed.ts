@@ -167,7 +167,19 @@ export function buildFeed(followed: FollowedItem[], now: Date = new Date()): Fee
     .map((item) => ({ item, info: describeRelease(item, now) }))
     .filter((x): x is { item: FollowedItem; info: ReleaseInfo } => x.info !== null)
     .filter((x) => x.info.diffDays >= 0);
-  dated.sort((a, b) => a.info.diffDays - b.info.diffDays);
+  dated.sort((a, b) => {
+    if (a.info.diffDays !== b.info.diffDays) return a.info.diffDays - b.info.diffDays;
+    // Same day: items with no exact time (movies/games — just "Friday")
+    // come first, then timed items (TV episodes with a known airtime) in
+    // chronological order. Without this, same-day items only kept
+    // whatever order they happened to be followed in.
+    const aAt = a.item.releaseAt;
+    const bAt = b.item.releaseAt;
+    if (!aAt && !bAt) return 0;
+    if (!aAt) return -1;
+    if (!bAt) return 1;
+    return new Date(aAt).getTime() - new Date(bAt).getTime();
+  });
 
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const afterNextWeekStart = endOfNextWeek(now);

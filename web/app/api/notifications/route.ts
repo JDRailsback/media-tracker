@@ -74,18 +74,23 @@ export async function GET(request: Request) {
 }
 
 // DELETE /api/notifications
-// Body: { id: number } to clear a single entry, or { ids: string[] } to
-// clear every history row for the given item ids (used by "clear all,"
-// which the client scopes to exactly the ids it's currently showing —
-// same trust model as GET, no auth, client-supplied id list only).
+// Body: { id: number, itemID: string } to clear a single entry, or
+// { ids: string[] } to clear every history row for the given item ids
+// (used by "clear all," which the client scopes to exactly the ids it's
+// currently showing — same trust model as GET, no auth, client-supplied id
+// list only). The single-id path requires itemID too and scopes the
+// DELETE to it — id alone is a sequential, guessable primary key, so
+// without this a caller could delete any OTHER item's history row just by
+// incrementing the number; itemID is exactly what the client already has
+// for the row it's rendering, so this closes that without adding auth.
 export async function DELETE(request: Request) {
   try {
-    const body = (await request.json()) as { id?: number; ids?: string[] };
+    const body = (await request.json()) as { id?: number; itemID?: string; ids?: string[] };
     await ensureSchema();
     const sql = db();
 
-    if (typeof body.id === "number") {
-      await sql`DELETE FROM notification_history WHERE id = ${body.id}`;
+    if (typeof body.id === "number" && typeof body.itemID === "string") {
+      await sql`DELETE FROM notification_history WHERE id = ${body.id} AND item_id = ${body.itemID}`;
       return NextResponse.json({ ok: true });
     }
 
@@ -94,7 +99,7 @@ export async function DELETE(request: Request) {
       return NextResponse.json({ ok: true });
     }
 
-    return NextResponse.json({ ok: false, error: "id or ids required" }, { status: 400 });
+    return NextResponse.json({ ok: false, error: "id+itemID or ids required" }, { status: 400 });
   } catch (err) {
     console.error(err);
     return NextResponse.json({ ok: false }, { status: 500 });
