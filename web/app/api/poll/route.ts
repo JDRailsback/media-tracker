@@ -11,13 +11,18 @@ export const maxDuration = 60;
 // Bearer CRON_SECRET). Two alert triggers per followed item, each logged to
 // notification_history exactly once (idempotent insert) and pushed only to
 // eligible subscriptions:
-//   1. CHANGE — the item's release date differs from the last poll's
-//      snapshot (a date was set, moved, or an episode/release rolled over).
-//      Logged even with ZERO subscribers: history must be complete for
-//      devices that never enabled push (they read it via /api/notifications).
-//   2. REMINDER — the release is exactly N days out, where N is a lead-time
-//      some eligible subscriber actually configured. Only computed against
-//      real subscribers (a reminder's only purpose is delivering a push).
+//   1. RELEASE DAY (lead_days = 0) — the release is today. Unconditional
+//      default for every followed item, regardless of that item's/device's
+//      lead-time preference — this is the one notification every follow is
+//      guaranteed to get. ("Change" notifications — the release date being
+//      set or moved — used to fire here too, explicitly turned off: they
+//      were noisy and repetitive, especially for anything whose date shifts
+//      more than once before it actually airs. If you only care that
+//      something's actually out, that's this trigger.)
+//   2. REMINDER (lead_days > 0) — the release is exactly N days out, where N
+//      is a lead-time some eligible subscriber actually configured (see
+//      Settings → Release reminders). Purely additive on top of trigger 1,
+//      for anyone who wants an advance heads-up too.
 // Eligibility = subscription follows the item, hasn't muted it, and hasn't
 // muted its media type. Push failures never abort the run (sendPush never
 // throws), and one bad item never aborts the loop.
@@ -39,12 +44,31 @@ export async function GET(request: Request) {
 
   await ensureSchema();
   const sql = db();
+  // last_known_release_date/last_checked_at are write-only bookkeeping now
+  // (kept updated below in case a future feature wants a "when did this
+  // last change" signal) — nothing in this route reads them anymore, since
+  // date-change detection was the one thing that used to need them.
   const items = await sql`
-    SELECT id, item_id, type, source_id, last_known_release_date, last_checked_at
+    SELECT id, item_id, type, source_id
     FROM followed_items`;
 
   let notified = 0;
   let logged = 0;
+  let pruned = 0;
+
+  // A subscription the push service itself says is gone for good (endpoint
+  // 404/410 — unsubscribed, expired, or silently rotated by the browser)
+  // gets removed here instead of being left to fail the exact same way on
+  // every future poll forever. ON DELETE CASCADE takes subscription_follows
+  // rows with it.
+  async function pushAndPrune(sub: SubscriberRow, payload: object): Promise<boolean> {
+    const result = await sendPush({ endpoint: sub.endpoint, p256dh: sub.p256dh, auth: sub.auth }, payload);
+    if (result.gone) {
+      await sql`DELETE FROM push_subscriptions WHERE endpoint = ${sub.endpoint}`;
+      pruned++;
+    }
+    return result.ok;
+  }
 
   // The idempotency layer: ON CONFLICT DO NOTHING RETURNING id yields a row
   // ONLY on a genuinely new event — re-running the poll the same day (or a
@@ -53,7 +77,6 @@ export async function GET(request: Request) {
   async function logEvent(
     followedItemId: number,
     itemId: string,
-    eventType: "change" | "reminder",
     leadDays: number,
     releaseDay: string,
     title: string,
@@ -62,7 +85,7 @@ export async function GET(request: Request) {
   ): Promise<boolean> {
     const rows = await sql`
       INSERT INTO notification_history (followed_item_id, item_id, event_type, lead_days, release_date, title, subtitle, message)
-      VALUES (${followedItemId}, ${itemId}, ${eventType}, ${leadDays}, ${releaseDay}, ${title}, ${subtitle}, ${message})
+      VALUES (${followedItemId}, ${itemId}, 'reminder', ${leadDays}, ${releaseDay}, ${title}, ${subtitle}, ${message})
       ON CONFLICT (followed_item_id, event_type, release_date, lead_days) DO NOTHING
       RETURNING id`;
     if (rows.length > 0) logged++;
@@ -73,9 +96,6 @@ export async function GET(request: Request) {
     try {
       const fetched = await details(item.type, item.source_id);
       const newDate = fetched.releaseDate ? new Date(fetched.releaseDate) : null;
-      const oldDate = item.last_known_release_date ? new Date(item.last_known_release_date) : null;
-      const firstCheck = !item.last_checked_at;
-      const changed = (newDate?.getTime() ?? null) !== (oldDate?.getTime() ?? null);
 
       await sql`
         UPDATE followed_items
@@ -101,31 +121,40 @@ export async function GET(request: Request) {
       const release = describeRelease({ ...fetched, followedAt: "" });
       const detail = fetched.subtitle ? `${fetched.title}: ${fetched.subtitle}` : fetched.title;
       const message = `${detail} — ${release?.label ?? releaseDay}`;
+      // Shown as the push notification's icon (see public/sw.js) — a
+      // followed title's own poster instead of the app's generic icon,
+      // so the notification itself is identifiable at a glance.
+      const icon = fetched.posterURL;
 
-      if (!firstCheck && changed) {
-        if (await logEvent(item.id, item.item_id, "change", -1, releaseDay, fetched.title, fetched.subtitle ?? null, message)) {
+      const diffDays = daysBetween(parseReleaseDay(fetched.releaseDate), new Date());
+
+      // Trigger 1: release day, unconditional — every followed item gets
+      // this regardless of any lead-time preference (see this route's
+      // top-of-file comment for why "change" notifications were removed
+      // instead of kept alongside this).
+      if (diffDays === 0) {
+        if (await logEvent(item.id, item.item_id, 0, releaseDay, fetched.title, fetched.subtitle ?? null, message)) {
           for (const s of eligible) {
-            const ok = await sendPush(
-              { endpoint: s.endpoint, p256dh: s.p256dh, auth: s.auth },
-              { title: "New release date", body: message, url: "/?view=notifications" }
-            );
+            const ok = await pushAndPrune(s, { title: "Releasing today", body: message, url: "/?view=notifications", icon });
             if (ok) notified++;
           }
         }
       }
 
-      // Reminder trigger — independent of whether the date changed this run.
-      const diffDays = daysBetween(parseReleaseDay(fetched.releaseDate), new Date());
+      // Trigger 2: optional advance heads-up, additive on top of trigger 1 —
+      // only for subscribers who set a lead time in Settings.
       if (diffDays > 0) {
         const leads = [...new Set(eligible.filter((s) => s.lead_time_days > 0).map((s) => s.lead_time_days))];
         for (const lead of leads) {
           if (lead !== diffDays) continue;
-          if (await logEvent(item.id, item.item_id, "reminder", lead, releaseDay, fetched.title, fetched.subtitle ?? null, message)) {
+          if (await logEvent(item.id, item.item_id, lead, releaseDay, fetched.title, fetched.subtitle ?? null, message)) {
             for (const s of eligible.filter((x) => x.lead_time_days === lead)) {
-              const ok = await sendPush(
-                { endpoint: s.endpoint, p256dh: s.p256dh, auth: s.auth },
-                { title: `${lead} day${lead === 1 ? "" : "s"} until release`, body: message, url: "/?view=notifications" }
-              );
+              const ok = await pushAndPrune(s, {
+                title: `${lead} day${lead === 1 ? "" : "s"} until release`,
+                body: message,
+                url: "/?view=notifications",
+                icon,
+              });
               if (ok) notified++;
             }
           }
@@ -136,5 +165,5 @@ export async function GET(request: Request) {
     }
   }
 
-  return NextResponse.json({ checked: items.length, logged, notified });
+  return NextResponse.json({ checked: items.length, logged, notified, pruned });
 }
