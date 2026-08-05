@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
-import { Search as SearchIcon, Bell, Sparkles, ArrowLeft, Plus, X, Calendar as CalendarIcon } from "lucide-react";
+import { Search as SearchIcon, Bell, Sparkles, ArrowLeft, Plus, X, Calendar as CalendarIcon, Play } from "lucide-react";
 import type { MediaItem } from "@/lib/types";
 import type { DugoutGroups, DugoutStatus, DugoutType } from "@/lib/dugout";
 import { addFollow, getFollowed, isFollowed, removeFollow, replaceFollowed, FollowedItem } from "@/lib/library";
@@ -264,6 +264,22 @@ export default function Home() {
     refetchDugout();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view, dugoutType]);
+
+  // Home's "Continue" rail — currentlyWatching across both types that
+  // support it (tvShow/game), flattened by /api/dugout?continue=1. Fetched
+  // once on mount rather than gated on `view === "feed"`: Home is the
+  // default landing view, so gating on it would mean the rail (and the
+  // layout reflow it causes) pops in a beat after the page itself does.
+  // Refetched after the detail modal closes, same "a status change made
+  // there wouldn't otherwise be reflected" reasoning as refetchDugout.
+  const [continueItems, setContinueItems] = useState<MediaItem[]>([]);
+  function refetchContinueWatching() {
+    fetch("/api/dugout?continue=1")
+      .then((r) => (r.ok ? r.json() : { items: [] }))
+      .then((d: { items: MediaItem[] }) => setContinueItems(d.items))
+      .catch(() => {});
+  }
+  useEffect(refetchContinueWatching, []);
 
   // Search directly from Dugout — a lighter-weight sibling of Discover's
   // search (query/searchType/searchResults above), not a reuse of it:
@@ -972,8 +988,11 @@ export default function Home() {
           // Calendar gets a bounded, non-scrolling height (see
           // components/MonthCalendarGrid.tsx's comment) — every other view
           // keeps main's ordinary content-sized/scrollable flow, so this
-          // must stay scoped to just that one view's classes.
-          view === "calendar" ? "flex h-dvh max-w-7xl flex-col" : "max-w-4xl"
+          // must stay scoped to just that one view's classes. Home gets a
+          // touch more width than the rest — just enough that the Continue
+          // rail (see the "feed" view below) doesn't squeeze the release
+          // feed to fit inside the same max-w-4xl every other view uses.
+          view === "calendar" ? "flex h-dvh max-w-7xl flex-col" : view === "feed" ? "max-w-5xl" : "max-w-4xl"
         }`}
       >
         {view === "feed" && (
@@ -986,6 +1005,7 @@ export default function Home() {
                 text="Follow a movie, show, or game in Discover to see release updates here."
               />
             ) : (
+              <div className={continueItems.length > 0 ? "md:grid md:grid-cols-[1fr_208px] md:gap-10" : ""}>
               <div className="space-y-10">
                 {heroItems.length > 0 &&
                   (() => {
@@ -1085,6 +1105,9 @@ export default function Home() {
                       </section>
                     );
                   })()}
+                {continueItems.length > 0 && (
+                  <ContinueStrip items={continueItems} onSelect={handleSelect} />
+                )}
                 {feed.map((group) => (
                   <section key={group.key}>
                     <h2 className="mb-2 text-[10.5px] font-bold uppercase tracking-[0.2em] text-subtle">
@@ -1103,6 +1126,14 @@ export default function Home() {
                     </div>
                   </section>
                 ))}
+              </div>
+              {continueItems.length > 0 && (
+                <ContinueRail
+                  items={continueItems}
+                  onSelect={handleSelect}
+                  onSeeAll={() => setView("dugout")}
+                />
+              )}
               </div>
             )}
           </>
@@ -1728,6 +1759,10 @@ export default function Home() {
             // DetailModal.tsx) wouldn't otherwise be reflected in the
             // already-fetched Dugout lists until the next navigation.
             if (view === "dugout") refetchDugout();
+            // The Continue rail can be affected from ANY view (DetailModal
+            // is opened from Discover/Following/Search too, not just
+            // Dugout) — always refetch, not gated on `view`.
+            refetchContinueWatching();
           }}
         />
       )}
@@ -1766,6 +1801,112 @@ function PageHeader({ title, subtitle }: { title: string; subtitle?: string }) {
     <div className="mb-7 animate-fade-up">
       <h1 className="text-[28px] font-bold tracking-tight text-ink">{title}</h1>
       {subtitle && <p className="mt-1.5 text-[14px] text-subtle">{subtitle}</p>}
+    </div>
+  );
+}
+
+// "Currently watching"/"Currently playing" label for a Continue entry —
+// deliberately just the bare status, no episode info (see item.subtitle,
+// "S{n} E{n}") alongside it.
+function continueSubtitle(item: MediaItem): string {
+  return item.type === "tvShow" ? "Watching" : "Playing";
+}
+
+// Home's right-hand "Continue" rail (desktop only — see the `md:hidden`
+// ContinueStrip below for the narrow-viewport equivalent). Deliberately
+// quieter than the release feed beside it: no pills, no poster-forward
+// cards, just a compact title+status list — the release feed is still the
+// point of Home, this is a glance at what's in progress, not a second
+// feature competing for the same attention.
+function ContinueRail({
+  items,
+  onSelect,
+  onSeeAll,
+}: {
+  items: MediaItem[];
+  onSelect: (item: MediaItem) => void;
+  onSeeAll: () => void;
+}) {
+  return (
+    <aside className="hidden md:block md:border-l md:border-hairline/70 md:pl-8">
+      <h2 className="mb-3 text-[10.5px] font-bold uppercase tracking-[0.2em] text-subtle">Continue</h2>
+      <div className="space-y-3">
+        {items.map((item) => (
+          <button
+            key={item.id}
+            onClick={() => onSelect(item)}
+            className="flex w-full items-center gap-2.5 text-left transition-opacity hover:opacity-80"
+          >
+            {item.posterURL ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={item.posterURL}
+                alt=""
+                loading="lazy"
+                decoding="async"
+                className="h-16 w-11 shrink-0 rounded-[7px] object-cover"
+              />
+            ) : (
+              <div className="h-16 w-11 shrink-0 rounded-[7px] bg-surface" />
+            )}
+            <div className="min-w-0">
+              <div className="truncate text-[12.5px] text-ink">{item.title}</div>
+              <div className="mt-1 flex items-center gap-1 text-[11px] text-subtle">
+                <Play size={9} className="shrink-0 fill-accent text-accent" />
+                <span className="truncate">{continueSubtitle(item)}</span>
+              </div>
+            </div>
+          </button>
+        ))}
+      </div>
+      <button
+        onClick={onSeeAll}
+        className="mt-4 border-t border-hairline/70 pt-3 text-[11.5px] font-medium text-subtle transition-colors hover:text-ink"
+      >
+        See Dugout
+      </button>
+    </aside>
+  );
+}
+
+// Mobile fallback for the rail above — there's no room for a side column
+// below the md breakpoint (same reasoning as Sidebar's own `hidden md:flex`
+// desktop-only nav), so this renders as a compact horizontal strip
+// underneath the Today spotlight instead, right where the rail would
+// otherwise sit relative to the feed.
+function ContinueStrip({ items, onSelect }: { items: MediaItem[]; onSelect: (item: MediaItem) => void }) {
+  return (
+    <div className="md:hidden">
+      <h2 className="mb-3 text-[10.5px] font-bold uppercase tracking-[0.2em] text-subtle">Continue</h2>
+      <div className="scrollbar-none flex gap-3 overflow-x-auto pb-1">
+        {items.map((item) => (
+          <button
+            key={item.id}
+            onClick={() => onSelect(item)}
+            className="flex w-40 shrink-0 items-center gap-2.5 rounded-xl bg-surface/70 p-2 text-left"
+          >
+            {item.posterURL ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={item.posterURL}
+                alt=""
+                loading="lazy"
+                decoding="async"
+                className="h-16 w-11 shrink-0 rounded-[7px] object-cover"
+              />
+            ) : (
+              <div className="h-16 w-11 shrink-0 rounded-[7px] bg-surface" />
+            )}
+            <div className="min-w-0">
+              <div className="truncate text-[12px] font-medium text-ink">{item.title}</div>
+              <div className="mt-1 flex items-center gap-1 text-[10.5px] text-subtle">
+                <Play size={9} className="shrink-0 fill-accent text-accent" />
+                <span className="truncate">{continueSubtitle(item)}</span>
+              </div>
+            </div>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

@@ -82,6 +82,38 @@ export async function getDugout(type: DugoutType, userId: number | null): Promis
   return groups;
 }
 
+// Home feed's "Continue" rail — currentlyWatching across BOTH types that
+// support it (tvShow/game — see DugoutGroups' comment), flattened into one
+// recency-ordered list rather than the per-type shape getDugout returns.
+// Kept as its own query instead of calling getDugout twice (once per type)
+// so this costs one round trip, not two, for a section that renders on
+// every Home load.
+export async function getContinueWatching(userId: number | null): Promise<MediaItem[]> {
+  await ensureSchema();
+  const sql = db();
+  const rows = (
+    userId === null
+      ? await sql`
+          SELECT item_id, type, status FROM dugout_items
+          WHERE status = 'currentlyWatching' AND type IN ('tvShow', 'game') AND user_id IS NULL
+          ORDER BY added_at DESC
+        `
+      : await sql`
+          SELECT item_id, type, status FROM dugout_items
+          WHERE status = 'currentlyWatching' AND type IN ('tvShow', 'game') AND user_id = ${userId}
+          ORDER BY added_at DESC
+        `
+  ) as unknown as DugoutRow[];
+
+  const settled = await Promise.allSettled(
+    rows.map((row) => {
+      const { rawId } = splitItemId(row.item_id);
+      return details(row.type, rawId);
+    })
+  );
+  return settled.filter((r): r is PromiseFulfilledResult<MediaItem> => r.status === "fulfilled").map((r) => r.value);
+}
+
 // Throws a plain Error with a user-facing message when onDeck is already at
 // its cap — this is an expected, actionable rejection (the API route
 // surfaces err.message as-is), not a real failure worth a generic 500.

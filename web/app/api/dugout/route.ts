@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import {
   getDugout,
   getDugoutStatus,
+  getContinueWatching,
   setDugoutStatus,
   removeDugoutItem,
   type DugoutStatus,
@@ -23,10 +24,13 @@ async function currentUserId(): Promise<number | null> {
 
 // GET /api/dugout?type=movie|tvShow -> { onDeck, watchlist, currentlyWatching }
 // GET /api/dugout?itemID=movie:603  -> { status: DugoutStatus | null }
-// Two shapes on one route rather than a second endpoint — same "itemID vs.
-// type" split already used elsewhere (/api/followed takes ids). DetailModal
-// only ever needs the single-item form. Scoped to the signed-in account
-// when there is one, else the same global list this always read.
+// GET /api/dugout?continue=1        -> { items: MediaItem[] }
+// Three shapes on one route rather than separate endpoints — same "itemID
+// vs. type" split already used elsewhere (/api/followed takes ids).
+// DetailModal only ever needs the single-item form; the Home feed's
+// "Continue" rail only ever needs the flattened cross-type form. Scoped to
+// the signed-in account when there is one, else the same global list this
+// always read.
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const userId = await currentUserId();
@@ -34,6 +38,10 @@ export async function GET(request: Request) {
   if (itemID) {
     const status = await getDugoutStatus(itemID, userId);
     return NextResponse.json({ status });
+  }
+  if (searchParams.get("continue")) {
+    const items = await getContinueWatching(userId);
+    return NextResponse.json({ items });
   }
   const type = searchParams.get("type");
   if (!type || !VALID_TYPES.has(type as DugoutType)) {
