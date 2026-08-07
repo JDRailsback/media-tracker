@@ -936,7 +936,21 @@ export default function Home() {
     .map((item) => ({ item, info: describeRelease(item) }))
     .filter((x): x is { item: FollowedItem; info: NonNullable<ReturnType<typeof describeRelease>> } =>
       x.info !== null && x.info.diffDays === 0
-    );
+    )
+    .sort((a, b) => {
+      // Every item here is already "today" — order by exact release time
+      // when one's known (a TV episode with a TVmaze airstamp), untimed
+      // releases (movies/games — just "today") first. Same tie-break
+      // buildFeed already uses for same-day items below; this list was
+      // previously unsorted, so the pager reflected follow order instead
+      // of actual release order.
+      const aAt = a.item.releaseAt;
+      const bAt = b.item.releaseAt;
+      if (!aAt && !bAt) return 0;
+      if (!aAt) return -1;
+      if (!bAt) return 1;
+      return new Date(aAt).getTime() - new Date(bAt).getTime();
+    });
   const heroIds = new Set(heroItems.map((x) => x.item.id));
 
   const feed = buildFeed(homeItems.filter((f) => !heroIds.has(f.id)));

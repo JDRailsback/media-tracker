@@ -90,6 +90,36 @@ export async function attachTVAirtimes(item: MediaItem): Promise<MediaItem> {
 
     const byEpisode = stamps?.byEpisode ?? {};
     const byEpisodeDate = stamps?.byEpisodeDate ?? {};
+
+    // catalogRowToMediaItem already picked item.subtitle/releaseDate as
+    // "the next episode" using each episode's raw TMDB airDate — but
+    // TVmaze's date for that same episode can land a day LATER (see
+    // TVmazeSchedule's doc comment: TVmaze's date is the more reliable of
+    // the two), which can mean an episode the raw-date scan already wrote
+    // off as "in the past" is actually still today or upcoming. Verified
+    // live: Silo S3E6's TMDB airDate is one day behind TVmaze's date for
+    // it, which is the real one — confirmed against the episode's actual
+    // 3am ET Apple TV+ drop — so the raw-date pick had already silently
+    // moved on to S3E7. Re-derive "next" with the corrected date before
+    // anything below runs, so both the per-episode airStamp list and the
+    // next-episode pointer work from the right episode.
+    const todayISO = new Date().toISOString().slice(0, 10);
+    const correctedDate = (e: { season: number; episode: number; airDate?: string }) =>
+      byEpisodeDate[`${e.season}:${e.episode}`] ?? e.airDate;
+    const trueNext = (item.episodes ?? [])
+      .filter((e) => {
+        const d = correctedDate(e);
+        return !!d && d >= todayISO;
+      })
+      .sort((a, b) => correctedDate(a)!.localeCompare(correctedDate(b)!))[0];
+
+    let subtitle = item.subtitle;
+    let releaseDate = item.releaseDate;
+    if (trueNext && `S${trueNext.season} E${trueNext.episode}` !== subtitle) {
+      subtitle = `S${trueNext.season} E${trueNext.episode}`;
+      releaseDate = correctedDate(trueNext) ?? releaseDate;
+    }
+
     // Real TVmaze time first (cross-checked — e.airDate absent means
     // nothing to check against, so skip rather than trust blind, same
     // conservative call as an outright date mismatch). Otherwise, the
@@ -105,14 +135,16 @@ export async function attachTVAirtimes(item: MediaItem): Promise<MediaItem> {
       return platform ? { ...e, airStamp: platform } : e;
     });
 
-    const next = /^S(\d+) E(\d+)$/.exec(item.subtitle ?? "");
+    const next = /^S(\d+) E(\d+)$/.exec(subtitle ?? "");
     const nextRealStamp = next ? byEpisode[`${next[1]}:${next[2]}`] : undefined;
-    if (nextRealStamp && withinOneDay(item.releaseDate, nextRealStamp)) {
-      return { ...item, episodes, releaseAt: nextRealStamp };
+    if (nextRealStamp && withinOneDay(releaseDate, nextRealStamp)) {
+      return { ...item, subtitle, releaseDate, episodes, releaseAt: nextRealStamp };
     }
-    const nextAnchorDate = (next && byEpisodeDate[`${next[1]}:${next[2]}`]) ?? item.releaseDate;
+    const nextAnchorDate = (next && byEpisodeDate[`${next[1]}:${next[2]}`]) ?? releaseDate;
     const nextPlatform = platformDropTimeUTC(networks, nextAnchorDate);
-    return nextPlatform ? { ...item, episodes, releaseAt: nextPlatform } : { ...item, episodes };
+    return nextPlatform
+      ? { ...item, subtitle, releaseDate, episodes, releaseAt: nextPlatform }
+      : { ...item, subtitle, releaseDate, episodes };
   } catch {
     // Times are enhancement, never a gate — any failure just means
     // day-precision display, exactly what the app did before.

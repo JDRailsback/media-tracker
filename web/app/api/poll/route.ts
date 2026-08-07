@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { db, ensureSchema } from "@/lib/db";
 import { details } from "@/lib/sources";
 import { sendPush } from "@/lib/push";
-import { daysBetween, describeRelease, parseReleaseDay } from "@/lib/feed";
+import { describeRelease } from "@/lib/feed";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -119,14 +119,27 @@ export async function GET(request: Request) {
       // Same phrasing engine the feed uses ("New episode Friday, 9:00 PM")
       // — followedAt is irrelevant to describeRelease, hence the stub.
       const release = describeRelease({ ...fetched, followedAt: "" });
+      if (!release) continue; // malformed date — nothing to trigger on
       const detail = fetched.subtitle ? `${fetched.title}: ${fetched.subtitle}` : fetched.title;
-      const message = `${detail} — ${release?.label ?? releaseDay}`;
+      const message = `${detail} — ${release.label}`;
       // Shown as the push notification's icon (see public/sw.js) — a
       // followed title's own poster instead of the app's generic icon,
       // so the notification itself is identifiable at a glance.
       const icon = fetched.posterURL;
 
-      const diffDays = daysBetween(parseReleaseDay(fetched.releaseDate), new Date());
+      // The SAME diffDays describeRelease just used to build the message
+      // above — not a second, independent calculation. A TV episode's
+      // releaseAt (its real, TVmaze-sourced air instant — see
+      // lib/airtimes.ts) can legitimately land on a different calendar day
+      // than the day-precision releaseDate a separate calculation here used
+      // to be based on: verified live on Silo, whose next episode's
+      // releaseAt fell exactly one day past its stored releaseDate, which
+      // fired the unconditional "release day" trigger (lead_days=0, "OUT
+      // NOW") a full day early — while the message logged in that same row,
+      // built from this same describeRelease call, correctly read "New
+      // episode tomorrow, 7:00 AM". Sourcing both from one call makes that
+      // contradiction impossible, not just less likely.
+      const diffDays = release.diffDays;
 
       // Trigger 1: release day, unconditional — every followed item gets
       // this regardless of any lead-time preference (see this route's
