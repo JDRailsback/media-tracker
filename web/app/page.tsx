@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 import { Search as SearchIcon, Bell, Sparkles, ArrowLeft, Plus, X, Calendar as CalendarIcon, Play } from "lucide-react";
 import type { MediaItem } from "@/lib/types";
-import type { DugoutGroups, DugoutStatus, DugoutType } from "@/lib/dugout";
+import { WATCHLIST_LABEL, type DugoutGroups, type DugoutStatus, type DugoutType } from "@/lib/dugout";
 import { addFollow, getFollowed, isFollowed, removeFollow, replaceFollowed, FollowedItem } from "@/lib/library";
 import { buildFeed, describeRelease, parseReleaseDay } from "@/lib/feed";
 import { currentSubscription, disablePush, enablePush, fetchPrefs, syncFollow } from "@/lib/push-client";
@@ -1518,7 +1518,7 @@ export default function Home() {
                     emptyText={`Add up to 5 ${DUGOUT_TYPE_NOUN[dugoutType]} you want to ${DUGOUT_TYPE_VERB[dugoutType]} next.`}
                   />
                   <ExpandableWatchlist
-                    title="Watchlist"
+                    title={WATCHLIST_LABEL[dugoutType]}
                     items={dugoutData.watchlist}
                     onSelect={handleSelect}
                     onAdd={() => setDugoutSearchTarget("watchlist")}
@@ -2078,7 +2078,7 @@ function ExpandableWatchlist({
         )}
       </div>
       {items.length === 0 ? (
-        <p className="text-[13px] text-subtle">Nothing on your watchlist yet.</p>
+        <p className="text-[13px] text-subtle">Your {title} is empty.</p>
       ) : (
         <div className="grid grid-cols-2 gap-x-5 gap-y-7 sm:grid-cols-3 lg:grid-cols-4">
           {(expanded ? items : items.slice(0, previewCount)).map((item, i) => (
@@ -2097,11 +2097,13 @@ function ExpandableWatchlist({
 // onSelect wiring in the main component) — the actual "add to On Deck/
 // Watchlist" controls live there, already built; this modal only finds
 // things.
-const DUGOUT_STATUS_LABEL: Record<DugoutStatus, string> = {
-  onDeck: "On Deck",
-  watchlist: "Watchlist",
-  currentlyWatching: "Currently Watching",
-};
+// "watchlist" is the one status whose label varies by type (see
+// WATCHLIST_LABEL in lib/dugout.ts) — onDeck/currentlyWatching read fine
+// as-is across all four types.
+function dugoutStatusLabel(status: DugoutStatus, type: DugoutType): string {
+  if (status === "watchlist") return WATCHLIST_LABEL[type];
+  return status === "onDeck" ? "On Deck" : "Currently Watching";
+}
 
 // Unlike every other "select an item" surface in the app (which opens
 // DetailModal and leaves the actual add/remove decision to its pills), this
@@ -2145,7 +2147,7 @@ function DugoutSearchModal({
       >
         <div className="flex items-center justify-between gap-2 border-b border-hairline/70 px-4 pt-3">
           <span className="text-[12px] font-semibold uppercase tracking-wide text-subtle">
-            Add to {DUGOUT_STATUS_LABEL[target]}
+            Add to {dugoutStatusLabel(target, dugoutType)}
           </span>
           <button
             onClick={onClose}

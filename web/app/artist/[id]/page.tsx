@@ -10,7 +10,7 @@ import { parseReleaseDay } from "@/lib/feed";
 import { getPreferredPlatforms, isPreferredProvider } from "@/lib/platformPrefs";
 import CollectionRow from "@/components/CollectionRow";
 import { DugoutPill } from "@/components/DetailModal";
-import type { DugoutStatus } from "@/lib/dugout";
+import { WATCHLIST_LABEL, type DugoutStatus } from "@/lib/dugout";
 
 // Dedicated artist profile page — the music counterpart of
 // /collection/[slug], replacing the generic DetailModal for artists
@@ -271,7 +271,7 @@ export default function ArtistPage({ params }: { params: { id: string } }) {
               onClick={() => handleDugoutClick("onDeck")}
             />
             <DugoutPill
-              label="Watchlist"
+              label={WATCHLIST_LABEL.artist}
               active={dugoutStatus === "watchlist"}
               disabled={dugoutBusy}
               onClick={() => handleDugoutClick("watchlist")}

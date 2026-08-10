@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { X, Play, Plus, Check, Star, Bell, BellOff } from "lucide-react";
 import type { MediaItem } from "@/lib/types";
-import type { DugoutStatus } from "@/lib/dugout";
+import { WATCHLIST_LABEL, type DugoutStatus, type DugoutType } from "@/lib/dugout";
 import { describeRelease, formatTime } from "@/lib/feed";
 import { getPreferredPlatforms, isPreferredProvider } from "@/lib/platformPrefs";
 import { fetchPrefs, setItemMuted } from "@/lib/push-client";
@@ -248,7 +248,9 @@ export default function DetailModal({
                     onClick={() => handleDugoutClick("onDeck")}
                   />
                   <DugoutPill
-                    label="Watchlist"
+                    // dugoutEligible (checked above) already narrows full.type to
+                    // exactly DugoutType's four values, so this cast is safe.
+                    label={WATCHLIST_LABEL[full.type as DugoutType]}
                     active={dugoutStatus === "watchlist"}
                     disabled={dugoutBusy}
                     onClick={() => handleDugoutClick("watchlist")}

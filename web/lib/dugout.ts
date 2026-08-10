@@ -11,6 +11,20 @@ import type { MediaItem } from "@/lib/types";
 export type DugoutStatus = "onDeck" | "watchlist" | "currentlyWatching";
 export type DugoutType = "movie" | "tvShow" | "game" | "artist";
 
+// Display label for the "watchlist" status, per type — "Watchlist" reads
+// naturally for movies/TV, but not for games (nobody calls their pile of
+// unplayed games a "watchlist") or music, so each type gets its own
+// idiomatic term instead of one label stretched across all four. "Backlog"
+// is the standard term gamers already use for "own/want to play,
+// haven't gotten to it yet"; "Listen Later" mirrors the familiar "Watch
+// Later" convention for the listening equivalent.
+export const WATCHLIST_LABEL: Record<DugoutType, string> = {
+  movie: "Watchlist",
+  tvShow: "Watchlist",
+  game: "Backlog",
+  artist: "Listen Later",
+};
+
 // Per type (movies, TV, games, and artists each get their own 5, not a
 // shared pool).
 const ON_DECK_LIMIT = 5;
