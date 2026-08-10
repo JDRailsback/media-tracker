@@ -295,6 +295,17 @@ function fetchFranchisePicks(rows: {
     );
   }
 
+  // "Regardless of popularity" (see this function's own comment) was never
+  // meant to mean regardless of whether the title is real. Verified live:
+  // "Batman Symbolus: A Fan Film" and an unrelated, obscure "Inside Out"
+  // (a different TMDB id from the real 2015 Pixar film) both matched their
+  // collection's bare-word keyword with a popularity/hype score of 1 —
+  // literally the floor TMDB/IGDB report for something almost nobody has
+  // looked at. Set well under One Piece: Grand Gourmet's IGDB hype of 5 —
+  // the actual case this admission path was built to protect — so it only
+  // cuts genuine zero-signal noise, not "low buzz but real."
+  const FRANCHISE_PICK_MIN_SCORE = 3;
+
   const picks: CalendarWriteRow[] = [];
   const sources: [SourceUpcomingRow[], "movie" | "tvShow" | "game"][] = [
     [rows.movies, "movie"],
@@ -305,7 +316,9 @@ function fetchFranchisePicks(rows: {
     const keywords = keywordsByType[type];
     if (keywords.length === 0) continue;
     for (const row of sourceRows) {
-      if (matches(row.title, keywords)) picks.push({ ...toWriteRow(row, row.popularity_score), franchisePick: true });
+      if (matches(row.title, keywords) && row.popularity_score >= FRANCHISE_PICK_MIN_SCORE) {
+        picks.push({ ...toWriteRow(row, row.popularity_score), franchisePick: true });
+      }
     }
   }
   return picks;
@@ -324,11 +337,17 @@ function fetchFranchisePicks(rows: {
 // stages (see tmdb.ts's OFFICIAL_STATUS_CONCURRENCY comment — 57.8s
 // measured live), so a ~10-batch sequential scan added on top was a real
 // risk to that budget; firing every batch's request at once instead costs
-// roughly one round trip's worth of wall-clock time, not ten. No
-// popularity floor here either: a show doesn't get a season-2+ pickup with
-// a confirmed premiere date without real viewership, so "has one" is
-// already the meaningful signal (verified live: Adults' Season 2 premiere
-// at vote_count 59 was a real, legitimate result a floor had wrongly cut).
+// roughly one round trip's worth of wall-clock time, not ten. A LOW
+// popularity floor: a show doesn't get a season-2+ pickup with a confirmed
+// premiere date without real viewership, so "has one" is mostly already
+// the meaningful signal (verified live: Adults' Season 2 premiere at
+// vote_count 59 was a real, legitimate result a floor had wrongly cut
+// before) — but "mostly" isn't "always": Ulice, a long-running Czech soap,
+// re-clears this bar every single time it rolls into a new season
+// (vote_count 35) with zero real anticipation behind it. Set well under
+// Adults' 59 so it stays this permissive for genuine hits, just not for
+// zero-signal noise.
+const RETURNING_TV_PREMIERE_MIN_SCORE = 40;
 const CATALOG_TV_SCAN_BATCH_SIZE = 1000;
 
 async function fetchReturningTVPremieres(): Promise<CalendarWriteRow[]> {
@@ -353,7 +372,7 @@ async function fetchReturningTVPremieres(): Promise<CalendarWriteRow[]> {
   const rows: CalendarWriteRow[] = [];
   for (const row of batches.flat()) {
     const premiere = nextSeasonPremiere(row);
-    if (!premiere) continue;
+    if (!premiere || row.popularity_score < RETURNING_TV_PREMIERE_MIN_SCORE) continue;
     rows.push({
       id: row.id,
       type: "tvShow",
@@ -545,10 +564,26 @@ const INTL_BAR_THRESHOLDS: Record<Exclude<IntlBarLevel, "off">, { movie: number;
 // 59) the moment the threshold was introduced. Returning premieres are
 // identified by `subtitle IS NOT NULL` — only fetchReturningTVPremieres
 // ever sets one (brand-new Trakt-admitted shows never do) — and are exempt
-// from BOTH bars below, same as games: their own admission (a confirmed
-// season-2+ pickup exists at all) is already the meaningful signal, per
-// fetchReturningTVPremieres' own reasoning.
+// from the general bar below, same as games: their own admission (a
+// confirmed season-2+ pickup exists at all) is already the meaningful
+// signal, per fetchReturningTVPremieres' own reasoning. The international
+// bar is the one exception — see its own vote_count-scale threshold below.
 const RETURNING_TV_EXEMPT = "(type = 'tvShow' AND subtitle IS NOT NULL)";
+
+// A returning show's own admission floor (RETURNING_TV_PREMIERE_MIN_SCORE)
+// already runs at write time regardless of language — but explicit
+// request: a foreign-language returning show shouldn't ALSO get a blanket
+// pass from the international bar specifically just because "a season was
+// renewed" says nothing about whether anyone outside its home market
+// cares, which is exactly what the international bar exists to ask.
+// Same vote_count scale as RETURNING_TV_PREMIERE_MIN_SCORE, not
+// INTL_BAR_THRESHOLDS' Trakt-list_count-scale numbers — those would be
+// far too strict for this signal (see this file's own note on the two
+// scales being incomparable).
+const RETURNING_TV_INTL_THRESHOLDS: Record<Exclude<IntlBarLevel, "off">, number> = {
+  moderate: 60,
+  strict: 150,
+};
 
 // Franchise picks (see fetchFranchisePicks) are exempt from BOTH bars for
 // the same reason games are: their admission — belonging to a major,
@@ -560,7 +595,13 @@ const FRANCHISE_PICK_EXEMPT = "franchise_pick = true";
 function intlBarSQL(level: IntlBarLevel): string {
   if (level === "off") return "";
   const t = INTL_BAR_THRESHOLDS[level];
-  return `AND (original_language = 'en' OR original_language IS NULL OR type = 'game' OR ${RETURNING_TV_EXEMPT} OR ${FRANCHISE_PICK_EXEMPT} OR
+  const returningFloor = RETURNING_TV_INTL_THRESHOLDS[level];
+  // English/no-language rows still short-circuit past everything below via
+  // the first clause, so an English returning show stays fully exempt
+  // exactly as before — only a non-English one now has to clear
+  // returningFloor instead of an unconditional pass.
+  return `AND (original_language = 'en' OR original_language IS NULL OR type = 'game' OR ${FRANCHISE_PICK_EXEMPT} OR
+    (${RETURNING_TV_EXEMPT} AND rank_score >= ${returningFloor}) OR
     (type = 'movie' AND rank_score >= ${t.movie}) OR (type = 'tvShow' AND subtitle IS NULL AND rank_score >= ${t.tvShow}))`;
 }
 

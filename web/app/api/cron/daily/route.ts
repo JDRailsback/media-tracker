@@ -20,9 +20,8 @@ import type { CatalogRow } from "@/lib/catalog";
 import { upsertTrending, pruneTrending } from "@/lib/trending";
 import type { TrendingRow } from "@/lib/trending";
 import { rebuildAllCollections } from "@/lib/collections-rebuild";
-import { refreshDiscoverSnapshot } from "@/lib/sources";
-import { refreshUpcomingCalendar } from "@/lib/upcomingCalendar";
 import { toISODate } from "@/lib/dbDate";
+import { waitUntil } from "@vercel/functions";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -31,7 +30,8 @@ export const maxDuration = 60;
 // Cron (see vercel.json; Hobby allows only two cron jobs, and /api/poll has
 // the other slot — hence one consolidated endpoint rather than one per
 // concern). Same Authorization: Bearer CRON_SECRET pattern as /api/poll.
-// Six stages:
+// Four stages run inline here, then a fifth pair is handed off to a SEPARATE
+// invocation:
 //   A. Upcoming refresh — upcoming_items replaced with the current biggest
 //      unreleased/announced titles (dated or not).
 //   B. Recent releases — titles released in the last ~30 days upserted into
@@ -50,17 +50,24 @@ export const maxDuration = 60;
 //   D. Collection self-heal — re-resolves the hand-curated title lists in
 //      lib/collections.ts against the (possibly just-grown) catalog. The
 //      lists themselves never change automatically.
-//   E. Upcoming calendar rebuild — see lib/upcomingCalendar.ts. Runs after
-//      A/B so it sees this run's freshest upcoming_items/catalog_items. Also
-//      does "New releases"' upkeep here: any upcoming_calendar row whose
-//      release_date has now passed graduates into new_releases_calendar
-//      BEFORE this run's fresh admission set overwrites it (see
-//      graduateReleasedTitles) — "New releases" has no separate admission
-//      logic of its own, it only ever inherits a title's existing
-//      upcoming-side rank_score.
-//   F. Discover snapshot rebuild — see lib/discoverSnapshot.ts. Runs last of
-//      all so it reflects everything A-E just refreshed, not a stale
-//      in-between state (its popularUpcoming shelf reads stage E's output).
+//   E/F. Upcoming calendar rebuild + Discover snapshot rebuild — see
+//      lib/upcomingCalendar.ts / lib/discoverSnapshot.ts. Used to run
+//      inline, right here, after D — but A-D alone were already measured at
+//      ~57.8s of real wall-clock time (see lib/sources/tmdb.ts's
+//      OFFICIAL_STATUS_CONCURRENCY comment), uncomfortably close to
+//      Vercel's 60s function limit even before E's own Trakt calls are
+//      added on top. Verified live: once Trakt started actually returning
+//      data instead of erroring instantly, the combined A-F runtime started
+//      timing out mid-E, and Vercel kills an invocation at maxDuration with
+//      no partial save for whatever was mid-flight — upcoming_items would
+//      refresh fine while upcoming_calendar and the Discover snapshot
+//      silently never updated. E/F now run in /api/cron/refresh-calendar
+//      instead, triggered below via a fire-and-forget server-to-server
+//      call — a genuinely separate invocation gets its own fresh 60s
+//      budget, independent of how long A-D just took. That route isn't in
+//      vercel.json's `crons` list (same Hobby two-job cap as above), so
+//      it's only ever reached this way, never by Vercel's scheduler
+//      directly — the CRON_SECRET check there is what actually gates it.
 // Nothing in the live app calls TMDB/IGDB/MangaDex — this cron and the
 // manual ingest script are the only writers; every user-facing read stays
 // table-only.
@@ -310,29 +317,26 @@ export async function GET(request: Request) {
     collections = { error: String(err) };
   }
 
-  // Stage E — rebuilds upcoming_calendar (see lib/upcomingCalendar.ts) from
-  // upcoming_items/catalog_items, both refreshed by stages A/B above. Must
-  // run BEFORE stage F: discover()'s popularUpcoming shelf now reads
-  // upcoming_calendar, so the snapshot rebuild would otherwise capture a
-  // stale calendar.
-  let upcomingCalendar: { count: number } | { error: string };
-  try {
-    upcomingCalendar = await refreshUpcomingCalendar();
-  } catch (err) {
-    upcomingCalendar = { error: String(err) };
-  }
-
-  // Stage F last of all — rebuilds the Discover snapshot (see
-  // lib/discoverSnapshot.ts) from trending_items/upcoming_calendar/
-  // catalog_items/collections, all of which stages A-E have just finished
-  // refreshing.
-  let discoverSnapshot: { ok: true } | { error: string };
-  try {
-    await refreshDiscoverSnapshot();
-    discoverSnapshot = { ok: true };
-  } catch (err) {
-    discoverSnapshot = { error: String(err) };
-  }
+  // Stage E/F handoff — fire-and-forget, not awaited: this invocation's own
+  // remaining budget can't be trusted to cover E/F's full runtime on top of
+  // what A-D already took (see this file's top comment). waitUntil keeps
+  // this invocation alive just long enough to guarantee the request is
+  // actually sent rather than dropped the instant this handler returns;
+  // once Vercel has received it, /api/cron/refresh-calendar runs as its own
+  // independent invocation regardless of what happens to this one
+  // afterward. The secret is read directly rather than forwarding this
+  // request's own Authorization header, since a request with no `secret`
+  // configured (local dev without CRON_SECRET set) would otherwise forward
+  // a null/missing header instead of skipping auth the same way this
+  // route's own check above does.
+  const origin = new URL(request.url).origin;
+  waitUntil(
+    fetch(`${origin}/api/cron/refresh-calendar`, {
+      headers: secret ? { authorization: `Bearer ${secret}` } : {},
+    }).catch((err) => {
+      console.error("Failed to trigger /api/cron/refresh-calendar", err);
+    })
+  );
 
   return NextResponse.json({
     upcoming: { movie: upMovie, tvShow: upTV, game: upGame },
@@ -342,7 +346,6 @@ export async function GET(request: Request) {
     followedTVRefreshed,
     followedUpcomingTVRefreshed,
     collections,
-    upcomingCalendar,
-    discoverSnapshot,
+    calendarRefresh: "triggered", // see /api/cron/refresh-calendar for its own result
   });
 }
