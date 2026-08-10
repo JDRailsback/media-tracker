@@ -19,12 +19,24 @@ export interface ReleaseEntry {
   uidSuffix: string;
 }
 
+// Long-running shows (a currently-airing anime can carry 1000+ episodes
+// back to the late '90s) blow the ICS feed up to a size some calendar
+// clients silently fail to import — verified live: Outlook loaded a blank
+// calendar for a feed that had swelled to 1.17MB/1699 events, almost
+// entirely One Piece's full back catalog. A release tracker only needs
+// recent history, not a multi-decade archive, so episodes are capped to
+// this window and everything future, however far out.
+const EPISODE_LOOKBACK_DAYS = 180;
+
 export function releaseEntriesFor(item: MediaItem): ReleaseEntry[] {
   if (item.type === "tvShow") {
     const episodes = item.episodes ?? [];
     if (episodes.length > 0) {
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - EPISODE_LOOKBACK_DAYS);
+      const cutoffISO = cutoff.toISOString().slice(0, 10);
       return episodes
-        .filter((ep): ep is typeof ep & { airDate: string } => !!ep.airDate)
+        .filter((ep): ep is typeof ep & { airDate: string } => !!ep.airDate && ep.airDate >= cutoffISO)
         .map((ep) => ({
           date: ep.airDate,
           title: ep.title || item.title,
