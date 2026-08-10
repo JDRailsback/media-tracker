@@ -194,8 +194,24 @@ async function fetchTraktAndHypeAdmitted(rows: {
   movies: SourceUpcomingRow[];
   tv: SourceUpcomingRow[];
   games: SourceUpcomingRow[];
-}): Promise<CalendarWriteRow[]> {
-  const [traktMovies, traktShows] = await Promise.all([fetchTraktAnticipatedMovieIds(), fetchTraktAnticipatedShowIds()]);
+}): Promise<{ rows: CalendarWriteRow[]; traktError?: string }> {
+  // A Trakt failure (see lib/trakt.ts's own comment on why page-1 failures
+  // now throw instead of silently returning empty) is caught HERE, not left
+  // to propagate out of this function — games still have their own
+  // independent admission (IGDB hypes), and franchise picks/returning-show
+  // premieres don't touch Trakt at all, so one bad Trakt request shouldn't
+  // cost the whole calendar rebuild. It's surfaced instead, so a real
+  // outage (or block) is visible in the cron's own response rather than
+  // reading identically to "nothing's anticipated right now" — which is
+  // exactly how a real, ongoing failure went unnoticed before this.
+  let traktMovies = new Map<number, number>();
+  let traktShows = new Map<number, number>();
+  let traktError: string | undefined;
+  try {
+    [traktMovies, traktShows] = await Promise.all([fetchTraktAnticipatedMovieIds(), fetchTraktAnticipatedShowIds()]);
+  } catch (err) {
+    traktError = String(err);
+  }
 
   const movies = rows.movies
     .map((row) => ({ row, score: traktMovies.get(tmdbIdOf(row.id)) }))
@@ -207,7 +223,7 @@ async function fetchTraktAndHypeAdmitted(rows: {
     .map(({ row, score }) => toWriteRow(row, score));
   const games = rows.games.map((row) => toWriteRow(row, row.popularity_score));
 
-  return [...movies, ...tv, ...games];
+  return { rows: [...movies, ...tv, ...games], traktError };
 }
 
 // Titles admitted purely for belonging to a MAJOR, hand-curated franchise —
@@ -450,7 +466,7 @@ async function pruneOldReleases(): Promise<void> {
 // lib/discoverSnapshot.ts). Upsert-then-prune, same pattern as
 // trending_items: this run's rows always win, anything not refreshed this
 // run (released, cancelled, no longer has a future premiere) is deleted.
-export async function refreshUpcomingCalendar(): Promise<{ count: number }> {
+export async function refreshUpcomingCalendar(): Promise<{ count: number; traktError?: string }> {
   await ensureSchema();
   const sql = db();
 
@@ -460,7 +476,7 @@ export async function refreshUpcomingCalendar(): Promise<{ count: number }> {
   await pruneOldReleases();
 
   const [rawRows, returningTV] = await Promise.all([fetchRawUpcomingRows(), fetchReturningTVPremieres()]);
-  const admittedRows = await fetchTraktAndHypeAdmitted(rawRows);
+  const { rows: admittedRows, traktError } = await fetchTraktAndHypeAdmitted(rawRows);
   const franchisePicks = fetchFranchisePicks(rawRows);
 
   // Merge in priority order: Trakt/hype-admitted first (a real earned
@@ -529,7 +545,7 @@ export async function refreshUpcomingCalendar(): Promise<{ count: number }> {
   const keepIds = rows.map((r) => r.id);
   await sql`DELETE FROM upcoming_calendar WHERE NOT (id = ANY(${keepIds}))`;
 
-  return { count: rows.length };
+  return { count: rows.length, traktError };
 }
 
 // ---------- Reads (live request paths) ----------

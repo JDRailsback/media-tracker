@@ -45,6 +45,17 @@ interface TraktAnticipatedRow {
 // Trakt's anticipated lists are small (a few pages at most) — walked fully
 // via its own x-pagination-page-count header rather than an assumed depth,
 // so this stays correct if the list ever grows or shrinks.
+//
+// A page-1 failure THROWS instead of silently returning an empty list — a
+// real request failure (Cloudflare block, an outage, an auth problem) used
+// to look byte-for-byte identical to "the anticipated list genuinely has
+// nothing in it right now," which is how a real, ongoing block went
+// unnoticed: every admitted movie/brand-new-TV title quietly vanished from
+// "Popular upcoming" while every downstream stage kept reporting success,
+// since franchise-pick/game/returning-show admission never touch Trakt at
+// all. A failure on a LATER page still degrades gracefully (keeps
+// whatever was already fetched) — that's a much smaller, more forgivable
+// loss than getting nothing at all from page 1.
 async function fetchAllPages<T extends TraktAnticipatedRow>(path: string): Promise<T[]> {
   const results: T[] = [];
   let page = 1;
@@ -52,7 +63,15 @@ async function fetchAllPages<T extends TraktAnticipatedRow>(path: string): Promi
     const res = await fetch(`${TRAKT_API_BASE}${path}?limit=100&page=${page}&extended=full`, {
       headers: headers(),
     });
-    if (!res.ok) break;
+    if (!res.ok) {
+      if (page === 1) {
+        const body = await res.text().catch(() => "");
+        throw new Error(
+          `Trakt request failed (${path}): ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 200)}` : ""}`
+        );
+      }
+      break;
+    }
     const data = (await res.json()) as T[];
     results.push(...data);
     const totalPages = Number(res.headers.get("x-pagination-page-count") ?? "1");
