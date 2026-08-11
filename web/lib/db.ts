@@ -410,6 +410,20 @@ function buildSchema(): Promise<void> {
       // same as games and returning-TV premieres — the whole point is
       // "show it regardless of popularity."
       await sql`ALTER TABLE upcoming_calendar ADD COLUMN IF NOT EXISTS franchise_pick BOOLEAN NOT NULL DEFAULT false`;
+      // Marks a row admitted via TMDB's trending/week list — a second,
+      // independent momentum signal for movies/brand-new TV alongside Trakt
+      // anticipation (see lib/upcomingCalendar.ts's fetchTrendingAdmitted).
+      // Added after Trakt's /movies/anticipated and /shows/anticipated were
+      // verified live to be blocked (403, Cloudflare-level) for an extended
+      // period — movies had NO other admission path at all when that
+      // happened (unlike TV, which still gets returning-show premieres from
+      // the catalog scan, or games, which use IGDB hypes), so "Popular
+      // upcoming" quietly lost nearly every movie with no visible error
+      // anywhere but the cron's own response. Exempt from the international/
+      // general bars, same as franchise picks — TMDB's own trending list is
+      // already a real momentum signal, not a candidate pool needing a
+      // second popularity filter on top.
+      await sql`ALTER TABLE upcoming_calendar ADD COLUMN IF NOT EXISTS trending_pick BOOLEAN NOT NULL DEFAULT false`;
       // "New releases"' calendar — same shape as upcoming_calendar, same
       // admission decisions, just the other side of one title's lifecycle.
       // A row only ever enters this table by GRADUATING out of
@@ -446,6 +460,7 @@ function buildSchema(): Promise<void> {
       // via ALTER, not the CREATE TABLE body above, since that statement is
       // a no-op once the table already exists on anyone's DB.
       await sql`ALTER TABLE new_releases_calendar ADD COLUMN IF NOT EXISTS franchise_pick BOOLEAN NOT NULL DEFAULT false`;
+      await sql`ALTER TABLE new_releases_calendar ADD COLUMN IF NOT EXISTS trending_pick BOOLEAN NOT NULL DEFAULT false`;
 
       // "Dugout" — a user's watch queue, deliberately separate from
       // followed_items (following = "tell me about release news"; this =

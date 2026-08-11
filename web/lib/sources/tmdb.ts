@@ -620,19 +620,45 @@ export async function discoverTMDBUpcomingTV(limit = 1000): Promise<UpcomingRow[
   return official.slice(0, limit);
 }
 
-// ---------- Trending (app/api/cron/daily/route.ts, via lib/trending.ts) ----------
+// ---------- Trending (app/api/cron/daily/route.ts, via lib/trending.ts;
+// also lib/upcomingCalendar.ts's fetchTrendingAdmitted) ----------
 // TMDB's own trending/week endpoint IS a real momentum signal (recent
 // views/searches), unlike `popularity` used elsewhere in this file for
 // admission gating — this is the one place that signal is exactly what's
 // wanted. Already ranked by TMDB itself; `rank` here is just the response's
 // own order (1 = most trending), not a recomputed score.
-export async function discoverTMDBTrendingMovies(limit = 20): Promise<TrendingRow[]> {
+//
+// `pages` defaults to 1 (the Discover shelf's own need — ~20 items is
+// plenty for a shelf) but the calendar's admission use needs much deeper
+// coverage: trending/week mixes already-released AND upcoming titles, so
+// only a small slice of any one page is genuinely unreleased — verified
+// live, page 1 alone matched only 1 of our own upcoming movie rows. Pages
+// are fetched IN PARALLEL and concatenated in TMDB's own rank order (page 1
+// before page 2, etc.), not re-sorted, since `rank` is meant to reflect
+// TMDB's real ordering, not this function's fetch order.
+async function fetchTMDBTrendingPages<T>(
+  url: (page: number) => string,
+  pages: number
+): Promise<T[]> {
+  const responses = await Promise.all(
+    Array.from({ length: pages }, (_, i) =>
+      fetch(url(i + 1), { cache: "no-store" }).then(async (res) => {
+        if (!res.ok) throw new Error(`TMDB trending failed: ${res.status}`);
+        return (await res.json()).results as T[];
+      })
+    )
+  );
+  return responses.flat();
+}
+
+export async function discoverTMDBTrendingMovies(limit = 20, pages = 1): Promise<TrendingRow[]> {
   const genreMap = await tmdbGenreMap("movie");
-  const url = `https://api.themoviedb.org/3/trending/movie/week?api_key=${key()}`;
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`TMDB trending movies failed: ${res.status}`);
-  const data = await res.json();
-  const results = (data.results as TMDBDiscoverMovie[]).filter((m) => m.poster_path);
+  const results = (
+    await fetchTMDBTrendingPages<TMDBDiscoverMovie>(
+      (page) => `https://api.themoviedb.org/3/trending/movie/week?api_key=${key()}&page=${page}`,
+      pages
+    )
+  ).filter((m) => m.poster_path);
   return results.slice(0, limit).map((m, i) => ({
     id: `movie:${m.id}`,
     type: "movie",
@@ -647,13 +673,14 @@ export async function discoverTMDBTrendingMovies(limit = 20): Promise<TrendingRo
   }));
 }
 
-export async function discoverTMDBTrendingTV(limit = 20): Promise<TrendingRow[]> {
+export async function discoverTMDBTrendingTV(limit = 20, pages = 1): Promise<TrendingRow[]> {
   const genreMap = await tmdbGenreMap("tv");
-  const url = `https://api.themoviedb.org/3/trending/tv/week?api_key=${key()}`;
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`TMDB trending TV failed: ${res.status}`);
-  const data = await res.json();
-  const results = (data.results as TMDBDiscoverShow[]).filter((s) => s.poster_path);
+  const results = (
+    await fetchTMDBTrendingPages<TMDBDiscoverShow>(
+      (page) => `https://api.themoviedb.org/3/trending/tv/week?api_key=${key()}&page=${page}`,
+      pages
+    )
+  ).filter((s) => s.poster_path);
   return results.slice(0, limit).map((s, i) => ({
     id: `tvShow:${s.id}`,
     type: "tvShow",
