@@ -5,9 +5,34 @@ import { X, Play, Plus, Check, Star, Bell, BellOff } from "lucide-react";
 import type { MediaItem } from "@/lib/types";
 import { WATCHLIST_LABEL, type DugoutStatus, type DugoutType } from "@/lib/dugout";
 import { describeRelease, formatTime } from "@/lib/feed";
-import { getPreferredPlatforms, isPreferredProvider } from "@/lib/platformPrefs";
+import {
+  getPreferredPlatforms,
+  isPreferredProvider,
+  platformKindFor,
+  getShowOnlyPreferred,
+  type PlatformKind,
+} from "@/lib/platformPrefs";
 import { fetchPrefs, setItemMuted } from "@/lib/push-client";
 import TypeTag from "./TypeTag";
+import type { LinkKind } from "@/lib/types";
+
+// "Available on" is grouped by kind rather than one flat list — a title
+// that's flatrate somewhere and rent/buy-only elsewhere used to render as
+// identical-looking pills with no way to tell which is which (verified
+// live feedback: users assumed a rent-only listing was a subscription).
+// TMDB's free API has no per-title price data (that's JustWatch's
+// commercial-only API), so Rent/Buy pills link to the storefront's own
+// search instead of a price — see lib/sources/tmdb.ts's provider-matching
+// comments for the full story. "store" (game storefronts) and "info"
+// (last-resort fallback, e.g. a bare TMDB page) round out the kinds any
+// source actually emits.
+const KIND_GROUPS: [LinkKind, string][] = [
+  ["stream", "Stream"],
+  ["rent", "Rent"],
+  ["buy", "Buy"],
+  ["store", "Available on"],
+  ["info", "More info"],
+];
 
 export default function DetailModal({
   item,
@@ -23,7 +48,16 @@ export default function DetailModal({
   onClose: () => void;
 }) {
   const [full, setFull] = useState<MediaItem>(item);
-  const [preferred, setPreferred] = useState<string[]>([]);
+  // Keyed by kind — Streaming and Rent & Buy are separate preferences now
+  // (see lib/platformPrefs.ts), so each KIND_GROUPS section below judges
+  // "preferred" against its own list, not one shared one.
+  const [preferred, setPreferred] = useState<Record<PlatformKind, string[]>>({
+    stream: [],
+    rentBuy: [],
+    store: [],
+    music: [],
+  });
+  const [showOnlyPreferred, setShowOnlyPreferredState] = useState(false);
   // null = mute control hidden (not followed, or push never enabled on this
   // device — there's no subscription for a mute to act on).
   const [muted, setMuted] = useState<boolean | null>(null);
@@ -40,7 +74,15 @@ export default function DetailModal({
   const [dugoutBusy, setDugoutBusy] = useState(false);
   const [dugoutError, setDugoutError] = useState<string | null>(null);
 
-  useEffect(() => setPreferred(getPreferredPlatforms()), []);
+  useEffect(() => {
+    setPreferred({
+      stream: getPreferredPlatforms("stream"),
+      rentBuy: getPreferredPlatforms("rentBuy"),
+      store: getPreferredPlatforms("store"),
+      music: getPreferredPlatforms("music"),
+    });
+    setShowOnlyPreferredState(getShowOnlyPreferred());
+  }, []);
 
   useEffect(() => {
     if (!dugoutEligible) return;
@@ -123,13 +165,14 @@ export default function DetailModal({
 
   const episodes = full.episodes
     ? [...full.episodes].sort((a, b) => {
-        // Specials (season 0) sorted after every real season, not first —
-        // otherwise a show's special episodes bury the actual season 1
-        // opener at the top of the list.
+        // Most recent first — matches how every other list in the app
+        // reads (newest release at the top). Specials (season 0) still
+        // sorted after every real season rather than first, so they don't
+        // bury the actual most recent episode at the top of the list.
         if (a.season === 0 && b.season !== 0) return 1;
         if (b.season === 0 && a.season !== 0) return -1;
-        if (a.season !== b.season) return a.season - b.season;
-        return a.episode - b.episode;
+        if (a.season !== b.season) return b.season - a.season;
+        return b.episode - a.episode;
       })
     : undefined;
 
@@ -227,6 +270,19 @@ export default function DetailModal({
               </div>
             </div>
 
+            {full.reviewScores && (
+              <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] font-medium text-subtle">
+                {full.reviewScores.rottenTomatoes !== undefined && (
+                  <span className={full.reviewScores.rottenTomatoes >= 60 ? "text-accent" : ""}>
+                    RT {full.reviewScores.rottenTomatoes}%
+                  </span>
+                )}
+                {full.reviewScores.imdb !== undefined && <span>IMDb {full.reviewScores.imdb}</span>}
+                {full.reviewScores.metacritic !== undefined && <span>Metacritic {full.reviewScores.metacritic}</span>}
+                {full.reviewScores.igdb !== undefined && <span>IGDB {full.reviewScores.igdb}%</span>}
+              </div>
+            )}
+
             {dugoutEligible && (
               <div className="mt-4">
                 <h2 className="mb-2 text-[12.5px] font-semibold uppercase tracking-wide text-subtle">
@@ -261,41 +317,58 @@ export default function DetailModal({
             )}
 
             {full.externalLinks && full.externalLinks.length > 0 && (
-            <div className="mt-5">
-              <h2 className="mb-2 text-[12.5px] font-semibold uppercase tracking-wide text-subtle">
-                Available on
-              </h2>
-              <div className="flex flex-wrap gap-2">
-                {[...full.externalLinks]
-                  .sort((a, b) => {
-                    const aPref = isPreferredProvider(a.provider, preferred);
-                    const bPref = isPreferredProvider(b.provider, preferred);
-                    return aPref === bPref ? 0 : aPref ? -1 : 1;
-                  })
-                  .map((l) => {
-                    const isPreferred = isPreferredProvider(l.provider, preferred);
-                    return (
-                      <a
-                        key={`${l.provider}-${l.kind}-${l.url}`}
-                        href={l.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[13px] font-medium transition-all duration-200 hover:-translate-y-0.5 ${
-                          isPreferred
-                            ? "bg-accent/12 text-accent ring-1 ring-accent/40 hover:bg-accent/18"
-                            : "bg-canvas text-ink hover:bg-hairline/60"
-                        }`}
-                      >
-                        {isPreferred ? (
-                          <Star size={12} className="fill-accent text-accent" />
-                        ) : (
-                          <Play size={12} className="fill-ink text-ink" />
-                        )}
-                        {l.provider}
-                      </a>
-                    );
-                  })}
-              </div>
+            <div className="mt-5 space-y-3.5">
+              {KIND_GROUPS.map(([kind, heading]) => {
+                const kindPreferred = preferred[platformKindFor(kind)];
+                const allLinks = full.externalLinks!.filter((l) => l.kind === kind);
+                // "Only show preferred" hides non-preferred entries entirely
+                // rather than just deprioritizing them (see
+                // lib/platformPrefs.ts's getShowOnlyPreferred) — a section
+                // with nothing preferred in it just doesn't render, same as
+                // if the title genuinely had no entries of that kind.
+                const links = showOnlyPreferred
+                  ? allLinks.filter((l) => isPreferredProvider(l.provider, kindPreferred))
+                  : allLinks;
+                if (links.length === 0) return null;
+                return (
+                  <div key={kind}>
+                    <h2 className="mb-2 text-[12.5px] font-semibold uppercase tracking-wide text-subtle">
+                      {heading}
+                    </h2>
+                    <div className="flex flex-wrap gap-2">
+                      {[...links]
+                        .sort((a, b) => {
+                          const aPref = isPreferredProvider(a.provider, kindPreferred);
+                          const bPref = isPreferredProvider(b.provider, kindPreferred);
+                          return aPref === bPref ? 0 : aPref ? -1 : 1;
+                        })
+                        .map((l) => {
+                          const isPreferred = isPreferredProvider(l.provider, kindPreferred);
+                          return (
+                            <a
+                              key={`${l.provider}-${l.kind}-${l.url}`}
+                              href={l.url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[13px] font-medium transition-all duration-200 hover:-translate-y-0.5 ${
+                                isPreferred
+                                  ? "bg-accent/12 text-accent ring-1 ring-accent/40 hover:bg-accent/18"
+                                  : "bg-canvas text-ink hover:bg-hairline/60"
+                              }`}
+                            >
+                              {isPreferred ? (
+                                <Star size={12} className="fill-accent text-accent" />
+                              ) : (
+                                <Play size={12} className="fill-ink text-ink" />
+                              )}
+                              {l.provider}
+                            </a>
+                          );
+                        })}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
 

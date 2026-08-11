@@ -68,4 +68,17 @@ export interface MediaItem {
   episodeCount?: number; // TV shows only
   releases?: ReleaseGroupInfo[]; // artists only — discography, newest first
   theme?: MediaTheme; // franchise items only
+  reviewScores?: ReviewScores;
+}
+
+// Movies/TV: OMDb (Rotten Tomatoes has no public API of its own — see
+// lib/sources/omdb.ts). Games: IGDB's own total_rating, already on hand
+// from the same request that gets everything else — no second source
+// needed. Never set for artist/manga/franchise — no viable free review-
+// score API exists for music, and manga/collections were never in scope.
+export interface ReviewScores {
+  rottenTomatoes?: number; // 0-100
+  imdb?: number; // 0-10
+  metacritic?: number; // 0-100
+  igdb?: number; // 0-100
 }

@@ -54,9 +54,11 @@ export default function ArtistPage({ params }: { params: { id: string } }) {
   // Was never wired in here at all — the external links below rendered
   // identically regardless of Settings' Preferred Platforms picks, unlike
   // DetailModal's own "Available on" section (see there for the same logic).
+  // Always the "music" preference bucket — every link this page ever shows
+  // is a music platform (see lib/sources/artist.ts's artistPlatformLinks).
   const [preferred, setPreferred] = useState<string[]>([]);
 
-  useEffect(() => setPreferred(getPreferredPlatforms()), []);
+  useEffect(() => setPreferred(getPreferredPlatforms("music")), []);
 
   useEffect(() => {
     setLoading(true);

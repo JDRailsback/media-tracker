@@ -154,6 +154,7 @@ async function refreshFollowedTVShows(): Promise<number> {
         nextEpisodeToAir: extra.nextEpisodeToAir,
         imdbId: extra.imdbId,
         networks: extra.networks,
+        reviewScores: extra.reviewScores,
       },
       tags: extra.tags,
       originalLanguage: row.original_language ?? undefined,

@@ -1,9 +1,10 @@
-import type { EpisodeInfo, ExternalLink, LinkKind, MediaItem } from "@/lib/types";
+import type { EpisodeInfo, ExternalLink, LinkKind, MediaItem, ReviewScores } from "@/lib/types";
 import type { CatalogRow } from "@/lib/catalog";
 import type { UpcomingRow } from "@/lib/upcoming";
 import type { TrendingRow } from "@/lib/trending";
 import { isExactMatch, RankedItem } from "./textMatch";
 import { mapWithConcurrency, withRetries } from "./concurrency";
+import { fetchOMDbRatings } from "./omdb";
 
 // TMDB adapter (TS port). Maps TMDB's JSON into our MediaItem.
 // Runs server-side only (in an API route), so TMDB_API_KEY stays secret.
@@ -741,7 +742,7 @@ const PROVIDER_SEARCH_RULES: { pattern: string; provider: string; searchURL: (ti
   { pattern: "apple", provider: "Apple TV+", searchURL: (t) => `https://tv.apple.com/search?term=${encodeURIComponent(t)}` },
   { pattern: "google play", provider: "Google Play Movies", searchURL: (t) => `https://play.google.com/store/search?q=${encodeURIComponent(t)}&c=movies` },
   { pattern: "youtube", provider: "YouTube", searchURL: (t) => `https://www.youtube.com/results?search_query=${encodeURIComponent(t)}` },
-  { pattern: "amazon", provider: "Amazon Video", searchURL: (t) => `https://www.amazon.com/s?k=${encodeURIComponent(t)}&i=instant-video` },
+  { pattern: "amazon", provider: "Prime Video", searchURL: (t) => `https://www.amazon.com/s?k=${encodeURIComponent(t)}&i=instant-video` },
 ];
 
 function matchesPattern(name: string, pattern: string): boolean {
@@ -749,8 +750,80 @@ function matchesPattern(name: string, pattern: string): boolean {
   return new RegExp(`\\b${escaped}\\b`, "i").test(name);
 }
 
+// TMDB gives the subscription service and the transactional store DIFFERENT
+// literal provider_name strings — verified live against real responses:
+// the Apple TV+ subscription is "Apple TV" (flatrate/free only), while the
+// pay-per-title storefront is the DISTINCT "Apple TV Store" (rent/buy only).
+// PROVIDER_SEARCH_RULES' plain "apple" substring pattern matched both and
+// collapsed them onto one label — verified live: a movie rentable ONLY on
+// "Apple TV Store" was showing as bare "Apple TV+", implying it was
+// included with the subscription. Amazon rebranded ALL of its video
+// offerings — the flatrate subscription ("Amazon Prime Video"/"...with
+// Ads") AND the pay-per-title store ("Amazon Video") — under one "Prime
+// Video" name in 2023, so both collapse to the SAME label here on purpose
+// (explicit request — the UI's Stream/Rent/Buy grouping already tells them
+// apart, a second distinct name would just be stale branding). "YouTube
+// TV" (a live-TV subscription bundle) is its own real service, not the
+// youtube.com rental storefront — PROVIDER_SEARCH_RULES' "youtube" pattern
+// would otherwise match "YouTube TV" as a substring and mislabel it plain
+// "YouTube," implying free rental availability it doesn't have. These
+// exact-name overrides are checked first so cases like this get their own
+// correctly-branded label; only after this table misses does the generic
+// substring table below run.
+const EXACT_PROVIDER_OVERRIDES: Record<string, { provider: string; searchURL: (title: string) => string }> = {
+  "apple tv store": { provider: "Apple TV", searchURL: (t) => `https://tv.apple.com/search?term=${encodeURIComponent(t)}` },
+  "amazon video": { provider: "Prime Video", searchURL: (t) => `https://www.amazon.com/s?k=${encodeURIComponent(t)}&i=instant-video` },
+  "amazon prime video": { provider: "Prime Video", searchURL: (t) => `https://www.amazon.com/gp/video/search?phrase=${encodeURIComponent(t)}` },
+  "amazon prime video with ads": { provider: "Prime Video", searchURL: (t) => `https://www.amazon.com/gp/video/search?phrase=${encodeURIComponent(t)}` },
+  "youtube tv": { provider: "YouTube TV", searchURL: () => `https://tv.youtube.com/` },
+};
+
+// Reseller "channel" bundles TMDB names as "{real brand} {reseller} Channel"
+// (e.g. "Starz Amazon Channel", "Apple TV Amazon Channel") — a separate
+// billing path for a subscription the title is already reachable through
+// directly. Dropped outright rather than resolved to a label (explicit
+// call — these read as noisy/redundant duplicates of the real service,
+// not a distinct way to watch): every provider entry ending in one of
+// these reseller suffixes is skipped before it ever reaches the rule
+// tables below.
+const CHANNEL_SUFFIX_RE = /\s+(?:Amazon|Apple TV|Roku Premium|Google Play)\s+Channel$/i;
+
 interface TMDBProviderEntry {
   provider_name: string;
+}
+
+function resolveProvider(name: string, title: string): { provider: string; url: string } | null {
+  if (CHANNEL_SUFFIX_RE.test(name)) return null;
+
+  const exact = EXACT_PROVIDER_OVERRIDES[name.toLowerCase().trim()];
+  if (exact) return { provider: exact.provider, url: exact.searchURL(title) };
+
+  for (const rule of PROVIDER_SEARCH_RULES) {
+    if (matchesPattern(name, rule.pattern)) return { provider: rule.provider, url: rule.searchURL(title) };
+  }
+  return null;
+}
+
+// A title that's genuinely, natively on Amazon Prime Video shows ONLY
+// "Amazon Prime Video"/"...with Ads" in flatrate. Verified live on "Silo"
+// (Apple TV+ exclusive) that JustWatch/TMDB's data ALSO lists bare "Amazon
+// Prime Video" right alongside "Apple TV" (the real home) and "Apple TV
+// Amazon Channel" (the actual Amazon offering — access to Apple TV+'s
+// catalog THROUGH Prime Video's Channels feature, not Prime Video's own
+// library) — i.e. the channel pass-through gets duplicated onto the base
+// Amazon entry too, not just its own channel entry (which is already
+// dropped above). Detected the same way: a title only earns this
+// suppression when both a "{brand} Amazon Channel" entry AND that brand's
+// own native entry are present in the SAME flatrate list — that pairing is
+// the actual evidence of channel-only access, not a real direct Prime
+// Video license.
+function hasAmazonChannelPassthrough(list: TMDBProviderEntry[] | undefined): boolean {
+  if (!list) return false;
+  const names = new Set(list.map((p) => p.provider_name));
+  return list.some((p) => {
+    const m = /^(.+?)\s+Amazon\s+Channel$/i.exec(p.provider_name);
+    return m !== null && names.has(m[1].trim());
+  });
 }
 
 function providerSearchLinks(
@@ -760,12 +833,15 @@ function providerSearchLinks(
   if (!country) return [];
   const seen = new Set<string>();
   const links: ExternalLink[] = [];
+  const suppressAmazonPrime = hasAmazonChannelPassthrough(country.flatrate);
   const scan = (list: TMDBProviderEntry[] | undefined, kind: LinkKind) => {
     for (const p of list ?? []) {
-      const rule = PROVIDER_SEARCH_RULES.find((r) => matchesPattern(p.provider_name, r.pattern));
-      if (!rule || seen.has(rule.provider)) continue;
-      seen.add(rule.provider);
-      links.push({ provider: rule.provider, url: rule.searchURL(title), kind });
+      if (kind === "stream" && suppressAmazonPrime && /^amazon prime video/i.test(p.provider_name)) continue;
+      const resolved = resolveProvider(p.provider_name, title);
+      const key = `${resolved?.provider ?? p.provider_name}:${kind}`;
+      if (!resolved || seen.has(key)) continue;
+      seen.add(key);
+      links.push({ provider: resolved.provider, url: resolved.url, kind });
     }
   };
   scan(country.flatrate, "stream");
@@ -813,6 +889,7 @@ export async function movieExtra(
   // zero extra TMDB calls.
   usReleaseDate?: string;
   fetchOk: boolean;
+  reviewScores?: ReviewScores;
 }> {
   try {
     return await withRetries(async () => {
@@ -826,6 +903,10 @@ export async function movieExtra(
         tags: movieTags(d),
         usReleaseDate: usTheatricalDate(d.release_dates),
         fetchOk: true,
+        // A movie's imdb_id is on this same top-level response — no extra
+        // TMDB request needed, just one more (already-budgeted, see
+        // lib/sources/omdb.ts) OMDb call.
+        reviewScores: await fetchOMDbRatings(typeof d.imdb_id === "string" ? d.imdb_id : undefined),
       };
     });
   } catch {
@@ -882,7 +963,10 @@ async function enrichMovieRows(rows: CatalogRow[], onEnrich?: (done: number, tot
   await mapWithConcurrency(rows, MOVIE_DETAIL_CONCURRENCY, async (row) => {
     const tmdbId = Number(row.id.split(":")[1]);
     const extra = await movieExtra(tmdbId, row.title);
-    row.metadata = { runtimeMinutes: extra.runtimeMinutes };
+    // reviewScores lives in metadata (read back by catalogRowToMediaItem)
+    // rather than its own column — same treatment as runtimeMinutes here,
+    // no schema migration needed for a field this small.
+    row.metadata = { runtimeMinutes: extra.runtimeMinutes, reviewScores: extra.reviewScores };
     row.externalLinks = extra.externalLinks;
     row.tags = extra.tags;
     if (extra.usReleaseDate) row.releaseDate = extra.usReleaseDate;
@@ -984,6 +1068,7 @@ export async function tvExtra(
   // authoritative source — used as a fallback in catalogRowToMediaItem
   // when scanning the season list doesn't turn one up.
   nextEpisodeToAir?: { season: number; episode: number; airDate: string };
+  reviewScores?: ReviewScores;
 }> {
   try {
     return await withRetries(async () => {
@@ -1054,6 +1139,7 @@ export async function tvExtra(
               airDate: d.next_episode_to_air.air_date,
             }
           : undefined,
+        reviewScores: await fetchOMDbRatings(d.external_ids?.imdb_id ?? undefined),
       };
     });
   } catch {
@@ -1119,6 +1205,7 @@ async function enrichTVRows(rows: CatalogRow[], onEnrich?: (done: number, total:
       imdbId: extra.imdbId,
       // Consumed by lib/streamingSchedules.ts's known-platform heuristic.
       networks: extra.networks,
+      reviewScores: extra.reviewScores,
     };
     row.externalLinks = extra.externalLinks;
     row.tags = extra.tags;

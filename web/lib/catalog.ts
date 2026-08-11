@@ -1,4 +1,4 @@
-import type { EpisodeInfo, ExternalLink, MediaItem, MediaType, ReleaseGroupInfo } from "@/lib/types";
+import type { EpisodeInfo, ExternalLink, MediaItem, MediaType, ReleaseGroupInfo, ReviewScores } from "@/lib/types";
 import { db, ensureSchema } from "@/lib/db";
 import type { RankedItem } from "@/lib/sources/textMatch";
 import { excludeHiddenSQL, type ContentCategory } from "@/lib/contentFilters";
@@ -178,6 +178,7 @@ export function catalogRowToMediaItem(row: CatalogDBRow): MediaItem {
   const type = row.type as MediaType;
   const metadata = parseJSON<Record<string, unknown>>(row.metadata, {});
   const externalLinks = parseJSON<ExternalLink[]>(row.external_links, []);
+  const reviewScores = metadata.reviewScores as ReviewScores | undefined;
 
   let subtitle: string | undefined;
   let episodes: EpisodeInfo[] | undefined;
@@ -267,6 +268,7 @@ export function catalogRowToMediaItem(row: CatalogDBRow): MediaItem {
     episodes,
     episodeCount,
     releases,
+    reviewScores,
   };
 }
 

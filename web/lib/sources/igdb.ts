@@ -31,6 +31,11 @@ interface IGDBGame {
   cover?: { url?: string };
   first_release_date?: number; // Unix seconds
   total_rating_count?: number;
+  // IGDB's own blended critic+user score, 0-100 — already on this same
+  // request (no separate ratings API/call needed, unlike movies/TV — see
+  // lib/sources/omdb.ts). Distinct from total_rating_count (a VOLUME used
+  // for the quality bar/popularity, above) — this is the actual score.
+  total_rating?: number;
   hypes?: number;
   game_type?: number | null;
 }
@@ -214,7 +219,7 @@ function mapGame(g: IGDBGame): MediaItem {
   };
 }
 
-const SEARCH_FIELDS = "name,summary,cover.url,first_release_date,total_rating_count,hypes,game_type";
+const SEARCH_FIELDS = "name,summary,cover.url,first_release_date,total_rating_count,total_rating,hypes,game_type";
 
 // Wide hero art for the detail card (see MediaItem.backdropURL). Games have
 // no TMDB-style "backdrop" concept; IGDB's closest equivalents, in
@@ -520,7 +525,10 @@ function gameToCatalogRow(g: IGDBGameWithGenres): CatalogRow {
     // undefined rather than falling back to IGDB's own page (that
     // fallback only happens in detailsIGDB, for the live single-item view).
     externalLinks: storeLinks(g.websites) ?? [],
-    metadata: { platforms: (g.platforms ?? []).map((p) => p.name) },
+    metadata: {
+      platforms: (g.platforms ?? []).map((p) => p.name),
+      reviewScores: typeof g.total_rating === "number" ? { igdb: Math.round(g.total_rating) } : undefined,
+    },
     tags: [
       ...new Set(
         [...(g.franchises ?? []), ...(g.keywords ?? []), ...(g.themes ?? [])]

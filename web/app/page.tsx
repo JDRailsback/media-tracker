@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
-import { Search as SearchIcon, Bell, Sparkles, ArrowLeft, Plus, X, Calendar as CalendarIcon, Play } from "lucide-react";
+import { Search as SearchIcon, Bell, Sparkles, ArrowLeft, Plus, X, Calendar as CalendarIcon, Play, Filter as FilterIcon } from "lucide-react";
 import type { MediaItem } from "@/lib/types";
 import { WATCHLIST_LABEL, type DugoutGroups, type DugoutStatus, type DugoutType } from "@/lib/dugout";
 import { addFollow, getFollowed, isFollowed, removeFollow, replaceFollowed, FollowedItem } from "@/lib/library";
@@ -64,6 +64,17 @@ const SEARCH_TYPE_FILTERS: { value: string; label: string }[] = [
   { value: "game", label: "Games" },
   { value: "artist", label: "Music" },
   { value: "franchise", label: "Collections" },
+];
+
+// No "Collections" here (unlike SEARCH_TYPE_FILTERS above) — Home already
+// excludes franchises entirely (see homeItems), so a chip for them would
+// only ever show empty.
+const HOME_TYPE_FILTERS: { value: MediaItem["type"] | "all"; label: string }[] = [
+  { value: "all", label: "All" },
+  { value: "movie", label: "Movies" },
+  { value: "tvShow", label: "TV" },
+  { value: "game", label: "Games" },
+  { value: "artist", label: "Music" },
 ];
 
 // Categories whose "see all" grid should also show the date pill — mirrors
@@ -430,6 +441,17 @@ export default function Home() {
   // fighting their choice.
   const [heroIndex, setHeroIndex] = useState(0);
   const [heroPaused, setHeroPaused] = useState(false);
+
+  // Home feed filters — media type narrows the underlying item list (so it
+  // affects the hero spotlight too, same as everything else derived from
+  // homeItems below); date narrows which of buildFeed's own groups render,
+  // keyed off the SAME group.key values buildFeed already produces (plus a
+  // synthetic "today" for the hero) rather than a second, independent
+  // date-bucketing scheme that could disagree with the section headers
+  // actually on screen.
+  const [homeTypeFilter, setHomeTypeFilter] = useState<MediaItem["type"] | "all">("all");
+  const [homeDateFilter, setHomeDateFilter] = useState<string>("all");
+  const [homeFilterOpen, setHomeFilterOpen] = useState(false);
 
   // Notifications — fetched on mount regardless of active view so the
   // Sidebar's unread badge is accurate everywhere. readIds mirrors the
@@ -928,11 +950,18 @@ export default function Home() {
     }
   }
 
+  // Type filter narrows the underlying list itself (not just what's
+  // rendered) — separate from homeItems above, which the sidebar Calendar
+  // tab also reads and must stay showing everything regardless of Home's
+  // own filter state.
+  const typeFilteredHomeItems =
+    homeTypeFilter === "all" ? homeItems : homeItems.filter((f) => f.type === homeTypeFilter);
+
   // The recap hero: EVERY item releasing today, and nothing else — no
   // "nearest upcoming" fallback when nothing's releasing today; the hero
   // simply doesn't render (see heroItems.length > 0 checks below). Pulled
   // OUT of the schedule below so nothing is shown twice.
-  const heroItems = homeItems
+  const heroItems = typeFilteredHomeItems
     .map((item) => ({ item, info: describeRelease(item) }))
     .filter((x): x is { item: FollowedItem; info: NonNullable<ReturnType<typeof describeRelease>> } =>
       x.info !== null && x.info.diffDays === 0
@@ -953,7 +982,18 @@ export default function Home() {
     });
   const heroIds = new Set(heroItems.map((x) => x.item.id));
 
-  const feed = buildFeed(homeItems.filter((f) => !heroIds.has(f.id)));
+  // "today" is a synthetic key standing in for the hero above — it isn't
+  // one of buildFeed's own bucket keys (diffDays===0 is deliberately
+  // excluded from its groups, see buildFeed's own comment), so it needs
+  // its own case here to be filterable the same way as every real bucket.
+  const showHero = homeDateFilter === "all" || homeDateFilter === "today";
+  const fullFeed = buildFeed(typeFilteredHomeItems.filter((f) => !heroIds.has(f.id)));
+  const feed = homeDateFilter === "all" ? fullFeed : fullFeed.filter((g) => g.key === homeDateFilter);
+  const dateFilterOptions: { key: string; title: string }[] = [
+    { key: "all", title: "All dates" },
+    ...(heroItems.length > 0 ? [{ key: "today", title: "Today" }] : []),
+    ...fullFeed.map((g) => ({ key: g.key, title: g.title })),
+  ];
 
   // Reset the spotlight whenever the set of hero items changes (a follow, a
   // date rollover, the freshness overlay landing) — a stale index could
@@ -1011,17 +1051,40 @@ export default function Home() {
       >
         {view === "feed" && (
           <>
-            <PageHeader title="Home" subtitle="What's new with what you follow." />
-            {heroItems.length === 0 && feed.length === 0 ? (
+            <PageHeader
+              title="Home"
+              subtitle="What's new with what you follow."
+              actions={
+                homeItems.length > 0 && (
+                  <HomeFilterButton
+                    open={homeFilterOpen}
+                    onToggle={() => setHomeFilterOpen((v) => !v)}
+                    onClose={() => setHomeFilterOpen(false)}
+                    typeFilter={homeTypeFilter}
+                    onTypeFilter={setHomeTypeFilter}
+                    dateFilter={homeDateFilter}
+                    onDateFilter={setHomeDateFilter}
+                    dateOptions={dateFilterOptions}
+                  />
+                )
+              }
+            />
+            {(!showHero || heroItems.length === 0) && feed.length === 0 ? (
               <EmptyState
                 icon={<Sparkles size={22} className="text-subtle" />}
-                title="You're all caught up"
-                text="Follow a movie, show, or game in Discover to see release updates here."
+                title={
+                  homeTypeFilter !== "all" || homeDateFilter !== "all" ? "Nothing matches this filter" : "You're all caught up"
+                }
+                text={
+                  homeTypeFilter !== "all" || homeDateFilter !== "all"
+                    ? "Try a different type or date range."
+                    : "Follow a movie, show, or game in Discover to see release updates here."
+                }
               />
             ) : (
               <div className={continueItems.length > 0 ? "md:grid md:grid-cols-[1fr_208px] md:gap-10" : ""}>
               <div className="space-y-10">
-                {heroItems.length > 0 &&
+                {showHero && heroItems.length > 0 &&
                   (() => {
                     // Spotlight pager: every today-release gets the FULL
                     // recap treatment (big art, headline, one breath of
@@ -1810,11 +1873,108 @@ export default function Home() {
   );
 }
 
-function PageHeader({ title, subtitle }: { title: string; subtitle?: string }) {
+function PageHeader({
+  title,
+  subtitle,
+  actions,
+}: {
+  title: string;
+  subtitle?: string;
+  // Optional trailing control (currently just Home's filter button) — kept
+  // on this shared row instead of its own line below so it doesn't compete
+  // for attention the way a permanently-visible filter bar did (see
+  // HomeFilterButton's comment).
+  actions?: ReactNode;
+}) {
   return (
-    <div className="mb-7 animate-fade-up">
-      <h1 className="text-[28px] font-bold tracking-tight text-ink">{title}</h1>
-      {subtitle && <p className="mt-1.5 text-[14px] text-subtle">{subtitle}</p>}
+    <div className="mb-7 flex items-start justify-between gap-3 animate-fade-up">
+      <div>
+        <h1 className="text-[28px] font-bold tracking-tight text-ink">{title}</h1>
+        {subtitle && <p className="mt-1.5 text-[14px] text-subtle">{subtitle}</p>}
+      </div>
+      {actions}
+    </div>
+  );
+}
+
+// A permanently-visible chip row + date select ate a full extra row under
+// the header on every visit, even doing nothing (explicit feedback: "This
+// looks bad"). Collapsed into one small button that opens a popover with
+// the same two controls — a filled dot on the button is the only thing
+// visible when a filter is actually narrowing the feed.
+function HomeFilterButton({
+  open,
+  onToggle,
+  onClose,
+  typeFilter,
+  onTypeFilter,
+  dateFilter,
+  onDateFilter,
+  dateOptions,
+}: {
+  open: boolean;
+  onToggle: () => void;
+  onClose: () => void;
+  typeFilter: MediaItem["type"] | "all";
+  onTypeFilter: (v: MediaItem["type"] | "all") => void;
+  dateFilter: string;
+  onDateFilter: (v: string) => void;
+  dateOptions: { key: string; title: string }[];
+}) {
+  const active = typeFilter !== "all" || dateFilter !== "all";
+  return (
+    <div className="relative shrink-0">
+      <button
+        onClick={onToggle}
+        className={`flex items-center gap-1.5 rounded-full px-3.5 py-2 text-[13px] font-medium transition-colors duration-150 ${
+          active ? "bg-accent/12 text-accent ring-1 ring-accent/40" : "bg-surface text-subtle hover:text-ink"
+        }`}
+      >
+        <FilterIcon size={14} />
+        Filter
+        {active && <span className="h-1.5 w-1.5 rounded-full bg-accent" aria-hidden />}
+      </button>
+      {open && (
+        <>
+          {/* Invisible click-away catcher, same technique as DetailModal's
+              backdrop — simpler than a document-level mousedown listener. */}
+          <div className="fixed inset-0 z-10" onClick={onClose} />
+          <div className="absolute right-0 top-full z-20 mt-2 w-64 space-y-3 rounded-xl bg-surface p-3.5 shadow-2xl ring-1 ring-hairline animate-fade-in">
+            <div>
+              <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-subtle">Type</div>
+              <div className="flex flex-wrap gap-1.5">
+                {HOME_TYPE_FILTERS.map(({ value, label }) => (
+                  <button
+                    key={value}
+                    onClick={() => onTypeFilter(value)}
+                    className={`rounded-full px-3 py-1.5 text-[13px] font-medium transition-colors duration-150 ${
+                      typeFilter === value ? "bg-accent text-on-accent" : "bg-canvas text-subtle hover:text-ink"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {dateOptions.length > 1 && (
+              <div>
+                <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-subtle">Date</div>
+                <select
+                  value={dateFilter}
+                  onChange={(e) => onDateFilter(e.target.value)}
+                  className="input w-full py-1.5 text-[13px]"
+                >
+                  {dateOptions.map((o) => (
+                    <option key={o.key} value={o.key}>
+                      {o.title}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }
