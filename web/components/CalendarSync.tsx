@@ -2,15 +2,16 @@
 
 import { useEffect, useState } from "react";
 import { useSession } from "next-auth/react";
+import Link from "next/link";
 import { Check, Copy } from "lucide-react";
 
 // Settings → "Calendar sync": the URL to subscribe to in Google Calendar /
-// Apple Calendar / Outlook ("Add calendar from URL"). Signed out (or before
-// any account ever existed), this is the app-wide unscoped URL exactly as
-// before. Signed in, the feed route requires a per-account ?token= (see
-// app/api/calendar/feed.ics) — session.user.calendarToken carries it here
-// (set in auth.ts's jwt/session callbacks) so the URL only ever exposes
-// this account's own follows.
+// Apple Calendar / Outlook ("Add calendar from URL"). Account-only — the
+// feed route (app/api/calendar/feed.ics) always requires a per-account
+// ?token= now (anonymous follows were removed entirely, so there's no
+// unscoped global list left to expose unauthenticated). session.user.
+// calendarToken carries it here (set in auth.ts's jwt/session callbacks)
+// so the URL only ever exposes this account's own follows.
 export default function CalendarSync() {
   const { data: session } = useSession();
   // Built client-side from the current origin so this works whether the
@@ -23,9 +24,18 @@ export default function CalendarSync() {
     setOrigin(window.location.origin);
   }, []);
 
-  const feedUrl = origin
-    ? `${origin}/api/calendar/feed.ics${session ? `?token=${session.user.calendarToken}` : ""}`
-    : "";
+  if (!session) {
+    return (
+      <p className="text-[13px] text-subtle">
+        <Link href="/signin" className="font-medium text-accent hover:underline">
+          Sign in
+        </Link>{" "}
+        to get your own calendar sync link.
+      </p>
+    );
+  }
+
+  const feedUrl = origin ? `${origin}/api/calendar/feed.ics?token=${session.user.calendarToken}` : "";
   // webcal:// is the one widely-recognized scheme for "open my OS/browser's
   // default calendar app's subscribe flow" — Apple Calendar and many
   // Google Calendar setups register it; the plain https URL above still

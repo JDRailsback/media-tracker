@@ -13,6 +13,7 @@ import { syncFollow } from "@/lib/push-client";
 import DetailModal from "@/components/DetailModal";
 import CollectionEditForm from "@/components/CollectionEditForm";
 import CollectionRow from "@/components/CollectionRow";
+import { useRequireAuth } from "@/lib/requireAuth";
 
 interface CollectionPayload {
   slug: string;
@@ -58,6 +59,7 @@ export default function CollectionPage({ params }: { params: { slug: string } })
   const collectionID = `franchise:${slug}`;
   const { data: session } = useSession();
   const isAdmin = !!session?.user?.isAdmin;
+  const requireAuth = useRequireAuth();
 
   const [data, setData] = useState<CollectionPayload | null>(null);
   const [loading, setLoading] = useState(true);
@@ -108,6 +110,7 @@ export default function CollectionPage({ params }: { params: { slug: string } })
   const selectedFollowed = selected ? checkFollowed(selected.id) : false;
 
   function toggleFollow() {
+    if (!requireAuth()) return;
     if (collectionFollowed) {
       removeFollow(collectionID);
       void syncFollow(collectionID, false);
@@ -302,11 +305,13 @@ export default function CollectionPage({ params }: { params: { slug: string } })
           item={selected}
           isFollowed={selectedFollowed}
           onFollow={(full) => {
+            if (!requireAuth()) return;
             addFollow(full);
             void syncFollow(full.id, true);
             setFollowVersion((v) => v + 1);
           }}
           onUnfollow={() => {
+            if (!requireAuth()) return;
             removeFollow(selected.id);
             void syncFollow(selected.id, false);
             setFollowVersion((v) => v + 1);

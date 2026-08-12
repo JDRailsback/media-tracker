@@ -155,17 +155,6 @@ function mapMovie(m: TMDBMovie): MediaItem {
   };
 }
 
-export async function detailsTMDBMovie(id: string): Promise<MediaItem> {
-  const url = `https://api.themoviedb.org/3/movie/${id}?api_key=${key()}&append_to_response=watch/providers`;
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`TMDB movie details failed: ${res.status}`);
-  const d = await res.json();
-  const base = mapMovie(d as TMDBMovie);
-  base.externalLinks =
-    watchLinks(d["watch/providers"]?.results?.US) ?? tmdbPageFallback("movie", id);
-  return base;
-}
-
 // Popular movies (for the Discover page's "Trending movies" shelf).
 export async function discoverTMDBMovies(limit = 20): Promise<MediaItem[]> {
   const url = `https://api.themoviedb.org/3/discover/movie?api_key=${key()}&sort_by=popularity.desc&vote_count.gte=100`;
@@ -520,18 +509,6 @@ async function allEpisodes(
     }
   });
   return episodes;
-}
-
-export async function detailsTMDBTV(id: string): Promise<MediaItem> {
-  const url = `https://api.themoviedb.org/3/tv/${id}?api_key=${key()}&append_to_response=watch/providers`;
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`TMDB TV details failed: ${res.status}`);
-  const d = await res.json();
-  const base = mapShow(d as TMDBShow);
-  base.externalLinks = watchLinks(d["watch/providers"]?.results?.US) ?? tmdbPageFallback("tv", id);
-  base.episodeCount = d.number_of_episodes;
-  base.episodes = await allEpisodes(id, d.seasons);
-  return base;
 }
 
 // Popular TV shows (for the Discover page's "Trending TV" shelf).
@@ -1442,27 +1419,6 @@ export async function tmdbCollectionParts(id: number): Promise<RankedItem[]> {
 }
 
 // ---------- Shared: watch providers ----------
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function watchLinks(country: any): ExternalLink[] | undefined {
-  if (!country?.link) return undefined;
-  const links: ExternalLink[] = [];
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const add = (list: any[] | undefined, kind: LinkKind) => {
-    for (const p of list ?? []) {
-      links.push({
-        provider: p.provider_name,
-        logoURL: p.logo_path ? `https://image.tmdb.org/t/p/w92${p.logo_path}` : undefined,
-        url: country.link,
-        kind,
-      });
-    }
-  };
-  add(country.flatrate, "stream");
-  add(country.rent, "rent");
-  add(country.buy, "buy");
-  return links.length ? links : undefined;
-}
 
 // TMDB has zero watch-provider data for some titles (verified live: "THE
 // GHOST IN THE SHELL," a brand-new show, has an entirely empty

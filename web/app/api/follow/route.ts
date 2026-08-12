@@ -4,23 +4,21 @@ import { auth } from "@/auth";
 
 // POST /api/follow  { itemID: "movie:603", subscription: <PushSubscription JSON> | null }
 //
-// `subscription` is OPTIONAL: a follow from a device that never enabled push
-// still registers the item in followed_items — the daily poll needs that row
-// to exist to log notification HISTORY for the item (see /api/poll and
-// notification_history in lib/db.ts). Delivering a push additionally
-// requires the subscription link, which is only created when a subscription
-// is supplied. Before this, a push-less follow left zero server-side trace,
-// which made a history page impossible for anyone who hadn't granted
-// notification permission.
-//
-// Signed-in requests scope the row to that account (user_id + active — see
-// lib/db.ts's schema comment on followed_items.active) instead of the old
-// global, unowned row; signed-out requests run exactly the original query
-// unchanged, targeting the partial index scoped to user_id IS NULL. Either
-// way, a supplied push subscription gets linked to the account too (when one
-// exists), so every device signed into an account becomes eligible for that
-// account's notifications without re-following anything per device.
+// Account-only — 401s without a session (see this file's own history: a
+// signed-out request used to write an unowned global row; that anonymous
+// mode was removed entirely). `subscription` is still OPTIONAL: a follow
+// from a device that never enabled push still registers the item in
+// followed_items — the daily poll needs that row to exist to log
+// notification HISTORY for the item (see /api/poll and notification_history
+// in lib/db.ts). Delivering a push additionally requires the subscription
+// link, which is only created when a subscription is supplied.
 export async function POST(request: Request) {
+  const session = await auth();
+  const userId = session?.user?.id ? Number(session.user.id) : null;
+  if (userId === null) {
+    return NextResponse.json({ error: "Not signed in" }, { status: 401 });
+  }
+
   const { itemID, subscription } = await request.json();
   if (!itemID) {
     return NextResponse.json({ error: "Missing itemID" }, { status: 400 });
@@ -35,22 +33,12 @@ export async function POST(request: Request) {
 
   await ensureSchema();
   const sql = db();
-  const session = await auth();
-  const userId = session?.user?.id ? Number(session.user.id) : null;
 
-  const itemRows = (
-    userId === null
-      ? await sql`
-          INSERT INTO followed_items (item_id, type, source_id)
-          VALUES (${itemID}, ${type}, ${sourceId})
-          ON CONFLICT (item_id) WHERE user_id IS NULL DO UPDATE SET item_id = EXCLUDED.item_id
-          RETURNING id`
-      : await sql`
-          INSERT INTO followed_items (item_id, type, source_id, user_id, active)
-          VALUES (${itemID}, ${type}, ${sourceId}, ${userId}, true)
-          ON CONFLICT (user_id, item_id) DO UPDATE SET active = true
-          RETURNING id`
-  ) as unknown as { id: number }[];
+  const itemRows = (await sql`
+    INSERT INTO followed_items (item_id, type, source_id, user_id, active)
+    VALUES (${itemID}, ${type}, ${sourceId}, ${userId}, true)
+    ON CONFLICT (user_id, item_id) DO UPDATE SET active = true
+    RETURNING id`) as unknown as { id: number }[];
   const followedItemId = itemRows[0].id;
 
   if (subscription?.endpoint && subscription?.keys) {

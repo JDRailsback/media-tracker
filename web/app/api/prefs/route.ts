@@ -5,15 +5,22 @@ import { auth } from "@/auth";
 // POST /api/prefs  { subscription, mutedTypes?, leadTimeDays? }
 // -> { mutedTypes, leadTimeDays, mutedItemIds }
 //
-// One route for both reading and updating this device's notification
-// preferences: with no update fields it just returns the current state.
-// Deliberately POST-only (no GET ?endpoint=...) — a push endpoint is a
-// capability URL, and query strings end up in server/proxy logs. These
-// preferences stay per-DEVICE even with accounts (a phone and a laptop can
-// reasonably want different mute settings) — only the account link on
-// push_subscriptions itself is new here, via the same COALESCE pattern
-// every other push_subscriptions upsert uses (see /api/follow, /subscribe).
+// Account-only — 401s without a session. One route for both reading and
+// updating this device's notification preferences: with no update fields
+// it just returns the current state. Deliberately POST-only (no GET
+// ?endpoint=...) — a push endpoint is a capability URL, and query strings
+// end up in server/proxy logs. These preferences stay per-DEVICE even with
+// accounts (a phone and a laptop can reasonably want different mute
+// settings) — only the account link on push_subscriptions itself is new
+// here, via the same COALESCE pattern every other push_subscriptions
+// upsert uses (see /api/follow, /subscribe).
 export async function POST(request: Request) {
+  const session = await auth();
+  const userId = session?.user?.id ? Number(session.user.id) : null;
+  if (userId === null) {
+    return NextResponse.json({ error: "Not signed in" }, { status: 401 });
+  }
+
   const { subscription, mutedTypes, leadTimeDays } = await request.json();
   if (!subscription?.endpoint || !subscription?.keys) {
     return NextResponse.json({ error: "Missing subscription" }, { status: 400 });
@@ -21,8 +28,6 @@ export async function POST(request: Request) {
 
   await ensureSchema();
   const sql = db();
-  const session = await auth();
-  const userId = session?.user?.id ? Number(session.user.id) : null;
 
   const subRows = await sql`
     INSERT INTO push_subscriptions (endpoint, p256dh, auth, user_id)

@@ -11,6 +11,7 @@ import { buildFeed, describeRelease, parseReleaseDay } from "@/lib/feed";
 import { currentSubscription, disablePush, enablePush, fetchPrefs, syncFollow } from "@/lib/push-client";
 import { getReadIds, markRead, timeAgo } from "@/lib/notificationHistory";
 import { LEAD_TIME_OPTIONS } from "@/lib/notificationPrefs";
+import { useRequireAuth } from "@/lib/requireAuth";
 import TypeMutes from "@/components/TypeMutes";
 import CalendarSync from "@/components/CalendarSync";
 import AccountSettings from "@/components/AccountSettings";
@@ -231,6 +232,7 @@ export default function Home() {
   const router = useRouter();
   const { data: session, status: sessionStatus } = useSession();
   const isAdmin = !!session?.user?.isAdmin;
+  const requireAuth = useRequireAuth();
   const [view, setView] = useState<View>("feed");
   const [selected, setSelected] = useState<MediaItem | null>(null);
   const [followed, setFollowed] = useState<FollowedItem[]>([]);
@@ -496,6 +498,20 @@ export default function Home() {
       })
       .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionStatus]);
+
+  // The mount effect above optimistically shows whatever's cached in
+  // localStorage before the session resolves — fine for the brief "loading"
+  // flash, but verified live that a signed-OUT viewer on a browser that had
+  // ever been signed in kept seeing that account's entire Home feed
+  // indefinitely, since nothing ever cleared the cache. Follow/Dugout/push
+  // are account-gated now (see lib/requireAuth.ts) — the display has to be
+  // too, or gating the write actions alone doesn't actually stop a
+  // signed-out viewer from seeing everything anyway.
+  useEffect(() => {
+    if (sessionStatus !== "unauthenticated") return;
+    replaceFollowed([]);
+    setFollowed([]);
   }, [sessionStatus]);
 
   const followedIdsKey = followed.map((f) => f.id).join(",");
@@ -815,12 +831,14 @@ export default function Home() {
   }
 
   function handleFollow(item: MediaItem) {
+    if (!requireAuth()) return;
     addFollow(item);
     void syncFollow(item.id, true);
     setFollowed(getFollowed());
   }
 
   function handleUnfollow(id: string) {
+    if (!requireAuth()) return;
     removeFollow(id);
     void syncFollow(id, false);
     setFollowed(getFollowed());
@@ -838,6 +856,10 @@ export default function Home() {
       setLeadTime(null);
       return;
     }
+    // Only ENABLING is account-gated — same reasoning as DELETE
+    // /api/subscribe being left ungated: turning something off should
+    // never require signing back in first.
+    if (!requireAuth()) return;
     try {
       const ok = await enablePush();
       setPushEnabled(ok);
@@ -1020,6 +1042,17 @@ export default function Home() {
       <AmbientBackground />
       {(() => {
         const handleNavChange = (v: View) => {
+          // Following/Calendar/Dugout/Notifications are all account data —
+          // same gate as the write actions (see lib/requireAuth.ts), just
+          // applied to NAVIGATING there at all rather than to an action
+          // once there. Home/Discover/Settings stay open (browsing and
+          // local-only settings never required an account).
+          if (
+            (v === "following" || v === "calendar" || v === "dugout" || v === "notifications") &&
+            !requireAuth()
+          ) {
+            return;
+          }
           // Clicking "Discover" again while already there clears any active
           // search/drill-down and returns to the landing shelves, instead of
           // doing nothing (React bails out on an unchanged state).
@@ -1073,12 +1106,18 @@ export default function Home() {
               <EmptyState
                 icon={<Sparkles size={22} className="text-subtle" />}
                 title={
-                  homeTypeFilter !== "all" || homeDateFilter !== "all" ? "Nothing matches this filter" : "You're all caught up"
+                  !session
+                    ? "Sign in to see what's new"
+                    : homeTypeFilter !== "all" || homeDateFilter !== "all"
+                      ? "Nothing matches this filter"
+                      : "You're all caught up"
                 }
                 text={
-                  homeTypeFilter !== "all" || homeDateFilter !== "all"
-                    ? "Try a different type or date range."
-                    : "Follow a movie, show, or game in Discover to see release updates here."
+                  !session
+                    ? "Home shows release updates for what you follow — sign in or create an account to start following things."
+                    : homeTypeFilter !== "all" || homeDateFilter !== "all"
+                      ? "Try a different type or date range."
+                      : "Follow a movie, show, or game in Discover to see release updates here."
                 }
               />
             ) : (

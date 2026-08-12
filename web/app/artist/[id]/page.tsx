@@ -11,6 +11,7 @@ import { getPreferredPlatforms, isPreferredProvider } from "@/lib/platformPrefs"
 import CollectionRow from "@/components/CollectionRow";
 import { DugoutPill } from "@/components/DetailModal";
 import { WATCHLIST_LABEL, type DugoutStatus } from "@/lib/dugout";
+import { useRequireAuth } from "@/lib/requireAuth";
 
 // Dedicated artist profile page — the music counterpart of
 // /collection/[slug], replacing the generic DetailModal for artists
@@ -36,6 +37,7 @@ function formatDay(iso: string): string {
 
 export default function ArtistPage({ params }: { params: { id: string } }) {
   const artistID = `artist:${params.id}`;
+  const requireAuth = useRequireAuth();
 
   const [item, setItem] = useState<MediaItem | null>(null);
   const [loading, setLoading] = useState(true);
@@ -90,16 +92,21 @@ export default function ArtistPage({ params }: { params: { id: string } }) {
   }, [artistID]);
 
   async function handleDugoutClick(status: DugoutStatus) {
+    if (!requireAuth()) return;
     const next = dugoutStatus === status ? null : status;
     setDugoutError(null);
     setDugoutBusy(true);
     try {
       if (next === null) {
-        await fetch("/api/dugout", {
+        const res = await fetch("/api/dugout", {
           method: "DELETE",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ itemID: artistID }),
         });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.error || "Something went wrong");
+        }
       } else {
         const res = await fetch("/api/dugout", {
           method: "POST",
@@ -139,6 +146,7 @@ export default function ArtistPage({ params }: { params: { id: string } }) {
 
   function toggleFollow() {
     if (!item) return;
+    if (!requireAuth()) return;
     if (followed) {
       removeFollow(artistID);
       void syncFollow(artistID, false);

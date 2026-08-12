@@ -3,14 +3,20 @@ import { db, ensureSchema } from "@/lib/db";
 import { auth } from "@/auth";
 
 // POST /api/mute  { itemID, subscription, muted }
-// Mute/unmute pushes for one followed item on ONE device (mute state lives
-// on subscription_follows — a phone and a laptop are separate
-// subscriptions, and that stays true with accounts: muting is a per-device
-// choice, not an account-wide one). Runs the same upsert chain as
-// /api/follow first, because the pairing may not exist yet: a user can
+// Account-only — 401s without a session. Mute/unmute pushes for one
+// followed item on ONE device (mute state lives on subscription_follows —
+// a phone and a laptop are separate subscriptions, so muting is a
+// per-device choice, not an account-wide one). Runs the same upsert chain
+// as /api/follow first, because the pairing may not exist yet: a user can
 // enable push AFTER having followed the item, and muting should still work
 // immediately.
 export async function POST(request: Request) {
+  const session = await auth();
+  const userId = session?.user?.id ? Number(session.user.id) : null;
+  if (userId === null) {
+    return NextResponse.json({ error: "Not signed in" }, { status: 401 });
+  }
+
   const { itemID, subscription, muted } = await request.json();
   if (!itemID || !subscription?.endpoint || !subscription?.keys || typeof muted !== "boolean") {
     return NextResponse.json({ error: "Missing itemID, subscription, or muted" }, { status: 400 });
@@ -25,8 +31,6 @@ export async function POST(request: Request) {
 
   await ensureSchema();
   const sql = db();
-  const session = await auth();
-  const userId = session?.user?.id ? Number(session.user.id) : null;
 
   const subRows = (await sql`
     INSERT INTO push_subscriptions (endpoint, p256dh, auth, user_id)
@@ -38,19 +42,11 @@ export async function POST(request: Request) {
     RETURNING id`) as unknown as { id: number }[];
   const subscriptionId = subRows[0].id;
 
-  const itemRows = (
-    userId === null
-      ? await sql`
-          INSERT INTO followed_items (item_id, type, source_id)
-          VALUES (${itemID}, ${type}, ${sourceId})
-          ON CONFLICT (item_id) WHERE user_id IS NULL DO UPDATE SET item_id = EXCLUDED.item_id
-          RETURNING id`
-      : await sql`
-          INSERT INTO followed_items (item_id, type, source_id, user_id, active)
-          VALUES (${itemID}, ${type}, ${sourceId}, ${userId}, true)
-          ON CONFLICT (user_id, item_id) DO UPDATE SET active = true
-          RETURNING id`
-  ) as unknown as { id: number }[];
+  const itemRows = (await sql`
+    INSERT INTO followed_items (item_id, type, source_id, user_id, active)
+    VALUES (${itemID}, ${type}, ${sourceId}, ${userId}, true)
+    ON CONFLICT (user_id, item_id) DO UPDATE SET active = true
+    RETURNING id`) as unknown as { id: number }[];
   const followedItemId = itemRows[0].id;
 
   await sql`

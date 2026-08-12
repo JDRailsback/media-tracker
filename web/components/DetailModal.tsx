@@ -13,6 +13,7 @@ import {
   type PlatformKind,
 } from "@/lib/platformPrefs";
 import { fetchPrefs, setItemMuted } from "@/lib/push-client";
+import { useRequireAuth } from "@/lib/requireAuth";
 import TypeTag from "./TypeTag";
 import type { LinkKind } from "@/lib/types";
 
@@ -48,6 +49,7 @@ export default function DetailModal({
   onClose: () => void;
 }) {
   const [full, setFull] = useState<MediaItem>(item);
+  const requireAuth = useRequireAuth();
   // Keyed by kind — Streaming and Rent & Buy are separate preferences now
   // (see lib/platformPrefs.ts), so each KIND_GROUPS section below judges
   // "preferred" against its own list, not one shared one.
@@ -99,16 +101,21 @@ export default function DetailModal({
   // rejected add (On Deck already at 5) leaves the prior status showing,
   // with the server's own message surfaced rather than a generic one.
   async function handleDugoutClick(status: DugoutStatus) {
+    if (!requireAuth()) return;
     const next = dugoutStatus === status ? null : status;
     setDugoutError(null);
     setDugoutBusy(true);
     try {
       if (next === null) {
-        await fetch("/api/dugout", {
+        const res = await fetch("/api/dugout", {
           method: "DELETE",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ itemID: item.id }),
         });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.error || "Something went wrong");
+        }
       } else {
         const res = await fetch("/api/dugout", {
           method: "POST",

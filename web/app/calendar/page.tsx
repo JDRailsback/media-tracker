@@ -12,6 +12,7 @@ import { getGeneralBarLevel } from "@/lib/generalBar";
 import { parseReleaseDay } from "@/lib/feed";
 import DetailModal from "@/components/DetailModal";
 import MonthCalendarGrid, { dayKey, type CalendarEntry } from "@/components/MonthCalendarGrid";
+import { useRequireAuth } from "@/lib/requireAuth";
 
 type TypeFilter = "" | "movie" | "tvShow" | "game";
 
@@ -23,6 +24,7 @@ const TYPE_FILTERS: { value: TypeFilter; label: string }[] = [
 ];
 
 export default function CalendarPage() {
+  const requireAuth = useRequireAuth();
   const today = useMemo(() => new Date(), []);
   const [year, setYear] = useState(today.getFullYear());
   const [month, setMonth] = useState(today.getMonth() + 1); // 1-indexed
@@ -136,11 +138,13 @@ export default function CalendarPage() {
           item={selected}
           isFollowed={selectedFollowed}
           onFollow={(full) => {
+            if (!requireAuth()) return;
             addFollow(full);
             void syncFollow(full.id, true);
             setFollowVersion((v) => v + 1);
           }}
           onUnfollow={() => {
+            if (!requireAuth()) return;
             removeFollow(selected.id);
             void syncFollow(selected.id, false);
             setFollowVersion((v) => v + 1);
