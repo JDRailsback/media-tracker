@@ -195,7 +195,10 @@ export default function DetailModal({
         <button
           onClick={onClose}
           aria-label="Close"
-          className="absolute right-4 top-4 z-10 rounded-full bg-black/45 p-1.5 text-white/85 backdrop-blur transition-colors hover:text-white"
+          // p-1.5 measured out at a 27x27px hit target on mobile — well
+          // under the ~44px minimum tap-target guideline. p-3 gets it to
+          // 40x40 without visually ballooning this corner overlay button.
+          className="absolute right-4 top-4 z-10 rounded-full bg-black/45 p-3 text-white/85 backdrop-blur transition-colors hover:text-white"
         >
           <X size={16} strokeWidth={2.5} />
         </button>
