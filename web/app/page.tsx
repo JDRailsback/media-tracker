@@ -287,12 +287,13 @@ export default function Home() {
   // there wouldn't otherwise be reflected" reasoning as refetchDugout.
   const [continueItems, setContinueItems] = useState<MediaItem[]>([]);
   function refetchContinueWatching() {
+    if (!session?.user) return;
     fetch("/api/dugout?continue=1")
       .then((r) => (r.ok ? r.json() : { items: [] }))
       .then((d: { items: MediaItem[] }) => setContinueItems(d.items))
       .catch(() => {});
   }
-  useEffect(refetchContinueWatching, []);
+  useEffect(refetchContinueWatching, [session]);
 
   // Search directly from Dugout — a lighter-weight sibling of Discover's
   // search (query/searchType/searchResults above), not a reuse of it:
