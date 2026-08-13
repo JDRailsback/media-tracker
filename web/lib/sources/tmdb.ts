@@ -854,6 +854,36 @@ function providerSearchLinks(
   return links;
 }
 
+// Provider links ONLY, for backfilling stale catalog_items rows in bulk —
+// deliberately NOT movieExtra/tvExtra, which also pull runtime/tags (movie)
+// or the full per-season episode list (TV, a separate request PER season).
+// A catalog-wide refresh only needs the single append_to_response=watch/
+// providers field already on the base detail request, so this skips
+// everything else rather than paying a TV show's full episode-list cost
+// just to re-resolve its provider labels. Reuses providerSearchLinks (the
+// same resolution logic movieExtra/tvExtra use) so a future provider-table
+// fix never has to be made twice.
+//
+// withRetries wraps the actual fetch — verified live that a real
+// catalog-wide backfill (10k+ movies) started hitting TMDB 429s after
+// roughly 1,000-1,500 sustained requests within ~20 seconds; every other
+// per-item TMDB call in this file already retries through exactly this
+// kind of transient throttling (see fetchStatus), this one just hadn't
+// needed it until something actually ran it at full-catalog scale.
+export async function fetchWatchProviderLinks(
+  kind: "movie" | "tv",
+  id: number,
+  title: string
+): Promise<ExternalLink[]> {
+  return withRetries(async () => {
+    const url = `https://api.themoviedb.org/3/${kind}/${id}?api_key=${key()}&append_to_response=watch/providers`;
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) throw new Error(`TMDB ${kind} watch/providers (${id}) failed: ${res.status}`);
+    const d = await res.json();
+    return providerSearchLinks(d["watch/providers"]?.results?.US, title);
+  });
+}
+
 // Franchise/studio/keyword identifiers for collection matching (see
 // scripts/rebuild-collections.ts) — NOT the same as `genres`, which is
 // purely for UI badges. belongs_to_collection/production_companies/keywords
