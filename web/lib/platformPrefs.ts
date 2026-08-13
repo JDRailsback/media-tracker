@@ -65,7 +65,7 @@ export const KNOWN_PLATFORMS: { group: string; kind: PlatformKind; names: string
   {
     group: "Rent & Buy",
     kind: "rentBuy",
-    names: ["Prime Video", "Apple TV", "Google Play Movies", "YouTube", "Fandango At Home"],
+    names: ["Amazon Video", "Apple TV", "Google Play Movies", "YouTube", "Fandango At Home"],
   },
   {
     group: "Game stores",

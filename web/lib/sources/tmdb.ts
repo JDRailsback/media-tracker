@@ -761,22 +761,22 @@ function matchesPattern(name: string, pattern: string): boolean {
 // PROVIDER_SEARCH_RULES' plain "apple" substring pattern matched both and
 // collapsed them onto one label — verified live: a movie rentable ONLY on
 // "Apple TV Store" was showing as bare "Apple TV+", implying it was
-// included with the subscription. Amazon rebranded ALL of its video
-// offerings — the flatrate subscription ("Amazon Prime Video"/"...with
-// Ads") AND the pay-per-title store ("Amazon Video") — under one "Prime
-// Video" name in 2023, so both collapse to the SAME label here on purpose
-// (explicit request — the UI's Stream/Rent/Buy grouping already tells them
-// apart, a second distinct name would just be stale branding). "YouTube
-// TV" (a live-TV subscription bundle) is its own real service, not the
-// youtube.com rental storefront — PROVIDER_SEARCH_RULES' "youtube" pattern
-// would otherwise match "YouTube TV" as a substring and mislabel it plain
-// "YouTube," implying free rental availability it doesn't have. These
-// exact-name overrides are checked first so cases like this get their own
-// correctly-branded label; only after this table misses does the generic
-// substring table below run.
+// included with the subscription. Amazon splits the same way — the
+// flatrate subscription ("Amazon Prime Video"/"...with Ads") is labeled
+// "Prime Video"; the pay-per-title store ("Amazon Video") keeps its own
+// "Amazon Video" name rather than also being folded into "Prime Video" —
+// explicit request, since that's still the name people know the rental
+// storefront by even though Amazon's marketing has blurred the two.
+// "YouTube TV" (a live-TV subscription bundle) is its own real service,
+// not the youtube.com rental storefront — PROVIDER_SEARCH_RULES' "youtube"
+// pattern would otherwise match "YouTube TV" as a substring and mislabel
+// it plain "YouTube," implying free rental availability it doesn't have.
+// These exact-name overrides are checked first so cases like this get
+// their own correctly-branded label; only after this table misses does
+// the generic substring table below run.
 const EXACT_PROVIDER_OVERRIDES: Record<string, { provider: string; searchURL: (title: string) => string }> = {
   "apple tv store": { provider: "Apple TV", searchURL: (t) => `https://tv.apple.com/search?term=${encodeURIComponent(t)}` },
-  "amazon video": { provider: "Prime Video", searchURL: (t) => `https://www.amazon.com/s?k=${encodeURIComponent(t)}&i=instant-video` },
+  "amazon video": { provider: "Amazon Video", searchURL: (t) => `https://www.amazon.com/s?k=${encodeURIComponent(t)}&i=instant-video` },
   "amazon prime video": { provider: "Prime Video", searchURL: (t) => `https://www.amazon.com/gp/video/search?phrase=${encodeURIComponent(t)}` },
   "amazon prime video with ads": { provider: "Prime Video", searchURL: (t) => `https://www.amazon.com/gp/video/search?phrase=${encodeURIComponent(t)}` },
   "youtube tv": { provider: "YouTube TV", searchURL: () => `https://tv.youtube.com/` },
