@@ -681,23 +681,46 @@ const RETURNING_TV_INTL_THRESHOLDS: Record<Exclude<IntlBarLevel, "off">, number>
 // must never re-exclude a row that was deliberately admitted despite it.
 const FRANCHISE_PICK_EXEMPT = "franchise_pick = true";
 
-// Trending picks (see fetchTrendingAdmitted) are exempt from both bars too
-// — TMDB's trending/week is already a real, global momentum signal (not
-// skewed toward Trakt's English-leaning user base the way the international
-// bar exists to correct for), so a second popularity filter on top of it
-// would just be re-litigating admission a different, arbitrarily-scaled way.
+// Trending picks (see fetchTrendingAdmitted) are exempt from the GENERAL
+// bar — TMDB's trending/week is already a real momentum signal, so a
+// second popularity filter on top of it would just be re-litigating
+// admission a different, arbitrarily-scaled way. NOT exempt from the
+// INTERNATIONAL bar, though (see its own threshold below) — verified live
+// this was too broad as an unconditional exemption: "Batwara 1947" (rank
+// 43 on trending's own 1-200 scale) and "Awarapan 2" (rank 63), both
+// Hindi, were getting a full pass with zero anticipation signal beyond
+// "briefly trended," which is exactly the region-specific-spike case the
+// international bar exists to catch — TMDB's trending list is global
+// aggregate activity, not curated for cross-market appeal, so it can
+// absolutely surface something popular in one specific market and nowhere
+// else, same failure mode Trakt's list_count has (see this file's own
+// note on that).
 const TRENDING_PICK_EXEMPT = "trending_pick = true";
+
+// Same-scale companion to RETURNING_TV_INTL_THRESHOLDS — trending_pick's
+// rank_score is TRENDING_PICK_LIMIT+1-minus-TMDB-rank (see
+// fetchTrendingAdmitted), so it runs roughly 1-200, nothing like Trakt's
+// list_count thousands INTL_BAR_THRESHOLDS is calibrated against. Set so a
+// non-English title needs to be genuinely near the TOP of TMDB's trending
+// list (not just present on it) to count as real cross-market anticipation
+// — moderate requires roughly top-40, strict roughly top-15.
+const TRENDING_PICK_INTL_THRESHOLDS: Record<Exclude<IntlBarLevel, "off">, number> = {
+  moderate: 160,
+  strict: 185,
+};
 
 function intlBarSQL(level: IntlBarLevel): string {
   if (level === "off") return "";
   const t = INTL_BAR_THRESHOLDS[level];
   const returningFloor = RETURNING_TV_INTL_THRESHOLDS[level];
+  const trendingFloor = TRENDING_PICK_INTL_THRESHOLDS[level];
   // English/no-language rows still short-circuit past everything below via
-  // the first clause, so an English returning show stays fully exempt
-  // exactly as before — only a non-English one now has to clear
-  // returningFloor instead of an unconditional pass.
-  return `AND (original_language = 'en' OR original_language IS NULL OR type = 'game' OR ${FRANCHISE_PICK_EXEMPT} OR ${TRENDING_PICK_EXEMPT} OR
+  // the first clause, so an English returning show/trending pick stays
+  // fully exempt exactly as before — only a non-English one now has to
+  // clear its own scale's floor instead of an unconditional pass.
+  return `AND (original_language = 'en' OR original_language IS NULL OR type = 'game' OR ${FRANCHISE_PICK_EXEMPT} OR
     (${RETURNING_TV_EXEMPT} AND rank_score >= ${returningFloor}) OR
+    (${TRENDING_PICK_EXEMPT} AND rank_score >= ${trendingFloor}) OR
     (type = 'movie' AND rank_score >= ${t.movie}) OR (type = 'tvShow' AND subtitle IS NULL AND rank_score >= ${t.tvShow}))`;
 }
 
