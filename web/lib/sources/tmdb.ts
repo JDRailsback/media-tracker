@@ -1173,6 +1173,17 @@ export async function tvExtra(
   // when scanning the season list doesn't turn one up.
   nextEpisodeToAir?: { season: number; episode: number; airDate: string };
   reviewScores?: ReviewScores;
+  // Same signal/scale as fetchStatus's majorReleaseScore for TV (see
+  // majorStreamingReach) — computed here too because this is the OTHER
+  // place a show's row gets written: refreshFollowedUpcomingTVShows (a
+  // followed show's episode-schedule refresh) calls this, not fetchStatus,
+  // and upsertUpcoming has no regression guard on this column (unlike
+  // metadata's COALESCE) — verified live a followed major-platform show
+  // ("Lanterns," HBO) got its correctly-computed score silently zeroed back
+  // out the same cron run, because this path used to just omit the field
+  // entirely and upsertUpcoming's unconditional write clobbered whatever
+  // the main discovery pass had just set.
+  majorReleaseScore: number;
 }> {
   try {
     return await withRetries(async () => {
@@ -1244,10 +1255,11 @@ export async function tvExtra(
             }
           : undefined,
         reviewScores: await fetchOMDbRatings(d.external_ids?.imdb_id ?? undefined),
+        majorReleaseScore: majorStreamingReach(d.networks, (d as { popularity?: number }).popularity ?? 0),
       };
     });
   } catch {
-    return { seasons: [], externalLinks: [], tags: [] };
+    return { seasons: [], externalLinks: [], tags: [], majorReleaseScore: 0 };
   }
 }
 
