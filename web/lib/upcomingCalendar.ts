@@ -43,6 +43,11 @@ interface CalendarWriteRow {
   // Admitted via TMDB's own trending/week list rather than Trakt (see
   // fetchTrendingAdmitted) — same bar exemption as franchisePick.
   trendingPick?: boolean;
+  // Admitted for being a wide US theatrical release (movie) or a show on a
+  // major streaming platform (TV) — see fetchMajorReleaseAdmitted. Same
+  // full bar exemption as franchisePick: a wide release or a major
+  // platform's show is exactly the "show it regardless of popularity" case.
+  majorPick?: boolean;
 }
 
 interface CalendarDBRow {
@@ -101,6 +106,7 @@ interface SourceUpcomingRow {
   genres: unknown;
   original_language: string | null;
   popularity_score: number;
+  major_release: boolean;
 }
 
 // TMDB id is the numeric suffix of our own "movie:603"/"tvShow:1399" id
@@ -161,19 +167,19 @@ async function fetchRawUpcomingRows(): Promise<{
   const sql = db();
   const [movies, tv, games, allGames] = await Promise.all([
     sql`
-      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score
+      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score, major_release
       FROM upcoming_items WHERE type = 'movie' AND date_confirmed = true AND release_date >= now()::date
     ` as unknown as Promise<SourceUpcomingRow[]>,
     sql`
-      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score
+      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score, major_release
       FROM upcoming_items WHERE type = 'tvShow' AND date_confirmed = true AND release_date >= now()::date
     ` as unknown as Promise<SourceUpcomingRow[]>,
     sql`
-      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score
+      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score, major_release
       FROM upcoming_items WHERE type = 'game' AND date_confirmed = true AND release_date >= now()::date AND popularity_score >= ${GAME_POPULARITY_FLOOR}
     ` as unknown as Promise<SourceUpcomingRow[]>,
     sql`
-      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score
+      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score, major_release
       FROM upcoming_items WHERE type = 'game' AND date_confirmed = true AND release_date >= now()::date
     ` as unknown as Promise<SourceUpcomingRow[]>,
   ]);
@@ -291,6 +297,23 @@ async function fetchTrendingAdmitted(rows: {
     .filter((row) => tvRank.has(row.id))
     .map((row) => ({ ...toWriteRow(row, TRENDING_PICK_LIMIT + 1 - tvRank.get(row.id)!), trendingPick: true }));
 
+  return [...movies, ...tv];
+}
+
+// Titles admitted for being a wide US theatrical release (movie) or a show
+// on one of a handful of major streaming platforms (TV) — regardless of
+// Trakt anticipation or trending rank. Explicit request: a wide release or a
+// major platform's show should show up in "Popular upcoming" on its own
+// merits, not depend on Trakt's (English-skewed, sometimes-403'd) anticipated
+// lists having heard of it. The underlying signal (major_release) is set at
+// write time by lib/sources/tmdb.ts's fetchStatus/filterOfficialOnly — this
+// just reads it back, no extra API calls. rankScore falls back to TMDB's own
+// popularity_score, same as games' own admission path above: these rows
+// don't have a Trakt list_count to use, and rankScore only ever affects the
+// shelf's highlight-slice ordering, never admission itself.
+function fetchMajorReleaseAdmitted(rows: { movies: SourceUpcomingRow[]; tv: SourceUpcomingRow[] }): CalendarWriteRow[] {
+  const movies = rows.movies.filter((row) => row.major_release).map((row) => ({ ...toWriteRow(row, row.popularity_score), majorPick: true }));
+  const tv = rows.tv.filter((row) => row.major_release).map((row) => ({ ...toWriteRow(row, row.popularity_score), majorPick: true }));
   return [...movies, ...tv];
 }
 
@@ -499,8 +522,8 @@ async function graduateReleasedTitles(): Promise<void> {
   await ensureSchema();
   const sql = db();
   await sql`
-    INSERT INTO new_releases_calendar (id, type, title, subtitle, poster_url, backdrop_url, release_date, external_links, genres, original_language, rank_score, franchise_pick, trending_pick)
-    SELECT id, type, title, subtitle, poster_url, backdrop_url, release_date, external_links, genres, original_language, rank_score, franchise_pick, trending_pick
+    INSERT INTO new_releases_calendar (id, type, title, subtitle, poster_url, backdrop_url, release_date, external_links, genres, original_language, rank_score, franchise_pick, trending_pick, major_pick)
+    SELECT id, type, title, subtitle, poster_url, backdrop_url, release_date, external_links, genres, original_language, rank_score, franchise_pick, trending_pick, major_pick
     FROM upcoming_calendar WHERE release_date < now()::date
     ON CONFLICT (id) DO UPDATE SET
       title = excluded.title,
@@ -514,6 +537,7 @@ async function graduateReleasedTitles(): Promise<void> {
       rank_score = excluded.rank_score,
       franchise_pick = excluded.franchise_pick,
       trending_pick = excluded.trending_pick,
+      major_pick = excluded.major_pick,
       updated_at = now()
   `;
 }
@@ -546,18 +570,20 @@ export async function refreshUpcomingCalendar(): Promise<{ count: number; traktE
 
   const [rawRows, returningTV] = await Promise.all([fetchRawUpcomingRows(), fetchReturningTVPremieres()]);
   const { rows: admittedRows, traktError } = await fetchTraktAndHypeAdmitted(rawRows);
+  const majorReleaseAdmitted = fetchMajorReleaseAdmitted(rawRows);
   const franchisePicks = fetchFranchisePicks(rawRows);
   const trendingAdmitted = await fetchTrendingAdmitted(rawRows);
 
   // Merge in priority order: Trakt/hype-admitted first (a real earned
-  // rankScore), then returning-show premieres, then franchise picks, then
-  // trending-admitted last — a title that already qualified on its own
-  // merits (Trakt, a franchise pick, a returning premiere) keeps that
-  // path's rankScore rather than being silently downgraded to trending's
-  // arbitrary 100-minus-rank scale.
+  // rankScore), then returning-show premieres, then major releases (wide
+  // theatrical / major-streaming-platform, popularity_score as rankScore),
+  // then franchise picks, then trending-admitted last — a title that already
+  // qualified on its own merits (Trakt, a franchise pick, a returning
+  // premiere) keeps that path's rankScore rather than being silently
+  // downgraded to a later path's differently-scaled one.
   const seen = new Set<string>();
   const merged: CalendarWriteRow[] = [];
-  for (const row of [...admittedRows, ...returningTV, ...franchisePicks, ...trendingAdmitted]) {
+  for (const row of [...admittedRows, ...returningTV, ...majorReleaseAdmitted, ...franchisePicks, ...trendingAdmitted]) {
     if (seen.has(row.id)) continue;
     seen.add(row.id);
     merged.push(row);
@@ -583,7 +609,7 @@ export async function refreshUpcomingCalendar(): Promise<{ count: number; traktE
     const batch = rows.slice(i, i + UPSERT_BATCH_SIZE);
     if (batch.length === 0) continue;
     await sql`
-      INSERT INTO upcoming_calendar (id, type, title, subtitle, poster_url, backdrop_url, release_date, external_links, genres, original_language, rank_score, franchise_pick, trending_pick)
+      INSERT INTO upcoming_calendar (id, type, title, subtitle, poster_url, backdrop_url, release_date, external_links, genres, original_language, rank_score, franchise_pick, trending_pick, major_pick)
       SELECT * FROM UNNEST(
         ${batch.map((r) => r.id)}::text[],
         ${batch.map((r) => r.type)}::text[],
@@ -597,8 +623,9 @@ export async function refreshUpcomingCalendar(): Promise<{ count: number; traktE
         ${batch.map((r) => r.originalLanguage ?? null)}::text[],
         ${batch.map((r) => r.rankScore)}::int[],
         ${batch.map((r) => !!r.franchisePick)}::boolean[],
-        ${batch.map((r) => !!r.trendingPick)}::boolean[]
-      ) AS t(id, type, title, subtitle, poster_url, backdrop_url, release_date, external_links, genres, original_language, rank_score, franchise_pick, trending_pick)
+        ${batch.map((r) => !!r.trendingPick)}::boolean[],
+        ${batch.map((r) => !!r.majorPick)}::boolean[]
+      ) AS t(id, type, title, subtitle, poster_url, backdrop_url, release_date, external_links, genres, original_language, rank_score, franchise_pick, trending_pick, major_pick)
       ON CONFLICT (id) DO UPDATE SET
         title = excluded.title,
         subtitle = excluded.subtitle,
@@ -611,6 +638,7 @@ export async function refreshUpcomingCalendar(): Promise<{ count: number; traktE
         rank_score = excluded.rank_score,
         franchise_pick = excluded.franchise_pick,
         trending_pick = excluded.trending_pick,
+        major_pick = excluded.major_pick,
         updated_at = now()
     `;
   }
@@ -697,6 +725,15 @@ const FRANCHISE_PICK_EXEMPT = "franchise_pick = true";
 // note on that).
 const TRENDING_PICK_EXEMPT = "trending_pick = true";
 
+// Major-release picks (see fetchMajorReleaseAdmitted) are exempt from BOTH
+// bars, same as franchise picks and for the same reason: "wide theatrical
+// release" / "major streaming platform show" is already the point of the
+// admission, explicitly regardless of Trakt/trending popularity. A
+// non-English wide release (Ip Man: Kung Fu Legend playing wide in the US)
+// shouldn't get re-excluded by the international bar after already clearing
+// this deliberately permissive bar.
+const MAJOR_PICK_EXEMPT = "major_pick = true";
+
 // Same-scale companion to RETURNING_TV_INTL_THRESHOLDS — trending_pick's
 // rank_score is TRENDING_PICK_LIMIT+1-minus-TMDB-rank (see
 // fetchTrendingAdmitted), so it runs roughly 1-200, nothing like Trakt's
@@ -718,7 +755,7 @@ function intlBarSQL(level: IntlBarLevel): string {
   // the first clause, so an English returning show/trending pick stays
   // fully exempt exactly as before — only a non-English one now has to
   // clear its own scale's floor instead of an unconditional pass.
-  return `AND (original_language = 'en' OR original_language IS NULL OR type = 'game' OR ${FRANCHISE_PICK_EXEMPT} OR
+  return `AND (original_language = 'en' OR original_language IS NULL OR type = 'game' OR ${FRANCHISE_PICK_EXEMPT} OR ${MAJOR_PICK_EXEMPT} OR
     (${RETURNING_TV_EXEMPT} AND rank_score >= ${returningFloor}) OR
     (${TRENDING_PICK_EXEMPT} AND rank_score >= ${trendingFloor}) OR
     (type = 'movie' AND rank_score >= ${t.movie}) OR (type = 'tvShow' AND subtitle IS NULL AND rank_score >= ${t.tvShow}))`;
@@ -742,7 +779,7 @@ const GENERAL_BAR_THRESHOLDS: Record<Exclude<GeneralBarLevel, "off">, { movie: n
 function generalBarSQL(level: GeneralBarLevel): string {
   if (level === "off") return "";
   const t = GENERAL_BAR_THRESHOLDS[level];
-  return `AND (type = 'game' OR ${RETURNING_TV_EXEMPT} OR ${FRANCHISE_PICK_EXEMPT} OR ${TRENDING_PICK_EXEMPT} OR
+  return `AND (type = 'game' OR ${RETURNING_TV_EXEMPT} OR ${FRANCHISE_PICK_EXEMPT} OR ${TRENDING_PICK_EXEMPT} OR ${MAJOR_PICK_EXEMPT} OR
     (type = 'movie' AND rank_score >= ${t.movie}) OR (type = 'tvShow' AND subtitle IS NULL AND rank_score >= ${t.tvShow}))`;
 }
 

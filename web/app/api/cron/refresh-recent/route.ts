@@ -17,21 +17,23 @@ import { upsertCatalog } from "@/lib/catalog";
 import type { CatalogRow } from "@/lib/catalog";
 import { upsertTrending, pruneTrending } from "@/lib/trending";
 import type { TrendingRow } from "@/lib/trending";
-import { rebuildAllCollections } from "@/lib/collections-rebuild";
 import { toISODate } from "@/lib/dbDate";
 import { waitUntil } from "@vercel/functions";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-// GET /api/cron/refresh-recent — stages B/C/D of the daily refresh (see
+// GET /api/cron/refresh-recent — stages B/C of the daily refresh (see
 // app/api/cron/daily/route.ts's own top comment for stage A, and why this
 // is split into its own invocation rather than run inline after it). Not
 // declared in vercel.json's `crons` list — only ever reached via the daily
 // route's own trigger, gated by the same CRON_SECRET check as every other
-// cron route. Chains onward to /api/cron/refresh-calendar the same way at
-// the end, for the same reason: each stage gets its own fresh 60s budget
-// instead of inheriting whatever was left of a shared one.
+// cron route. Chains onward to /api/cron/refresh-collections the same way
+// at the end, for the same reason: each stage gets its own fresh 60s
+// budget instead of inheriting whatever was left of a shared one — stage D
+// (collection rebuild) used to run inline here too, but a live timing run
+// of just B/C measured 46.3s, uncomfortably close to the cap, so D moved
+// out to its own invocation (see refresh-collections/route.ts).
 //   B. Recent releases — titles released in the last ~30 days upserted into
 //      catalog_items (all four types, manga included). This is what
 //      "graduates" a title the day it releases: stage A prunes it from
@@ -48,10 +50,6 @@ export const maxDuration = 60;
 //      Also runs the rotating artist-discography refresh and the followed-
 //      show refreshes alongside it — none of them share a rate limit with
 //      each other or with B, so nothing contends.
-//   D. Collection self-heal — re-resolves the hand-curated title lists in
-//      lib/collections.ts against the (possibly just-grown) catalog. The
-//      lists themselves never change automatically. Runs after B so it
-//      sees any titles B just added.
 
 async function ingestRecent(fetchRows: () => Promise<CatalogRow[]>): Promise<number> {
   const rows = await fetchRows();
@@ -273,21 +271,12 @@ export async function GET(request: Request) {
     ])
   ).map(settled);
 
-  // Stage D after B so the rebuild sees any titles B just added.
-  let collections: { totalItems: number; totalUnmatched: number } | { error: string };
-  try {
-    const summary = await rebuildAllCollections();
-    collections = { totalItems: summary.totalItems, totalUnmatched: summary.totalUnmatched };
-  } catch (err) {
-    collections = { error: String(err) };
-  }
-
   const origin = new URL(request.url).origin;
   waitUntil(
-    fetch(`${origin}/api/cron/refresh-calendar`, {
+    fetch(`${origin}/api/cron/refresh-collections`, {
       headers: secret ? { authorization: `Bearer ${secret}` } : {},
     }).catch((err) => {
-      console.error("Failed to trigger /api/cron/refresh-calendar", err);
+      console.error("Failed to trigger /api/cron/refresh-collections", err);
     })
   );
 
@@ -297,7 +286,6 @@ export async function GET(request: Request) {
     artistsRefreshed,
     followedTVRefreshed,
     followedUpcomingTVRefreshed,
-    collections,
-    nextStage: "triggered", // see /api/cron/refresh-calendar for its own result
+    nextStage: "triggered", // see /api/cron/refresh-collections for its own result
   });
 }

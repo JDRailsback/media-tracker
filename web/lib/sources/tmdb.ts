@@ -232,6 +232,34 @@ function usTheatricalDate(releaseDatesResponse: unknown): string | undefined {
   return chosen?.release_date?.slice(0, 10);
 }
 
+// A real WIDE release, not just any theatrical showing — type 3 specifically
+// ("Theatrical"), never falling back to type 2 ("Theatrical (limited)") the
+// way usTheatricalDate above does for its date-correction purpose. A limited
+// arthouse/festival release shouldn't auto-admit into "Popular upcoming" just
+// because it eventually plays SOME US theater; type 3 is what TMDB itself
+// uses to distinguish a wide release from one.
+function hasWideUSTheatrical(releaseDatesResponse: unknown): boolean {
+  const results = (releaseDatesResponse as { results?: { iso_3166_1: string; release_dates: TMDBReleaseDateEntry[] }[] })
+    ?.results;
+  const us = results?.find((r) => r.iso_3166_1 === "US");
+  return !!us?.release_dates.some((r) => r.type === 3);
+}
+
+// A show is on one of these iff its /tv/{id} `networks` field names one of
+// them — checked via substring, not exact match, since TMDB's own network
+// name varies by title ("Netflix" vs "Netflix Animation/Netflix Kids" for
+// some children's shows, "Prime Video" vs "Amazon Prime Video"). Deliberately
+// a SHORT list of the platforms actually driving major, widely-marketed
+// releases — not lib/platformPrefs.ts's full "Streaming" group (Tubi, Pluto
+// TV, Kanopy, ...), which exists to match every real "Available on" link,
+// not to gate "is this a big-deal show."
+const MAJOR_STREAMING_NETWORKS = ["netflix", "max", "hbo", "disney+", "apple tv+", "prime video", "hulu", "paramount+", "peacock"];
+
+function isMajorStreamingNetwork(networks: unknown): boolean {
+  const names = (networks as { name?: string }[] | undefined)?.map((n) => n.name?.toLowerCase() ?? "") ?? [];
+  return names.some((n) => MAJOR_STREAMING_NETWORKS.some((major) => n.includes(major)));
+}
+
 interface StatusResult {
   status?: string;
   // Movie-only — see usTheatricalDate. Corrects releaseDate on the calling
@@ -251,6 +279,13 @@ interface StatusResult {
   // wrong 2026-07-28 this way. See filterOfficialOnly/upsertUpcoming for how
   // this flag now guards against that instead of just hoping retries win.
   fetchOk: boolean;
+  // Wide US theatrical (movie, via hasWideUSTheatrical) or a major-platform
+  // show (TV, via isMajorStreamingNetwork) — see MAJOR_STREAMING_NETWORKS.
+  // Piggybacks on this same per-item request for both kinds: movies already
+  // fetch release_dates here, and TV's base /tv/{id} response already
+  // includes `networks` with no append needed. False (never undefined) so a
+  // failed fetch can't be mistaken for "checked, not major" downstream.
+  majorRelease: boolean;
 }
 
 async function fetchStatus(kind: "movie" | "tv", id: number): Promise<StatusResult> {
@@ -270,6 +305,7 @@ async function fetchStatus(kind: "movie" | "tv", id: number): Promise<StatusResu
         status: d.status as string | undefined,
         usReleaseDate: kind === "movie" ? usTheatricalDate(d.release_dates) : undefined,
         fetchOk: true,
+        majorRelease: kind === "movie" ? hasWideUSTheatrical(d.release_dates) : isMajorStreamingNetwork(d.networks),
       };
     });
   } catch {
@@ -277,12 +313,14 @@ async function fetchStatus(kind: "movie" | "tv", id: number): Promise<StatusResu
     // request silently exclude an otherwise-legitimate title or crash the
     // date correction; the row just keeps its original release_date this
     // run, but fetchOk: false stops that unverified value from ever being
-    // written over a previously-good one (see upsertUpcoming).
-    return { fetchOk: false };
+    // written over a previously-good one (see upsertUpcoming). majorRelease
+    // stays false rather than carrying forward a stale prior value — this
+    // flag is fully recomputed every run, unlike releaseDate.
+    return { fetchOk: false, majorRelease: false };
   }
 }
 
-async function filterOfficialOnly<T extends { id: string; releaseDate?: string; dateVerified?: boolean }>(
+async function filterOfficialOnly<T extends { id: string; releaseDate?: string; dateVerified?: boolean; majorRelease?: boolean }>(
   kind: "movie" | "tv",
   rows: T[]
 ): Promise<T[]> {
@@ -298,6 +336,7 @@ async function filterOfficialOnly<T extends { id: string; releaseDate?: string; 
       ...x.row,
       ...(x.result.usReleaseDate ? { releaseDate: x.result.usReleaseDate } : {}),
       dateVerified: x.result.fetchOk,
+      majorRelease: x.result.majorRelease,
     }));
 }
 

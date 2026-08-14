@@ -12,8 +12,8 @@ export const maxDuration = 60;
 // the other slot). Same Authorization: Bearer CRON_SECRET pattern as
 // /api/poll. This used to run every stage of the daily refresh inline —
 // see git history, or /api/cron/refresh-upcoming-tv-game,
-// /api/cron/refresh-recent, and /api/cron/refresh-calendar for where the
-// rest of it lives now.
+// /api/cron/refresh-recent, /api/cron/refresh-collections, and
+// /api/cron/refresh-calendar for where the rest of it lives now.
 //
 // Movies ONLY now — split out from what used to also include TV and games
 // in one invocation. Verified LIVE in Vercel's own cron log (not just

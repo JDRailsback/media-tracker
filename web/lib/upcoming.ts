@@ -41,6 +41,12 @@ export interface UpcomingRow {
   // sets it, which is every non-movie row plus movies whose fetch actually
   // succeeded — see upsertUpcoming for how this gates the write.
   dateVerified?: boolean;
+  // Wide US theatrical release (movie) or major-streaming-platform show
+  // (TV) — see lib/sources/tmdb.ts's fetchStatus/filterOfficialOnly.
+  // Defaults false for every row that never sets it (games, and any row
+  // whose date-correction fetch never ran) — see lib/upcomingCalendar.ts's
+  // fetchMajorReleaseAdmitted for how this drives admission.
+  majorRelease?: boolean;
   // TV only, and only ever set by the cron's followed-upcoming-shows
   // refresh (app/api/cron/daily) — { seasons, numberOfEpisodes, ... } same
   // shape as CatalogRow's metadata, so a followed-but-unreleased show can
@@ -221,8 +227,8 @@ export async function upsertUpcoming(rows: UpcomingRow[]): Promise<void> {
     };
 
     await sql`
-      INSERT INTO upcoming_items (id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, first_seen_at, genres, original_language, external_links, date_verified, metadata)
-      SELECT id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, COALESCE(announced_at, now()), genres, original_language, external_links, date_verified, COALESCE(metadata, '{}'::jsonb)
+      INSERT INTO upcoming_items (id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, first_seen_at, genres, original_language, external_links, date_verified, major_release, metadata)
+      SELECT id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, COALESCE(announced_at, now()), genres, original_language, external_links, date_verified, major_release, COALESCE(metadata, '{}'::jsonb)
       FROM UNNEST(
         ${batch.map((r) => r.id)}::text[],
         ${batch.map((r) => r.type)}::text[],
@@ -238,11 +244,12 @@ export async function upsertUpcoming(rows: UpcomingRow[]): Promise<void> {
         ${batch.map((r) => r.originalLanguage ?? null)}::text[],
         ${batch.map((r) => JSON.stringify(r.externalLinks ?? []))}::jsonb[],
         ${batch.map((r) => r.dateVerified ?? true)}::boolean[],
+        ${batch.map((r) => r.majorRelease ?? false)}::boolean[],
         ${batch.map((r) => {
           const m = metadataFor(r);
           return m ? JSON.stringify(m) : null;
         })}::jsonb[]
-      ) AS t(id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, announced_at, genres, original_language, external_links, date_verified, metadata)
+      ) AS t(id, type, title, overview, poster_url, backdrop_url, release_date, date_confirmed, popularity_score, announced_at, genres, original_language, external_links, date_verified, major_release, metadata)
       ON CONFLICT (id) DO UPDATE SET
         title = excluded.title,
         overview = excluded.overview,
@@ -260,6 +267,7 @@ export async function upsertUpcoming(rows: UpcomingRow[]): Promise<void> {
         original_language = excluded.original_language,
         external_links = excluded.external_links,
         date_verified = excluded.date_verified,
+        major_release = excluded.major_release,
         -- NULL (this run never touched episode data) keeps whatever was
         -- already stored instead of wiping it back to '{}'.
         metadata = COALESCE(excluded.metadata, upcoming_items.metadata),

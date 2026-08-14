@@ -307,6 +307,17 @@ function buildSchema(): Promise<void> {
       // which then keeps the OLD stored release_date instead of overwriting
       // it with an unverified one.
       await sql`ALTER TABLE upcoming_items ADD COLUMN IF NOT EXISTS date_verified BOOLEAN NOT NULL DEFAULT true`;
+      // A wide US theatrical release (movie) or a show on one of a handful
+      // of major streaming platforms (TV) — piggybacked off the SAME
+      // per-item fetch filterOfficialOnly already makes for every upcoming
+      // candidate (release_dates for movies, the base /tv/{id} response's
+      // own `networks` field for TV), zero extra TMDB calls. Explicit
+      // request: a wide release or a major-platform show should show up in
+      // "Popular upcoming" regardless of Trakt anticipation/trending — see
+      // lib/upcomingCalendar.ts's fetchMajorReleaseAdmitted, and its
+      // major_pick columns on upcoming_calendar/new_releases_calendar for
+      // the read-time bar exemption.
+      await sql`ALTER TABLE upcoming_items ADD COLUMN IF NOT EXISTS major_release BOOLEAN NOT NULL DEFAULT false`;
       // Notification history — one GLOBAL row per logged event (mirrors
       // followed_items' one-row-per-item model, not per-subscriber), written
       // only by /api/poll, read by /api/notifications filtered to the ids
@@ -424,6 +435,14 @@ function buildSchema(): Promise<void> {
       // already a real momentum signal, not a candidate pool needing a
       // second popularity filter on top.
       await sql`ALTER TABLE upcoming_calendar ADD COLUMN IF NOT EXISTS trending_pick BOOLEAN NOT NULL DEFAULT false`;
+      // Marks a row admitted for being a wide theatrical release (movie) or
+      // a major-streaming-platform show (TV) — regardless of Trakt
+      // anticipation or trending rank (see lib/upcomingCalendar.ts's
+      // fetchMajorReleaseAdmitted). Exempt from the international/general
+      // bars, same as franchise picks — a wide release or a major
+      // platform's show is exactly the kind of thing "show it regardless of
+      // popularity" is for.
+      await sql`ALTER TABLE upcoming_calendar ADD COLUMN IF NOT EXISTS major_pick BOOLEAN NOT NULL DEFAULT false`;
       // "New releases"' calendar — same shape as upcoming_calendar, same
       // admission decisions, just the other side of one title's lifecycle.
       // A row only ever enters this table by GRADUATING out of
@@ -461,6 +480,7 @@ function buildSchema(): Promise<void> {
       // a no-op once the table already exists on anyone's DB.
       await sql`ALTER TABLE new_releases_calendar ADD COLUMN IF NOT EXISTS franchise_pick BOOLEAN NOT NULL DEFAULT false`;
       await sql`ALTER TABLE new_releases_calendar ADD COLUMN IF NOT EXISTS trending_pick BOOLEAN NOT NULL DEFAULT false`;
+      await sql`ALTER TABLE new_releases_calendar ADD COLUMN IF NOT EXISTS major_pick BOOLEAN NOT NULL DEFAULT false`;
 
       // "Dugout" — a user's watch queue, deliberately separate from
       // followed_items (following = "tell me about release news"; this =
