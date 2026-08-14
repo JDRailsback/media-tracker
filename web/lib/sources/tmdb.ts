@@ -232,17 +232,30 @@ function usTheatricalDate(releaseDatesResponse: unknown): string | undefined {
   return chosen?.release_date?.slice(0, 10);
 }
 
-// A real WIDE release, not just any theatrical showing — type 3 specifically
-// ("Theatrical"), never falling back to type 2 ("Theatrical (limited)") the
-// way usTheatricalDate above does for its date-correction purpose. A limited
-// arthouse/festival release shouldn't auto-admit into "Popular upcoming" just
-// because it eventually plays SOME US theater; type 3 is what TMDB itself
-// uses to distinguish a wide release from one.
-function hasWideUSTheatrical(releaseDatesResponse: unknown): boolean {
+// A real WIDE release, not just any theatrical showing. TMDB's type 3
+// ("Theatrical") vs type 2 ("Theatrical (limited)") turned out NOT to be a
+// reliable "wide" signal on its own — verified live: this admitted "The
+// Wrong Girls" (popularity 4.5, a single LA-premiere-then-US-type-3 entry,
+// 2 countries total) and "Slice of Life" (popularity 0.0071, ONE country in
+// its entire release_dates response) right alongside real wide releases,
+// because TMDB's type field is crowd-contributed and applied inconsistently
+// for small/indie titles that technically aren't "limited" but were never
+// wide either. A genuinely wide release is virtually always day-and-date
+// across many territories now (verified live: "The End of Oak Street" had
+// type-3 entries in 40+ countries; "Insidious: Out of the Further", a real
+// franchise wide release, had 31; the junk titles above had 1-2) — country
+// COUNT is what actually distinguishes "wide" from "technically theatrical,"
+// so that's the gate, not the type value alone.
+const WIDE_RELEASE_MIN_COUNTRIES = 10;
+
+function isWideUSTheatrical(releaseDatesResponse: unknown): boolean {
   const results = (releaseDatesResponse as { results?: { iso_3166_1: string; release_dates: TMDBReleaseDateEntry[] }[] })
     ?.results;
-  const us = results?.find((r) => r.iso_3166_1 === "US");
-  return !!us?.release_dates.some((r) => r.type === 3);
+  if (!results) return false;
+  const us = results.find((r) => r.iso_3166_1 === "US");
+  if (!us?.release_dates.some((r) => r.type === 3)) return false;
+  const countriesWithTheatrical = results.filter((r) => r.release_dates.some((rd) => rd.type === 3)).length;
+  return countriesWithTheatrical >= WIDE_RELEASE_MIN_COUNTRIES;
 }
 
 // A show is on one of these iff its /tv/{id} `networks` field names one of
@@ -255,7 +268,19 @@ function hasWideUSTheatrical(releaseDatesResponse: unknown): boolean {
 // not to gate "is this a big-deal show."
 const MAJOR_STREAMING_NETWORKS = ["netflix", "max", "hbo", "disney+", "apple tv+", "prime video", "hulu", "paramount+", "peacock"];
 
-function isMajorStreamingNetwork(networks: unknown): boolean {
+// A network match alone isn't "major" — verified live: being ON Netflix
+// admitted three low-profile Netflix Originals (Moria/AR popularity 1.7,
+// S&X/JP popularity 5.3, Blood Sacrifice/SE popularity 4.7) right alongside
+// real hits, because Netflix (and every other platform on the list above)
+// hosts a huge volume of small regional/niche content, not just its
+// flagship titles. Real trending shows on these same platforms sampled live
+// at 46-425 popularity (House of the Dragon, Reacher, Silo, Ted Lasso, ...);
+// this floor sits well under that range (a brand-new show hasn't built up
+// trending-tier momentum yet) but well clear of the 1-5 noise above.
+const MAJOR_TV_POPULARITY_FLOOR = 20;
+
+function isMajorStreamingShow(networks: unknown, popularity: number): boolean {
+  if (popularity < MAJOR_TV_POPULARITY_FLOOR) return false;
   const names = (networks as { name?: string }[] | undefined)?.map((n) => n.name?.toLowerCase() ?? "") ?? [];
   return names.some((n) => MAJOR_STREAMING_NETWORKS.some((major) => n.includes(major)));
 }
@@ -279,12 +304,12 @@ interface StatusResult {
   // wrong 2026-07-28 this way. See filterOfficialOnly/upsertUpcoming for how
   // this flag now guards against that instead of just hoping retries win.
   fetchOk: boolean;
-  // Wide US theatrical (movie, via hasWideUSTheatrical) or a major-platform
-  // show (TV, via isMajorStreamingNetwork) — see MAJOR_STREAMING_NETWORKS.
-  // Piggybacks on this same per-item request for both kinds: movies already
-  // fetch release_dates here, and TV's base /tv/{id} response already
-  // includes `networks` with no append needed. False (never undefined) so a
-  // failed fetch can't be mistaken for "checked, not major" downstream.
+  // Wide US theatrical (movie, via isWideUSTheatrical) or a major-platform
+  // show above a popularity floor (TV, via isMajorStreamingShow). Piggybacks
+  // on this same per-item request for both kinds: movies already fetch
+  // release_dates here, and TV's base /tv/{id} response already includes
+  // `networks`/`popularity` with no append needed. False (never undefined)
+  // so a failed fetch can't be mistaken for "checked, not major" downstream.
   majorRelease: boolean;
 }
 
@@ -305,7 +330,8 @@ async function fetchStatus(kind: "movie" | "tv", id: number): Promise<StatusResu
         status: d.status as string | undefined,
         usReleaseDate: kind === "movie" ? usTheatricalDate(d.release_dates) : undefined,
         fetchOk: true,
-        majorRelease: kind === "movie" ? hasWideUSTheatrical(d.release_dates) : isMajorStreamingNetwork(d.networks),
+        majorRelease:
+          kind === "movie" ? isWideUSTheatrical(d.release_dates) : isMajorStreamingShow(d.networks, d.popularity ?? 0),
       };
     });
   } catch {
