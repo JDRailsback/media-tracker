@@ -762,11 +762,20 @@ const MAJOR_PICK_EXEMPT = "major_pick = true";
 // fetchTrendingAdmitted), so it runs roughly 1-200, nothing like Trakt's
 // list_count thousands INTL_BAR_THRESHOLDS is calibrated against. Set so a
 // non-English title needs to be genuinely near the TOP of TMDB's trending
-// list (not just present on it) to count as real cross-market anticipation
-// — moderate requires roughly top-40, strict roughly top-15.
+// list (not just present on it) to count as real cross-market anticipation.
+// Originally moderate: 160/strict: 185 (top-40/top-15), calibrated against
+// "Awarapan 2" sitting at TMDB rank 63 at the time — verified live days
+// later that the SAME title had climbed to rank ~31 (rank_score 170),
+// clearing that "moderate" floor outright, because TMDB's trending rank is
+// a real-time, day-to-day-fluctuating signal, not a fixed property of the
+// title. Raised so a non-English title needs to be genuinely near the very
+// top (moderate ~top-16, strict ~top-6) to count as real cross-market
+// anticipation rather than a single day's regional spike — TMDB's trending
+// list is global aggregate activity, not curated for cross-market appeal
+// (see this file's own note above), so even top-40 wasn't a safe margin.
 const TRENDING_PICK_INTL_THRESHOLDS: Record<Exclude<IntlBarLevel, "off">, number> = {
-  moderate: 160,
-  strict: 185,
+  moderate: 185,
+  strict: 195,
 };
 
 // major_pick's rank_score is major_release_score (see fetchMajorReleaseAdmitted)
