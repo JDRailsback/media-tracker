@@ -106,7 +106,7 @@ interface SourceUpcomingRow {
   genres: unknown;
   original_language: string | null;
   popularity_score: number;
-  major_release: boolean;
+  major_release_score: number;
 }
 
 // TMDB id is the numeric suffix of our own "movie:603"/"tvShow:1399" id
@@ -167,19 +167,19 @@ async function fetchRawUpcomingRows(): Promise<{
   const sql = db();
   const [movies, tv, games, allGames] = await Promise.all([
     sql`
-      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score, major_release
+      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score, major_release_score
       FROM upcoming_items WHERE type = 'movie' AND date_confirmed = true AND release_date >= now()::date
     ` as unknown as Promise<SourceUpcomingRow[]>,
     sql`
-      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score, major_release
+      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score, major_release_score
       FROM upcoming_items WHERE type = 'tvShow' AND date_confirmed = true AND release_date >= now()::date
     ` as unknown as Promise<SourceUpcomingRow[]>,
     sql`
-      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score, major_release
+      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score, major_release_score
       FROM upcoming_items WHERE type = 'game' AND date_confirmed = true AND release_date >= now()::date AND popularity_score >= ${GAME_POPULARITY_FLOOR}
     ` as unknown as Promise<SourceUpcomingRow[]>,
     sql`
-      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score, major_release
+      SELECT id, type, title, poster_url, backdrop_url, release_date, external_links, genres, original_language, popularity_score, major_release_score
       FROM upcoming_items WHERE type = 'game' AND date_confirmed = true AND release_date >= now()::date
     ` as unknown as Promise<SourceUpcomingRow[]>,
   ]);
@@ -305,15 +305,33 @@ async function fetchTrendingAdmitted(rows: {
 // Trakt anticipation or trending rank. Explicit request: a wide release or a
 // major platform's show should show up in "Popular upcoming" on its own
 // merits, not depend on Trakt's (English-skewed, sometimes-403'd) anticipated
-// lists having heard of it. The underlying signal (major_release) is set at
-// write time by lib/sources/tmdb.ts's fetchStatus/filterOfficialOnly — this
-// just reads it back, no extra API calls. rankScore falls back to TMDB's own
-// popularity_score, same as games' own admission path above: these rows
-// don't have a Trakt list_count to use, and rankScore only ever affects the
-// shelf's highlight-slice ordering, never admission itself.
+// lists having heard of it. The underlying magnitude (major_release_score —
+// country count for movies, popularity for TV, see lib/sources/tmdb.ts's
+// fetchStatus) is computed at write time, no extra API calls; the actual
+// admission floors live HERE, at read time, matching every other admission
+// path in this file. rankScore is major_release_score itself — this scale
+// (movies: country count) is what the international bar's own
+// MAJOR_PICK_INTL_THRESHOLDS below is calibrated against for non-English
+// rows, unlike games'/franchise's TMDB-popularity fallback which nothing
+// else compares it to.
+//
+// Movies: 10+ countries with a real (type=3) theatrical entry — see
+// lib/sources/tmdb.ts's wideUSTheatricalReach for why country count, not
+// the type flag alone, is the actual "wide" signal.
+const WIDE_RELEASE_MIN_COUNTRIES = 10;
+// TV: popularity floor on top of the major-network match — see
+// lib/sources/tmdb.ts's majorStreamingReach for why the network match alone
+// isn't enough (every major platform hosts plenty of small regional/niche
+// content too).
+const MAJOR_TV_POPULARITY_FLOOR = 20;
+
 function fetchMajorReleaseAdmitted(rows: { movies: SourceUpcomingRow[]; tv: SourceUpcomingRow[] }): CalendarWriteRow[] {
-  const movies = rows.movies.filter((row) => row.major_release).map((row) => ({ ...toWriteRow(row, row.popularity_score), majorPick: true }));
-  const tv = rows.tv.filter((row) => row.major_release).map((row) => ({ ...toWriteRow(row, row.popularity_score), majorPick: true }));
+  const movies = rows.movies
+    .filter((row) => row.major_release_score >= WIDE_RELEASE_MIN_COUNTRIES)
+    .map((row) => ({ ...toWriteRow(row, row.major_release_score), majorPick: true }));
+  const tv = rows.tv
+    .filter((row) => row.major_release_score >= MAJOR_TV_POPULARITY_FLOOR)
+    .map((row) => ({ ...toWriteRow(row, row.major_release_score), majorPick: true }));
   return [...movies, ...tv];
 }
 
@@ -725,13 +743,18 @@ const FRANCHISE_PICK_EXEMPT = "franchise_pick = true";
 // note on that).
 const TRENDING_PICK_EXEMPT = "trending_pick = true";
 
-// Major-release picks (see fetchMajorReleaseAdmitted) are exempt from BOTH
-// bars, same as franchise picks and for the same reason: "wide theatrical
-// release" / "major streaming platform show" is already the point of the
-// admission, explicitly regardless of Trakt/trending popularity. A
-// non-English wide release (Ip Man: Kung Fu Legend playing wide in the US)
-// shouldn't get re-excluded by the international bar after already clearing
-// this deliberately permissive bar.
+// Major-release picks (see fetchMajorReleaseAdmitted) are exempt from the
+// GENERAL bar unconditionally, same as franchise/trending picks: "wide
+// theatrical release" / "major streaming platform show" is already the
+// point of the admission, regardless of general popularity. NOT exempt from
+// the INTERNATIONAL bar, though (see its own threshold below) — verified
+// live this was too broad as an unconditional exemption: a Kannada film
+// (rank_score/country-count 22, popularity only 11.75 — a real theatrical
+// release, but a modest one) got a full pass right alongside "The End of
+// Oak Street" (40+ countries), which is exactly the kind of region-specific,
+// low-cross-market-appeal case the international bar exists to catch — same
+// failure mode Trakt's list_count and TMDB's trending list both already
+// have (see this file's own notes on those).
 const MAJOR_PICK_EXEMPT = "major_pick = true";
 
 // Same-scale companion to RETURNING_TV_INTL_THRESHOLDS — trending_pick's
@@ -746,18 +769,34 @@ const TRENDING_PICK_INTL_THRESHOLDS: Record<Exclude<IntlBarLevel, "off">, number
   strict: 185,
 };
 
+// major_pick's rank_score is major_release_score (see fetchMajorReleaseAdmitted)
+// — country count for movies (base admission floor 10), popularity for TV
+// (base floor 20) — so this needs its own {movie, tvShow} pair on THOSE
+// scales, not INTL_BAR_THRESHOLDS' Trakt-list_count numbers. Set to roughly
+// double the base admission floor: a non-English wide release needs to be
+// genuinely wider than the minimum bar, not just clear it, to count as real
+// cross-market reach rather than a diaspora-circuit release that happens to
+// touch double-digit countries.
+const MAJOR_PICK_INTL_THRESHOLDS: Record<Exclude<IntlBarLevel, "off">, { movie: number; tvShow: number }> = {
+  moderate: { movie: 20, tvShow: 50 },
+  strict: { movie: 35, tvShow: 100 },
+};
+
 function intlBarSQL(level: IntlBarLevel): string {
   if (level === "off") return "";
   const t = INTL_BAR_THRESHOLDS[level];
   const returningFloor = RETURNING_TV_INTL_THRESHOLDS[level];
   const trendingFloor = TRENDING_PICK_INTL_THRESHOLDS[level];
+  const majorFloor = MAJOR_PICK_INTL_THRESHOLDS[level];
   // English/no-language rows still short-circuit past everything below via
-  // the first clause, so an English returning show/trending pick stays
-  // fully exempt exactly as before — only a non-English one now has to
-  // clear its own scale's floor instead of an unconditional pass.
-  return `AND (original_language = 'en' OR original_language IS NULL OR type = 'game' OR ${FRANCHISE_PICK_EXEMPT} OR ${MAJOR_PICK_EXEMPT} OR
+  // the first clause, so an English returning show/trending/major pick
+  // stays fully exempt exactly as before — only a non-English one now has
+  // to clear its own scale's floor instead of an unconditional pass.
+  return `AND (original_language = 'en' OR original_language IS NULL OR type = 'game' OR ${FRANCHISE_PICK_EXEMPT} OR
     (${RETURNING_TV_EXEMPT} AND rank_score >= ${returningFloor}) OR
     (${TRENDING_PICK_EXEMPT} AND rank_score >= ${trendingFloor}) OR
+    (${MAJOR_PICK_EXEMPT} AND type = 'movie' AND rank_score >= ${majorFloor.movie}) OR
+    (${MAJOR_PICK_EXEMPT} AND type = 'tvShow' AND rank_score >= ${majorFloor.tvShow}) OR
     (type = 'movie' AND rank_score >= ${t.movie}) OR (type = 'tvShow' AND subtitle IS NULL AND rank_score >= ${t.tvShow}))`;
 }
 

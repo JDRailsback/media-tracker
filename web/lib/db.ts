@@ -307,17 +307,21 @@ function buildSchema(): Promise<void> {
       // which then keeps the OLD stored release_date instead of overwriting
       // it with an unverified one.
       await sql`ALTER TABLE upcoming_items ADD COLUMN IF NOT EXISTS date_verified BOOLEAN NOT NULL DEFAULT true`;
-      // A wide US theatrical release (movie) or a show on one of a handful
-      // of major streaming platforms (TV) — piggybacked off the SAME
-      // per-item fetch filterOfficialOnly already makes for every upcoming
-      // candidate (release_dates for movies, the base /tv/{id} response's
-      // own `networks` field for TV), zero extra TMDB calls. Explicit
+      // "How major" a wide US theatrical release (movie) or major-streaming-
+      // platform show (TV) is — country count for movies, popularity for
+      // TV, 0 for neither — piggybacked off the SAME per-item fetch
+      // filterOfficialOnly already makes for every upcoming candidate
+      // (release_dates for movies, the base /tv/{id} response's own
+      // `networks`/`popularity` for TV), zero extra TMDB calls. Explicit
       // request: a wide release or a major-platform show should show up in
       // "Popular upcoming" regardless of Trakt anticipation/trending — see
-      // lib/upcomingCalendar.ts's fetchMajorReleaseAdmitted, and its
-      // major_pick columns on upcoming_calendar/new_releases_calendar for
-      // the read-time bar exemption.
-      await sql`ALTER TABLE upcoming_items ADD COLUMN IF NOT EXISTS major_release BOOLEAN NOT NULL DEFAULT false`;
+      // lib/upcomingCalendar.ts's fetchMajorReleaseAdmitted. Stored as a
+      // real magnitude (not just a boolean) so the international bar can
+      // apply its OWN, stricter floor to non-English rows instead of
+      // exempting every major release unconditionally — verified live that
+      // an unconditional exemption let a low-signal regional release
+      // through (see MAJOR_PICK_EXEMPT there).
+      await sql`ALTER TABLE upcoming_items ADD COLUMN IF NOT EXISTS major_release_score INTEGER NOT NULL DEFAULT 0`;
       // Notification history — one GLOBAL row per logged event (mirrors
       // followed_items' one-row-per-item model, not per-subscriber), written
       // only by /api/poll, read by /api/notifications filtered to the ids

@@ -246,16 +246,20 @@ function usTheatricalDate(releaseDatesResponse: unknown): string | undefined {
 // franchise wide release, had 31; the junk titles above had 1-2) — country
 // COUNT is what actually distinguishes "wide" from "technically theatrical,"
 // so that's the gate, not the type value alone.
-const WIDE_RELEASE_MIN_COUNTRIES = 10;
-
-function isWideUSTheatrical(releaseDatesResponse: unknown): boolean {
+// The country COUNT itself, not just a yes/no — needed as a real magnitude,
+// not only a gate, so lib/upcomingCalendar.ts's international bar can apply
+// its own calibrated floor to non-English wide releases instead of admitting
+// every one of them unconditionally (see MAJOR_PICK_EXEMPT there). Returns 0
+// (never undefined) when there's no US theatrical entry at all — a title
+// with no US release isn't "wide" by this app's own US-centric definition,
+// regardless of how many other countries it played in.
+function wideUSTheatricalReach(releaseDatesResponse: unknown): number {
   const results = (releaseDatesResponse as { results?: { iso_3166_1: string; release_dates: TMDBReleaseDateEntry[] }[] })
     ?.results;
-  if (!results) return false;
+  if (!results) return 0;
   const us = results.find((r) => r.iso_3166_1 === "US");
-  if (!us?.release_dates.some((r) => r.type === 3)) return false;
-  const countriesWithTheatrical = results.filter((r) => r.release_dates.some((rd) => rd.type === 3)).length;
-  return countriesWithTheatrical >= WIDE_RELEASE_MIN_COUNTRIES;
+  if (!us?.release_dates.some((r) => r.type === 3)) return 0;
+  return results.filter((r) => r.release_dates.some((rd) => rd.type === 3)).length;
 }
 
 // A show is on one of these iff its /tv/{id} `networks` field names one of
@@ -273,16 +277,15 @@ const MAJOR_STREAMING_NETWORKS = ["netflix", "max", "hbo", "disney+", "apple tv+
 // S&X/JP popularity 5.3, Blood Sacrifice/SE popularity 4.7) right alongside
 // real hits, because Netflix (and every other platform on the list above)
 // hosts a huge volume of small regional/niche content, not just its
-// flagship titles. Real trending shows on these same platforms sampled live
-// at 46-425 popularity (House of the Dragon, Reacher, Silo, Ted Lasso, ...);
-// this floor sits well under that range (a brand-new show hasn't built up
-// trending-tier momentum yet) but well clear of the 1-5 noise above.
-const MAJOR_TV_POPULARITY_FLOOR = 20;
-
-function isMajorStreamingShow(networks: unknown, popularity: number): boolean {
-  if (popularity < MAJOR_TV_POPULARITY_FLOOR) return false;
+// flagship titles. Returns the show's own popularity when it matches a
+// major network (0 otherwise), same "magnitude, not just yes/no" reasoning
+// as wideUSTheatricalReach — lib/upcomingCalendar.ts applies BOTH the
+// admission floor and (for non-English rows) the international bar's own,
+// stricter floor against this same stored number.
+function majorStreamingReach(networks: unknown, popularity: number): number {
   const names = (networks as { name?: string }[] | undefined)?.map((n) => n.name?.toLowerCase() ?? "") ?? [];
-  return names.some((n) => MAJOR_STREAMING_NETWORKS.some((major) => n.includes(major)));
+  const isMajorNetwork = names.some((n) => MAJOR_STREAMING_NETWORKS.some((major) => n.includes(major)));
+  return isMajorNetwork ? popularity : 0;
 }
 
 interface StatusResult {
@@ -304,13 +307,15 @@ interface StatusResult {
   // wrong 2026-07-28 this way. See filterOfficialOnly/upsertUpcoming for how
   // this flag now guards against that instead of just hoping retries win.
   fetchOk: boolean;
-  // Wide US theatrical (movie, via isWideUSTheatrical) or a major-platform
-  // show above a popularity floor (TV, via isMajorStreamingShow). Piggybacks
-  // on this same per-item request for both kinds: movies already fetch
-  // release_dates here, and TV's base /tv/{id} response already includes
-  // `networks`/`popularity` with no append needed. False (never undefined)
-  // so a failed fetch can't be mistaken for "checked, not major" downstream.
-  majorRelease: boolean;
+  // "How major" — country count for a wide US theatrical release (movie,
+  // via wideUSTheatricalReach) or popularity for a major-platform show (TV,
+  // via majorStreamingReach); 0 for neither. Piggybacks on this same
+  // per-item request for both kinds: movies already fetch release_dates
+  // here, and TV's base /tv/{id} response already includes
+  // `networks`/`popularity` with no append needed. Always 0 (never
+  // undefined) on a failed fetch, same reasoning as majorRelease had before
+  // — a flaky request can't be mistaken for "checked, not major."
+  majorReleaseScore: number;
 }
 
 async function fetchStatus(kind: "movie" | "tv", id: number): Promise<StatusResult> {
@@ -330,8 +335,8 @@ async function fetchStatus(kind: "movie" | "tv", id: number): Promise<StatusResu
         status: d.status as string | undefined,
         usReleaseDate: kind === "movie" ? usTheatricalDate(d.release_dates) : undefined,
         fetchOk: true,
-        majorRelease:
-          kind === "movie" ? isWideUSTheatrical(d.release_dates) : isMajorStreamingShow(d.networks, d.popularity ?? 0),
+        majorReleaseScore:
+          kind === "movie" ? wideUSTheatricalReach(d.release_dates) : majorStreamingReach(d.networks, d.popularity ?? 0),
       };
     });
   } catch {
@@ -339,14 +344,14 @@ async function fetchStatus(kind: "movie" | "tv", id: number): Promise<StatusResu
     // request silently exclude an otherwise-legitimate title or crash the
     // date correction; the row just keeps its original release_date this
     // run, but fetchOk: false stops that unverified value from ever being
-    // written over a previously-good one (see upsertUpcoming). majorRelease
-    // stays false rather than carrying forward a stale prior value — this
-    // flag is fully recomputed every run, unlike releaseDate.
-    return { fetchOk: false, majorRelease: false };
+    // written over a previously-good one (see upsertUpcoming). majorReleaseScore
+    // stays 0 rather than carrying forward a stale prior value — this
+    // score is fully recomputed every run, unlike releaseDate.
+    return { fetchOk: false, majorReleaseScore: 0 };
   }
 }
 
-async function filterOfficialOnly<T extends { id: string; releaseDate?: string; dateVerified?: boolean; majorRelease?: boolean }>(
+async function filterOfficialOnly<T extends { id: string; releaseDate?: string; dateVerified?: boolean; majorReleaseScore?: number }>(
   kind: "movie" | "tv",
   rows: T[]
 ): Promise<T[]> {
@@ -362,7 +367,7 @@ async function filterOfficialOnly<T extends { id: string; releaseDate?: string; 
       ...x.row,
       ...(x.result.usReleaseDate ? { releaseDate: x.result.usReleaseDate } : {}),
       dateVerified: x.result.fetchOk,
-      majorRelease: x.result.majorRelease,
+      majorReleaseScore: x.result.majorReleaseScore,
     }));
 }
 
